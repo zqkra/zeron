@@ -40,7 +40,9 @@ use gpui::{
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
-use zeron_proto::ToolCall;
+use zeron_proto::orchestration::{self, ChildOutcome};
+use zeron_proto::view::{ZeronChatVerb, zeron_chat_command};
+use zeron_proto::{ChatIndicator, ToolCall};
 
 use crate::markdown::parser::{
     Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full,
@@ -379,6 +381,48 @@ pub struct ToolItem {
     /// is the `detail`; `resolved == false` means it is still streaming (the
     /// chip then defaults open).
     pub kind: ToolItemKind,
+    /// A `zeron chat spawn|tell|wait|output` exec: the chip renders as an
+    /// agent card with live chat references, never a "Run" row inside a
+    /// commands fold. Titles/status resolve at render time — this carries
+    /// only what the command line and its output pinned down.
+    pub agent: Option<AgentExec>,
+}
+
+/// What [`zeron_proto::view::zeron_chat_command`] parsed out of an exec'd
+/// `zeron chat` call, plus the spawn target's chat id lifted from the output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentExec {
+    pub verb: ZeronChatVerb,
+    /// Chat references as typed: full ids, prefixes or titles — resolved
+    /// against the registry at render time.
+    pub targets: Vec<SharedString>,
+    /// The spawned child: the last `@chat:<uuid>` mention in the output.
+    /// `None` while the spawn is still running (or printed no id).
+    pub child: Option<SharedString>,
+}
+
+/// Classify an exec as orchestration CLI traffic, and for spawns lift the
+/// child chat id out of whatever output exists so far (the human format ends
+/// with the `@chat:<full-id>` line; a still-running command has none).
+fn agent_exec(call: &ToolCall, output: Option<&str>) -> Option<AgentExec> {
+    let ToolCall::Exec { command } = call else {
+        return None;
+    };
+    let command = zeron_chat_command(command)?;
+    let child = (command.verb == ZeronChatVerb::Spawn)
+        .then(|| {
+            output.and_then(|output| {
+                orchestration::chat_mentions(output)
+                    .last()
+                    .map(|mention| SharedString::from(mention.chat_id.to_owned()))
+            })
+        })
+        .flatten();
+    Some(AgentExec {
+        verb: command.verb,
+        targets: command.targets.iter().map(SharedString::from).collect(),
+        child,
+    })
 }
 
 /// Subagent spawn chips — [`ToolCall::is_subagent_spawn`], the shared genus
@@ -395,7 +439,7 @@ fn is_agent_call(call: &ToolCall) -> bool {
 /// traffic), and honoring the ref alone turned those Runs into spawn chips
 /// that opened empty, never-created subagent docs.
 fn is_agent_tool(item: &ToolItem) -> bool {
-    is_agent_call(&item.call)
+    is_agent_call(&item.call) || item.agent.is_some()
 }
 
 /// A chip renders as the spawn LINK (whole-card click → subagent tab) only
@@ -728,6 +772,7 @@ fn thought_item(part_id: &str, tree: &BlockTree, live: bool) -> ToolItem {
         subagent_status: None,
         subagent_tail: None,
         kind: ToolItemKind::Thought,
+        agent: None,
     }
 }
 
@@ -1062,6 +1107,74 @@ pub enum RowKind {
         source_chat_id: SharedString,
         source_title: SharedString,
     },
+    /// One or more child-chat settle notifications (`MessagePart::
+    /// ChildUpdate` system entries). Consecutive ones merge into a single
+    /// "N subagents updated" group row — see [`merge_child_updates`].
+    ChildUpdates {
+        items: Arc<Vec<ChildUpdateItem>>,
+    },
+}
+
+/// One child-chat update inside a [`RowKind::ChildUpdates`] row.
+#[derive(Clone)]
+pub struct ChildUpdateItem {
+    /// The part id — the card's stable identity inside its group.
+    pub part_id: SharedString,
+    /// Content pinned at delivery: the card falls back to these when the
+    /// child no longer resolves.
+    pub child_chat_id: SharedString,
+    pub child_title: SharedString,
+    pub outcome: ChildOutcome,
+    pub excerpt: Option<SharedString>,
+}
+
+/// Row identity for a child-update card: hash everything the card paints
+/// statically (titles and live status resolve at render, so they only need
+/// the stored copy as a fallback here).
+fn child_updates_version(items: &[ChildUpdateItem]) -> u64 {
+    let mut acc = Vec::new();
+    for item in items {
+        acc.extend_from_slice(item.part_id.as_bytes());
+        acc.push(0);
+        acc.extend_from_slice(item.child_chat_id.as_bytes());
+        acc.push(0);
+        acc.extend_from_slice(item.child_title.as_bytes());
+        acc.push(0);
+        acc.push(item.outcome as u8);
+        if let Some(excerpt) = &item.excerpt {
+            acc.extend_from_slice(excerpt.as_bytes());
+        }
+        acc.push(0);
+    }
+    fnv1a(&acc)
+}
+
+/// Merge adjacent [`RowKind::ChildUpdates`] rows into one group row. The
+/// child notifier writes one system entry per update; bursts therefore
+/// arrive as a RUN of single-card rows, which read better collapsed.
+/// Applied per entry (intra-entry runs) and again on the assembled row list
+/// (cross-entry runs) — the card keeps the run's FIRST row id so a late
+/// arrival remeasures in place instead of flashing a fresh row.
+fn merge_child_updates(rows: &mut Vec<Row>) {
+    let mut ix = 0;
+    while ix + 1 < rows.len() {
+        let mergeable = matches!(&rows[ix].kind, RowKind::ChildUpdates { .. })
+            && matches!(&rows[ix + 1].kind, RowKind::ChildUpdates { .. });
+        if !mergeable {
+            ix += 1;
+            continue;
+        }
+        let next = rows.remove(ix + 1);
+        let (RowKind::ChildUpdates { items }, RowKind::ChildUpdates { items: more }) =
+            (&mut rows[ix].kind, next.kind)
+        else {
+            continue;
+        };
+        let merged: Vec<ChildUpdateItem> =
+            items.iter().cloned().chain(more.iter().cloned()).collect();
+        *items = Arc::new(merged);
+        rows[ix].version = child_updates_version(items);
+    }
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1218,6 +1331,21 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         );
         if let Some(tail) = &t.subagent_tail {
             acc.extend_from_slice(tail.as_bytes());
+        }
+        // The orchestration chip swaps the whole header — verb, targets and
+        // a discovered child id all reshape it.
+        match &t.agent {
+            None => acc.push(0),
+            Some(agent) => {
+                acc.push(1 + agent.verb as u8);
+                for target in &agent.targets {
+                    acc.extend_from_slice(target.as_bytes());
+                    acc.push(0);
+                }
+                if let Some(child) = &agent.child {
+                    acc.extend_from_slice(child.as_bytes());
+                }
+            }
         }
     }
     acc.push(auto_open as u8);
@@ -1434,6 +1562,7 @@ pub fn rows_for_entry(
                     subagent_status: *subagent_status,
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
                     kind: ToolItemKind::Call,
+                    agent: agent_exec(call, output.as_deref()),
                 };
                 if compact {
                     // Compact mode keeps ONE group for the whole turn —
@@ -1644,9 +1773,34 @@ pub fn rows_for_entry(
                             compact_fold: None,
                         });
                     }
-                    // No row for now: the child update card renders it (see
-                    // the notifications UI).
-                    MessagePart::ChildUpdate { .. } => {}
+                    MessagePart::ChildUpdate {
+                        id: part_id,
+                        child_chat_id,
+                        child_title,
+                        outcome,
+                        excerpt,
+                    } => {
+                        let item = ChildUpdateItem {
+                            part_id: part_id.clone().into(),
+                            child_chat_id: child_chat_id.clone().into(),
+                            child_title: single_line(child_title).into(),
+                            outcome: *outcome,
+                            excerpt: excerpt.clone().map(SharedString::from),
+                        };
+                        let version = child_updates_version(std::slice::from_ref(&item));
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version,
+                            turn_start: false,
+                            kind: RowKind::ChildUpdates {
+                                items: Arc::new(vec![item]),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                        });
+                    }
                     // Tools and thoughts are grouped by the outer arms;
                     // nothing reaches here.
                     MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
@@ -1722,6 +1876,9 @@ pub fn rows_for_entry(
         );
     }
 
+    // Consecutive child updates within one entry collapse into a group row;
+    // cross-entry runs merge when the transcript assembles its rows.
+    merge_child_updates(&mut rows);
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
     }
@@ -1731,7 +1888,10 @@ pub fn rows_for_entry(
     // change when streaming flips off (chips).
     if !streaming
         && let Some(last) = rows.last_mut()
-        && !matches!(last.kind, RowKind::ForkMarker { .. })
+        && !matches!(
+            last.kind,
+            RowKind::ForkMarker { .. } | RowKind::ChildUpdates { .. }
+        )
     {
         last.timestamp = Some(entry.created_at);
         last.copy_text = assistant_copy_text(entry);
@@ -3261,7 +3421,14 @@ pub struct Transcript {
     /// recently (click "Show full output" after a diff → see the output).
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
+    /// Chat ids the current rows reference (agent-chip targets, spawn
+    /// children, child-update cards). Rebuilt in [`Self::sync`]; the watcher
+    /// below fingerprints their live titles/status so a child's settle
+    /// repaints its chip without a transcript revision.
+    chat_refs: std::collections::BTreeSet<String>,
+    chat_ref_fingerprint: u64,
     _observe: Subscription,
+    _chat_ref_watch: Subscription,
     _text_changes: Subscription,
 }
 
@@ -3286,6 +3453,9 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// A chip/card referencing a chat was activated: open that chat in the
+    /// right pane (side-chat tab surface).
+    OpenChildChat { chat_id: String },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -3356,6 +3526,23 @@ impl Transcript {
             .ok();
         });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        // Live-referencing chips (spawn/tell/wait/output cards, child-update
+        // cards) resolve their titles and status glyphs at RENDER time —
+        // `sync` skips unchanged transcripts, so the chips' own fingerprint
+        // drives the repaint instead (the activity menu's observer pattern).
+        let chat_ref_watch = cx.observe(&state, |this: &mut Self, state, cx| {
+            if this.chat_refs.is_empty() {
+                return;
+            }
+            let fingerprint = crate::chat_pill::chat_refs_fingerprint(
+                state.read(cx),
+                this.chat_refs.iter().map(String::as_str),
+            );
+            if fingerprint != this.chat_ref_fingerprint {
+                this.chat_ref_fingerprint = fingerprint;
+                cx.notify();
+            }
+        });
         let text_changes = cx.subscribe(
             &state,
             |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
@@ -3459,7 +3646,10 @@ impl Transcript {
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
+            chat_refs: std::collections::BTreeSet::new(),
+            chat_ref_fingerprint: 0,
             _observe: observe,
+            _chat_ref_watch: chat_ref_watch,
             _text_changes: text_changes,
         };
         this.sync(cx);
@@ -4617,6 +4807,10 @@ impl Transcript {
             )
         };
 
+        // Child-update cards from back-to-back system entries collapse into
+        // one "N subagents updated" row.
+        merge_child_updates(&mut new_rows);
+
         let baseline = self
             .chat_id
             .as_deref()
@@ -4880,6 +5074,7 @@ impl Transcript {
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
+                self.refresh_chat_refs(cx);
                 self.refresh_protected_attachments(cx);
                 self.reconcile_own_turn_prompt();
                 // Replay readiness is independent of row content: an empty
@@ -4918,6 +5113,7 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
+        self.refresh_chat_refs(cx);
         if old_last != self.rows.len().checked_sub(1) {
             if let Some(ix) = old_last.filter(|&ix| ix < self.rows.len()) {
                 // Bottom chrome moves to the new tail too.
@@ -4974,6 +5170,43 @@ impl Transcript {
             }
         }
         cx.notify();
+    }
+
+    /// Refresh the set of chat ids the rendered rows reference (agent exec
+    /// chip targets, spawn children, child-update cards) and re-fingerprint
+    /// their live identity. The fingerprint observer then repaints when a
+    /// referenced child's title, harness, model or status changes — the doc
+    /// doesn't change when a child settles, so [`Self::sync`] alone never
+    /// sees it.
+    fn refresh_chat_refs(&mut self, cx: &mut Context<Self>) {
+        let mut refs = std::collections::BTreeSet::new();
+        for row in &self.rows {
+            match &row.kind {
+                RowKind::ToolGroup { tools, .. } => {
+                    for tool in tools.iter() {
+                        if let Some(agent) = &tool.agent {
+                            refs.extend(agent.targets.iter().map(|t| t.to_string()));
+                            if let Some(child) = &agent.child {
+                                refs.insert(child.to_string());
+                            }
+                        }
+                    }
+                }
+                RowKind::ChildUpdates { items } => {
+                    refs.extend(items.iter().map(|item| item.child_chat_id.to_string()));
+                }
+                _ => {}
+            }
+        }
+        self.chat_refs = refs;
+        self.chat_ref_fingerprint = if self.chat_refs.is_empty() {
+            0
+        } else {
+            crate::chat_pill::chat_refs_fingerprint(
+                self.state.read(cx),
+                self.chat_refs.iter().map(String::as_str),
+            )
+        };
     }
 
     fn compact_worked_secs_for(&self, entry: &SessionMessageEntry) -> Option<i64> {
@@ -6547,6 +6780,9 @@ impl Transcript {
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::ChildUpdates { items } => {
+                self.render_child_updates(&row.id, items, &theme, cx)
+            }
         };
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -7423,7 +7659,7 @@ impl Transcript {
                                 entry.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
-                            .child(chip_header(tool, open, theme, cx.entity_id(), cx)),
+                            .child(self.chip_header_for(tool, open, theme, cx)),
                     );
                 // The body stays mounted while the close tween shrinks over it.
                 // Invocation first (what was asked), then output/diff (what
@@ -7574,6 +7810,689 @@ impl Transcript {
             })
             .into_any_element()
     }
+
+    /// The expandable chip card's content row. `zeron chat` execs get the
+    /// agent header (live chat chips, spawn status, open affordances);
+    /// everything else keeps the ordinary label/detail/chevron row.
+    fn chip_header_for(
+        &mut self,
+        tool: &ToolItem,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        match &tool.agent {
+            Some(agent) => self.agent_exec_header(tool, agent, open, theme, cx),
+            None => chip_header(tool, open, theme, cx.entity_id(), cx),
+        }
+    }
+
+    /// The header row of a `zeron chat spawn|tell|wait|output` chip: the
+    /// agent-card recipe — 18px icon tile, medium verb label, live chat chips
+    /// or titles for the targets, then the status/link affordances and the
+    /// same chevron trail every expandable chip carries. Titles and status
+    /// resolve against [`AppState`] per paint; the row itself is pure doc.
+    fn agent_exec_header(
+        &mut self,
+        tool: &ToolItem,
+        agent: &AgentExec,
+        open: bool,
+        theme: &Theme,
+        view_cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        // Resolve everything the header needs up front: holding the
+        // AppState borrow across `view_cx` mutable calls won't compile, and
+        // the refs are owned snapshots — the next fingerprint change
+        // repaints them anyway.
+        let (child, resolved) = {
+            let state = self.state.read(view_cx);
+            let child = agent
+                .child
+                .as_deref()
+                .map(|id| crate::chat_pill::ChatRef::resolve(state, id));
+            let resolved = agent
+                .targets
+                .iter()
+                .map(|t| crate::chat_pill::ChatRef::resolve_target(state, t))
+                .collect::<Vec<_>>();
+            (child, resolved)
+        };
+        let running = !tool.resolved;
+        let child_working = child
+            .as_ref()
+            .is_some_and(|c| c.known && c.indicator == ChatIndicator::Working);
+        let child_errored = child
+            .as_ref()
+            .is_some_and(|c| c.known && c.indicator == ChatIndicator::Errored);
+        let failed = tool.is_error || child_errored;
+        let tint = if failed {
+            theme.danger
+        } else {
+            theme.text_muted
+        };
+        let label = match agent.verb {
+            ZeronChatVerb::Spawn => {
+                if agent.child.is_some() || tool.resolved {
+                    "Spawned"
+                } else {
+                    "Spawning"
+                }
+            }
+            ZeronChatVerb::Tell => "Messaged",
+            ZeronChatVerb::Wait => "Waited for",
+            ZeronChatVerb::Output => "Read",
+        };
+        // Leading tile: the child's harness mark for spawns (BOT until the
+        // registry resolves it), the BOT glyph for the messaging verbs.
+        let mark = child
+            .as_ref()
+            .and_then(|c| c.harness)
+            .map(crate::pickers::harness_brand_icon)
+            .unwrap_or((crate::icons::BOT, None));
+        let mut header = div()
+            .h(px(CHIP_HEADER_HEIGHT))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .text_size(px(TOOL_LABEL_SIZE))
+            .line_height(px(TOOL_LABEL_LINE_HEIGHT))
+            .child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.08))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(mark.0)
+                            .size(px(12.0))
+                            .text_color(mark.1.unwrap_or(theme.text_muted)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(tint)
+                    .child(label),
+            );
+        // The detail slot: spawn shows the child's live title; the messaging
+        // verbs show their targets as chat chips (raw muted text for the
+        // ones that no longer resolve).
+        let mut detail = div()
+            .flex_1()
+            .min_w_0()
+            .h(px(TOOL_LABEL_LINE_HEIGHT))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_hidden();
+        if agent.verb == ZeronChatVerb::Spawn {
+            match &child {
+                Some(chat) => {
+                    detail = detail.child(crate::chat_pill::chat_chip(
+                        chat,
+                        theme,
+                        view_cx.entity_id(),
+                        view_cx,
+                    ));
+                }
+                None => {
+                    if let Some(target) = agent.targets.first() {
+                        detail = detail.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(tint)
+                                .child(target.clone()),
+                        );
+                    }
+                }
+            }
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            for (tix, target) in agent.targets.iter().enumerate() {
+                match resolved.get(tix).and_then(|chat| chat.as_ref()) {
+                    Some(chat) if seen.insert(chat.chat_id.clone()) => {
+                        let chat_id = chat.chat_id.clone();
+                        detail = detail.child(
+                            div()
+                                .id(SharedString::from(format!("{}#t{tix}", tool.part_id)))
+                                .flex_none()
+                                .min_w_0()
+                                .cursor_pointer()
+                                .on_click(view_cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(TranscriptEvent::OpenChildChat {
+                                        chat_id: chat_id.clone(),
+                                    });
+                                }))
+                                .child(crate::chat_pill::chat_chip(
+                                    chat,
+                                    theme,
+                                    view_cx.entity_id(),
+                                    view_cx,
+                                )),
+                        );
+                    }
+                    _ => {
+                        detail = detail.child(
+                            div()
+                                .flex_none()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text_muted)
+                                .child(target.clone()),
+                        );
+                    }
+                }
+            }
+        }
+        header = header.child(detail);
+        // `wait` reports the settle word the CLI printed.
+        if agent.verb == ZeronChatVerb::Wait
+            && let Some(outcome) = wait_outcome(tool)
+        {
+            header = header.child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(outcome),
+            );
+        }
+        if agent.verb == ZeronChatVerb::Spawn
+            && let Some(model) = child.as_ref().and_then(|c| c.model.clone())
+        {
+            header = header.child(
+                div()
+                    .flex_none()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(model),
+            );
+        }
+        // Live status: the spawn spins while its command or its child runs;
+        // the other verbs spin only while the exec itself is unresolved.
+        let spinning = running || (agent.verb == ZeronChatVerb::Spawn && child_working);
+        if spinning && !failed {
+            header = header.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
+                format!("agent-exec-{}", tool.part_id),
+                2.0,
+                theme.glyph,
+                view_cx.entity_id(),
+                view_cx,
+            )));
+        } else if let Some(chat) = child.as_ref().filter(|c| c.known) {
+            header = header.child(crate::chat_pill::status_glyph(
+                format!("agent-exec-{}", tool.part_id),
+                chat.indicator,
+                view_cx.entity_id(),
+                theme,
+                view_cx,
+            ));
+        }
+        if let Some(chat) = child.as_ref().filter(|c| c.known) {
+            let chat_id = chat.chat_id.clone();
+            header = header.child(
+                div()
+                    .id(SharedString::from(format!("{}#open", tool.part_id)))
+                    .size(px(18.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.06))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_click(view_cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(TranscriptEvent::OpenChildChat {
+                            chat_id: chat_id.clone(),
+                        });
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
+                            .size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    ),
+            );
+        }
+        header.child(
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.06))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(if open {
+                        crate::icons::ALT_ARROW_DOWN
+                    } else {
+                        crate::icons::ALT_ARROW_RIGHT
+                    })
+                    .size(px(12.0))
+                    .text_color(theme.text_faint),
+                ),
+        )
+    }
+
+    /// The "N subagents updated" group row (a quiet header folding over the
+    /// individual cards) or, for a lone update, the card itself.
+    fn render_child_updates(
+        &mut self,
+        row_id: &SharedString,
+        items: &Arc<Vec<ChildUpdateItem>>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if items.len() == 1 {
+            return self.child_update_card(row_id, 0, &items[0], theme, cx);
+        }
+        let fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let open = fold.open.unwrap_or(false);
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        // Card heights must stay analytic: CHIP_HEIGHT per card plus its
+        // excerpt when that card's fold is open (mid-tween heights follow
+        // the toggle's target, like detail folds inside a tool group).
+        let item_height = |ix: usize, item: &ChildUpdateItem| {
+            CHIP_HEIGHT
+                + if self
+                    .folds
+                    .get(&SharedString::from(format!("{row_id}#c{ix}")))
+                    .copied()
+                    .unwrap_or_default()
+                    .open
+                    .unwrap_or(false)
+                {
+                    excerpt_height(item)
+                } else {
+                    0.0
+                }
+        };
+        let target = if open {
+            items
+                .iter()
+                .enumerate()
+                .map(|(ix, item)| item_height(ix, item))
+                .sum()
+        } else {
+            0.0
+        };
+        let mut animating = false;
+        let body_height = if let Some(at) = fold.toggled_at.filter(|_| !reduce_motion) {
+            let t = TOOL_FOLD.curve.eval(
+                now.saturating_duration_since(at).as_secs_f32() / TOOL_FOLD.total().as_secs_f32(),
+            );
+            if t < 1.0 {
+                animating = true;
+            }
+            motion::lerp(fold.from, target, t)
+        } else {
+            target
+        };
+        let disclosure_progress = if reduce_motion {
+            if open { 1.0 } else { 0.0 }
+        } else {
+            tool_disclosure_progress(open, fold, now)
+        };
+        let toggle_id = row_id.clone();
+        let header = div()
+            .id(SharedString::from(format!("{row_id}-cu-hdr")))
+            .relative()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .pr(px(4.0))
+            .h(px(TOOL_GROUP_HEADER_HEIGHT))
+            .cursor_pointer()
+            .text_size(px(TOOL_LABEL_SIZE))
+            .line_height(px(TOOL_LABEL_LINE_HEIGHT))
+            .text_color(theme.text_muted)
+            .hover(|s| s.text_color(theme.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_fold(toggle_id.clone(), target, false, cx);
+                cx.notify();
+            }))
+            .child(
+                div().w(px(22.0)).h(px(18.0)).flex_none().relative().child(
+                    crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                        .absolute()
+                        .left(px(ACTIVITY_TRUNK_X - 7.0))
+                        .top(px(2.0))
+                        .size(px(14.0))
+                        .with_transformation(gpui::Transformation::rotate(gpui::radians(
+                            -std::f32::consts::FRAC_PI_2 * (1.0 - disclosure_progress),
+                        )))
+                        .text_color(theme.text_muted),
+                ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .h(px(TOOL_LABEL_LINE_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(SharedString::from(format!(
+                        "{} subagents updated",
+                        items.len()
+                    ))),
+            );
+        let body = div().overflow_hidden().h(px(body_height)).child(
+            div().flex().flex_col().gap(px(CHIP_GAP)).children(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, item)| self.child_update_card(row_id, ix, item, theme, cx)),
+            ),
+        );
+        let view = cx.entity_id();
+        div()
+            .flex()
+            .flex_col()
+            .font_family(theme.font_sans_fixed.clone())
+            .child(header)
+            .child(body)
+            .when(animating, |group| {
+                group.child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            window.on_next_frame(move |_, cx| cx.notify(view));
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One child-update card: the spawn chip's card geometry carrying a
+    /// status tile (per outcome), the child's live chat chip, the settle
+    /// verb, and — when an excerpt was recorded — a disclosure that expands
+    /// it like a tool detail. The chat chip and the arrow tile open the
+    /// child in the right pane.
+    fn child_update_card(
+        &mut self,
+        row_id: &SharedString,
+        ix: usize,
+        item: &ChildUpdateItem,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let state = self.state.read(cx);
+        let chat = crate::chat_pill::ChatRef::resolve(state, &item.child_chat_id);
+        // The outcome icon's tile: the check of a clean settle, the danger
+        // wash of a failure, muted for a manual stop, warning for a blocker.
+        let (glyph, color) = match item.outcome {
+            ChildOutcome::Completed => (crate::icons::CHECK, theme.success),
+            ChildOutcome::Errored => (crate::icons::CLOSE_CIRCLE, theme.danger),
+            ChildOutcome::Interrupted => (crate::icons::STOP, theme.text_muted),
+            ChildOutcome::NeedsInput => (crate::icons::DANGER_TRIANGLE, theme.warning),
+        };
+        let verb = match item.outcome {
+            ChildOutcome::Completed => "finished",
+            ChildOutcome::Errored => "failed",
+            ChildOutcome::Interrupted => "was interrupted",
+            ChildOutcome::NeedsInput => "needs help",
+        };
+        let fold_key = SharedString::from(format!("{row_id}#c{ix}"));
+        let excerpt_h = excerpt_height(item);
+        let excerpt_fold = self.folds.get(&fold_key).copied().unwrap_or_default();
+        let excerpt_open = excerpt_fold.open.unwrap_or(false);
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let mut animating = false;
+        let excerpt_current = if let Some(at) = excerpt_fold.toggled_at.filter(|_| !reduce_motion) {
+            let t = TOOL_FOLD.curve.eval(
+                now.saturating_duration_since(at).as_secs_f32() / TOOL_FOLD.total().as_secs_f32(),
+            );
+            if t < 1.0 {
+                animating = true;
+            }
+            motion::lerp(
+                excerpt_fold.from,
+                if excerpt_open { excerpt_h } else { 0.0 },
+                t,
+            )
+        } else if excerpt_open {
+            excerpt_h
+        } else {
+            0.0
+        };
+        let chat_id = item.child_chat_id.to_string();
+        let excerpt_toggle = fold_key.clone();
+        let header = div()
+            .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
+            .h(px(CHIP_CARD_HEIGHT))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .rounded(px(9.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.07))
+            .bg(crate::theme::ink(0.03))
+            .child(
+                div()
+                    .h(px(CHIP_HEADER_HEIGHT))
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .text_size(px(TOOL_LABEL_SIZE))
+                    .line_height(px(TOOL_LABEL_LINE_HEIGHT))
+                    .child(
+                        div()
+                            .size(px(18.0))
+                            .flex_none()
+                            .rounded(px(5.0))
+                            .bg(crate::theme::ink(0.08))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(crate::icons::icon(glyph).size(px(12.0)).text_color(color)),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{row_id}#c{ix}-chat")))
+                            .flex_none()
+                            .min_w_0()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(TranscriptEvent::OpenChildChat {
+                                    chat_id: chat_id.clone(),
+                                });
+                            }))
+                            .child(if chat.known {
+                                crate::chat_pill::chat_chip(&chat, theme, cx.entity_id(), cx)
+                            } else {
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.text)
+                                    .child(item.child_title.clone())
+                                    .into_any_element()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.text_muted)
+                            .child(verb),
+                    )
+                    .when(item.excerpt.is_some(), |row| {
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("{fold_key}-tog")))
+                                .size(px(18.0))
+                                .flex_none()
+                                .rounded(px(5.0))
+                                .bg(crate::theme::ink(0.06))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let entry =
+                                        this.folds.entry(excerpt_toggle.clone()).or_default();
+                                    let was_open = entry.open.unwrap_or(false);
+                                    entry.from = if was_open { excerpt_h } else { 0.0 };
+                                    entry.open = Some(!was_open);
+                                    entry.epoch += 1;
+                                    entry.toggled_at = Some(Instant::now());
+                                    entry.disclosure_at = entry.toggled_at;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    crate::icons::icon(if excerpt_open {
+                                        crate::icons::ALT_ARROW_DOWN
+                                    } else {
+                                        crate::icons::ALT_ARROW_RIGHT
+                                    })
+                                    .size(px(12.0))
+                                    .text_color(theme.text_faint),
+                                ),
+                        )
+                    })
+                    .child({
+                        let chat_id = item.child_chat_id.to_string();
+                        div()
+                            .id(SharedString::from(format!("{row_id}#c{ix}-open")))
+                            .size(px(18.0))
+                            .flex_none()
+                            .rounded(px(5.0))
+                            .bg(crate::theme::ink(0.06))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(TranscriptEvent::OpenChildChat {
+                                    chat_id: chat_id.clone(),
+                                });
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
+                                    .size(px(11.0))
+                                    .text_color(theme.text_muted.opacity(0.8)),
+                            )
+                    }),
+            );
+        let mut card = div().w_full().flex_none().flex().flex_col().child(header);
+        if excerpt_current > 0.0
+            && let Some(excerpt) = &item.excerpt
+        {
+            let lines: Vec<&str> = excerpt.lines().take(8).collect();
+            card = card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .overflow_hidden()
+                    .h(px(excerpt_current))
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .flex()
+                            .flex_col()
+                            .text_size(px(TOOL_TEXT_SIZE))
+                            .text_color(theme.text_muted)
+                            .children(lines.iter().map(|line| {
+                                div()
+                                    .h(px(OUTPUT_LINE_HEIGHT))
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(SharedString::from(line.to_string())),
+                                    )
+                            })),
+                    ),
+            );
+        }
+        let view = cx.entity_id();
+        card.when(animating, |card| {
+            card.relative().child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        window.on_next_frame(move |_, cx| cx.notify(view));
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+        })
+        .into_any_element()
+    }
+}
+
+/// The excerpt's expanded height: capped at 8 lines of the detail row pitch
+/// plus its vertical padding.
+fn excerpt_height(item: &ChildUpdateItem) -> f32 {
+    let lines = item
+        .excerpt
+        .as_deref()
+        .map(|text| text.lines().take(8).count())
+        .unwrap_or(0);
+    8.0 + lines.max(1) as f32 * OUTPUT_LINE_HEIGHT
+}
+
+/// The settle word a `zeron chat wait` printed, lifted from the captured
+/// output lines: the LAST outcome keyword wins (the summary line trails any
+/// per-chat lines above it).
+fn wait_outcome(tool: &ToolItem) -> Option<&'static str> {
+    let ToolDetail::Output { lines, .. } = tool.detail.as_deref()? else {
+        return None;
+    };
+    let text = lines
+        .iter()
+        .map(|l| l.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    [
+        "completed",
+        "failed",
+        "interrupted",
+        "needs input",
+        "timed out",
+    ]
+    .into_iter()
+    .filter_map(|word| text.rfind(word).map(|at| (at, word)))
+    .max_by_key(|(at, _)| *at)
+    .map(|(_, word)| word)
 }
 
 /// A sent message's text with its file-mention chips. The same recipe as the
@@ -13484,6 +14403,7 @@ mod tests {
             subagent_status: None,
             subagent_tail: None,
             kind: ToolItemKind::Call,
+            agent: None,
         };
         let edit = |p: &str| ToolItem {
             part_id: "fixture".into(),
@@ -13503,6 +14423,7 @@ mod tests {
             subagent_status: None,
             subagent_tail: None,
             kind: ToolItemKind::Call,
+            agent: None,
         };
         let tools = vec![
             exec("ls"),
@@ -13538,6 +14459,7 @@ mod tests {
                 subagent_status: None,
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
+                agent: None,
             },
             ToolItem {
                 part_id: "fixture".into(),
@@ -13555,6 +14477,7 @@ mod tests {
                 subagent_status: None,
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
+                agent: None,
             },
             ToolItem {
                 part_id: "fixture".into(),
@@ -13570,6 +14493,7 @@ mod tests {
                 subagent_status: None,
                 subagent_tail: None,
                 kind: ToolItemKind::Call,
+                agent: None,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
@@ -14014,6 +14938,148 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, false, &mut parse).is_empty());
+    }
+
+    fn exec_tool(id: &str, command: &str, output: Option<&str>) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Exec {
+                command: command.into(),
+            },
+            is_error: false,
+            resolved: true,
+            output: output.map(str::to_owned),
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }
+    }
+
+    #[test]
+    fn zeron_chat_execs_classify_as_agent_chips() {
+        let verbs = [
+            ("zeron chat spawn --prompt \"go\"", ZeronChatVerb::Spawn),
+            ("zeron chat tell 3f6b2a18 done?", ZeronChatVerb::Tell),
+            ("zeron chat wait a b --timeout 90s", ZeronChatVerb::Wait),
+            ("zeron chat output 3f6b2a18", ZeronChatVerb::Output),
+            (
+                "cd /repo && $ZERON_CLI chat spawn --prompt hi",
+                ZeronChatVerb::Spawn,
+            ),
+        ];
+        for (command, verb) in verbs {
+            let agent = agent_exec(
+                &ToolCall::Exec {
+                    command: command.into(),
+                },
+                None,
+            )
+            .unwrap_or_else(|| panic!("{command} should classify"));
+            assert_eq!(agent.verb, verb, "{command}");
+        }
+        // Ordinary commands and non-exec calls stay ordinary chips.
+        assert!(
+            agent_exec(
+                &ToolCall::Exec {
+                    command: "echo zeron chat spawn".into()
+                },
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            agent_exec(
+                &ToolCall::Unknown {
+                    name: "zeron chat spawn".into(),
+                    input: None
+                },
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn spawn_child_id_comes_from_the_last_chat_mention() {
+        let call = ToolCall::Exec {
+            command: "zeron chat spawn --prompt hi".into(),
+        };
+        // No output yet — still running — no child.
+        assert!(agent_exec(&call, None).unwrap().child.is_none());
+        // The LAST mention wins: earlier ids are progress noise, the final
+        // line is the spawned child.
+        let output = "mention @chat:00000000-0000-0000-0000-000000000001\nspawned @chat:3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
+        let agent = agent_exec(&call, Some(output)).unwrap();
+        assert_eq!(
+            agent.child.as_deref(),
+            Some("3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b")
+        );
+        // The row keeps the agent genus out of the "Ran N commands" fold:
+        // a lone zeron-chat exec renders as its own card.
+        let entry = assistant(
+            "e1",
+            MessageStatus::Complete,
+            vec![exec_tool(
+                "t1",
+                "zeron chat spawn --prompt hi",
+                Some(output),
+            )],
+        );
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let [row] = &rows[..] else {
+            panic!("expected exactly one row, got {}", rows.len());
+        };
+        match &row.kind {
+            RowKind::ToolGroup { tools, .. } => {
+                assert!(
+                    !tool_group_collapses(tools),
+                    "agent chips never fold behind a summary"
+                );
+                assert_eq!(
+                    tools[0].agent.as_ref().map(|a| a.verb),
+                    Some(ZeronChatVerb::Spawn)
+                );
+            }
+            _ => panic!("expected a tool group row"),
+        }
+    }
+
+    #[test]
+    fn child_update_parts_group_into_one_row() {
+        let update = |id: &str, child: &str, outcome: ChildOutcome| MessagePart::ChildUpdate {
+            id: id.into(),
+            child_chat_id: child.into(),
+            child_title: "child".into(),
+            outcome,
+            excerpt: Some("last lines".into()),
+        };
+        let entry = assistant(
+            "e1",
+            MessageStatus::Complete,
+            vec![
+                update("u1", "c1", ChildOutcome::Completed),
+                update("u2", "c2", ChildOutcome::Errored),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let [row] = &rows[..] else {
+            panic!("adjacent child updates must merge, got {}", rows.len());
+        };
+        match &row.kind {
+            RowKind::ChildUpdates { items } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].outcome, ChildOutcome::Completed);
+                assert_eq!(items[1].outcome, ChildOutcome::Errored);
+            }
+            _ => panic!("expected a child-updates row"),
+        }
+        // Update cards stay out of the timestamp strip, like fork markers.
+        assert!(row.timestamp.is_none());
     }
 }
 
