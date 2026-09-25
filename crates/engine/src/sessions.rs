@@ -133,8 +133,11 @@ struct RoutedSteer {
 struct Inner {
     device_id: String,
     /// Loopback IPC port this engine serves, once known (0 = not serving):
-    /// what the injected `zeron mcp` server dials back into.
+    /// what the injected `zeron` CLI dials back into.
     ipc_port: std::sync::atomic::AtomicU16,
+    /// The staged `zeron` CLI shim + skill bundle, prepared once at engine
+    /// assembly (see [`crate::agent_runtime`]); absent in bare tests.
+    agent_runtime: OnceLock<crate::agent_runtime::AgentRuntime>,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
@@ -187,6 +190,7 @@ impl SessionsEngine {
             inner: Arc::new(Inner {
                 device_id,
                 ipc_port: std::sync::atomic::AtomicU16::new(0),
+                agent_runtime: OnceLock::new(),
                 journal,
                 registry,
                 doc_host: Mutex::new(None),
@@ -204,12 +208,19 @@ impl SessionsEngine {
     }
 
     /// Record the loopback IPC port this engine serves. Runs started after
-    /// this carry Zeron's MCP server (see [`Inner::zeron_mcp`]); until then —
-    /// or with 0 — agents get no Zeron tools rather than a dead server.
+    /// this carry the injected `zeron` CLI context (see
+    /// [`Inner::agent_context`]); until then — or with 0 — agents get no
+    /// Zeron tools rather than a context pointing at a dead port.
     pub fn set_ipc_port(&self, port: u16) {
         self.inner
             .ipc_port
             .store(port, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Install the prepared agent runtime (CLI shim + staged skill bundle).
+    /// Called once at engine assembly; first set wins.
+    pub fn set_agent_runtime(&self, runtime: crate::agent_runtime::AgentRuntime) {
+        let _ = self.inner.agent_runtime.set(runtime);
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -1082,28 +1093,23 @@ impl Inner {
         lock(&self.doc_host).clone()
     }
 
-    /// Zeron's own MCP server for a run of `chat_id`: this binary's `zeron
-    /// mcp` subcommand, dialing the engine's IPC port and stamped with the
-    /// originating chat + device so the agent's side chats link back here.
-    /// None when the engine serves no port or its executable is unknown.
-    fn zeron_mcp(&self, chat_id: &str) -> Option<zeron_proto::McpServer> {
+    /// The orchestration context for a run of `chat_id`: the `zeron` CLI on
+    /// PATH, the chat/device/port env it dials back through, and the guide
+    /// instructions + staged skill bundle. None when the engine serves no
+    /// port or the runtime was never prepared — a context pointing at a dead
+    /// port is worse than none.
+    fn agent_context(&self, chat_id: &str) -> Option<zeron_proto::AgentContext> {
         let port = self.ipc_port.load(std::sync::atomic::Ordering::Relaxed);
         if port == 0 {
             return None;
         }
-        let command = std::env::current_exe().ok()?.to_str()?.to_owned();
-        Some(zeron_proto::McpServer {
-            name: "zeron".into(),
-            command,
-            args: vec!["mcp".into()],
-            env: [
-                ("ZERON_IPC_PORT".to_owned(), port.to_string()),
-                ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
-                ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
-            ]
-            .into_iter()
-            .collect(),
-        })
+        let runtime = self.agent_runtime.get()?;
+        Some(crate::agent_runtime::context(
+            runtime,
+            port,
+            &self.device_id,
+            chat_id,
+        ))
     }
 
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
@@ -1572,10 +1578,11 @@ async fn drive_run(
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
-    // The host stamps its own MCP server onto every run it drives, so the
+    // The host stamps the orchestration context onto every chat run it
+    // drives: the `zeron` CLI on PATH plus the guide instructions, so the
     // agent can spawn and talk to side chats through the engine it runs in.
-    if request.mcp.is_none() {
-        request.mcp = inner.zeron_mcp(&chat_id);
+    if request.agent.is_none() {
+        request.agent = inner.agent_context(&chat_id);
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside

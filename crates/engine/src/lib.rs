@@ -16,6 +16,7 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
+pub mod agent_runtime;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
@@ -222,6 +223,10 @@ impl EngineCore {
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        // The `zeron` CLI shim + staged skill bundle every chat run is
+        // stamped with. Synchronous filesystem work, so it runs here at
+        // assembly — once, off the async hot path, never fatal.
+        sessions.set_agent_runtime(agent_runtime::prepare(data_dir));
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {

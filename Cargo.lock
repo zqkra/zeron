@@ -11831,6 +11831,7 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zeron-doc",
+ "zeron-guide",
  "zeron-harness",
  "zeron-preview",
  "zeron-proto",

@@ -185,17 +185,27 @@ async fn fork_is_frozen_durable_idempotent_and_has_an_independent_provider_sessi
     .unwrap();
     let request = requests.lock().unwrap()[0].clone();
     assert_eq!(request.resume, None);
-    // The host stamps its MCP server onto the run: this binary's `zeron
-    // mcp`, dialing the served port, identified as the side chat.
-    let mcp = request
-        .mcp
+    // The host stamps the orchestration context onto the run — the `zeron`
+    // CLI env, guide instructions and staged skill bundle — and no longer
+    // auto-injects its MCP server.
+    assert_eq!(request.mcp, None);
+    let agent = request
+        .agent
         .clone()
-        .expect("run carries the zeron MCP server");
-    assert_eq!(mcp.name, "zeron");
-    assert_eq!(mcp.args, ["mcp"]);
-    assert_eq!(mcp.env["ZERON_IPC_PORT"], "27699");
-    assert_eq!(mcp.env["ZERON_CHAT_ID"], "side");
-    assert_eq!(mcp.env["ZERON_DEVICE_ID"], core.device_id);
+        .expect("run carries the agent context");
+    assert_eq!(agent.env["ZERON_IPC_PORT"], "27699");
+    assert_eq!(agent.env["ZERON_CHAT_ID"], "side");
+    assert_eq!(agent.env["ZERON_DEVICE_ID"], core.device_id);
+    assert!(
+        agent.env["ZERON_CLI"].ends_with("zeron"),
+        "{}",
+        agent.env["ZERON_CLI"]
+    );
+    assert!(agent.instructions.contains("working inside Zeron"));
+    let bundle = agent.skill_bundle.expect("skill bundle staged");
+    assert!(bundle.contains("runtime/skills"), "{bundle}");
+    assert_eq!(agent.skills.len(), 1);
+    assert!(std::path::Path::new(&agent.skills[0].path).is_file());
     assert!(request.prompt.contains("PINEAPPLE"));
     assert!(!request.prompt.contains("unfinished turn"));
     assert_eq!(source.doc().read_entries().unwrap().len(), 4);
