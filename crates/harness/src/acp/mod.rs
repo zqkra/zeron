@@ -3337,6 +3337,9 @@ async fn run_session(session: Session) {
     };
     let mut prompt_stall_deadline: Option<tokio::time::Instant> =
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
+    // Pending session-instructions prefix: withheld from slash commands,
+    // attached to the first ordinary prompt or steer the agent reads.
+    let mut agent_prefix = crate::AgentPrefix::new(request.agent.as_ref());
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_turn(
             client.clone(),
@@ -3344,11 +3347,9 @@ async fn run_session(session: Session) {
             // The first `session/prompt` after `session/new`/`session/load`
             // (fresh-session fallback included) carries the injected
             // instructions — ACP has no system-prompt channel. Exactly once
-            // per session: later turns and steers never see it.
-            crate::with_agent_prefix(
-                request.agent.as_ref(),
-                prompt_transform(request.reasoning, &request.prompt),
-            ),
+            // per session, on the first ordinary prompt: a leading slash
+            // command passes through untouched and keeps it pending.
+            agent_prefix.apply(prompt_transform(request.reasoning, &request.prompt)),
             current_prompt_id.clone(),
         )
     });
@@ -3619,7 +3620,7 @@ async fn run_session(session: Session) {
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        texts.join("\n\n"),
+                        agent_prefix.apply(texts.join("\n\n")),
                         current_prompt_id.clone(),
                     ));
                 } else if !steering_open {
@@ -3931,13 +3932,17 @@ async fn run_session(session: Session) {
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        agent_prefix.apply(text),
                         current_prompt_id.clone(),
                     ));
                 }
                 while let Some(next_text) = steer_backlog.pop_front() {
                     if turn.is_some() && !interrupted {
-                        let fut = steering_call_future(&client, &session_id, &next_text);
+                        let fut = steering_call_future(
+                            &client,
+                            &session_id,
+                            &agent_prefix.apply(next_text.clone()),
+                        );
                         steering_call = Some((next_text, fut));
                         break;
                     }
@@ -3980,7 +3985,7 @@ async fn run_session(session: Session) {
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        agent_prefix.apply(text),
                         current_prompt_id.clone(),
                     ));
                 } else if turn.is_none() && !steering_open {
@@ -4052,7 +4057,7 @@ async fn run_session(session: Session) {
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        agent_prefix.apply(text),
                         current_prompt_id.clone(),
                     ));
                 } else if !steering_open {
@@ -4115,7 +4120,7 @@ async fn run_session(session: Session) {
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        agent_prefix.apply(text),
                         current_prompt_id.clone(),
                     ));
                     } else if steer_ext {
@@ -4126,7 +4131,11 @@ async fn run_session(session: Session) {
                         if steering_call.is_some() {
                             steer_backlog.push_back(text);
                         } else {
-                            let fut = steering_call_future(&client, &session_id, &text);
+                            let fut = steering_call_future(
+                                &client,
+                                &session_id,
+                                &agent_prefix.apply(text.clone()),
+                            );
                             steering_call = Some((text, fut));
                         }
                     } else {

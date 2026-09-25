@@ -228,14 +228,30 @@ pub fn apply_agent_env(
     Some(joined)
 }
 
-/// `prompt` with the agent's system-instructions frame prepended — the
-/// delivery channel for harnesses with no system-prompt field. Apply to the
-/// FIRST prompt of each session only; the transcript never shows it because
-/// the engine writes the user bubble from `RunRequest.prompt`.
-pub fn with_agent_prefix(agent: Option<&zeron_proto::AgentContext>, prompt: String) -> String {
-    match agent {
-        Some(agent) => format!("{}{prompt}", agent.prompt_prefix()),
-        None => prompt,
+/// Once-per-session delivery state for the injected instructions prefix on
+/// harnesses with no system-prompt channel (ACP, OpenCode, Cursor). The
+/// frame is withheld while the next text the agent reads is a native slash
+/// command — a `<system_instructions>` preamble would break `/cmd`
+/// resolution — and lands on the first ordinary prompt or steer instead.
+/// Never delivered twice.
+pub struct AgentPrefix(Option<String>);
+
+impl AgentPrefix {
+    pub fn new(agent: Option<&zeron_proto::AgentContext>) -> Self {
+        Self(agent.map(|a| a.prompt_prefix()))
+    }
+
+    /// `text` with the pending prefix applied, or `text` unchanged: slash
+    /// commands pass through and keep the prefix pending, and once delivered
+    /// nothing is ever prefixed again.
+    pub fn apply(&mut self, text: String) -> String {
+        if text.trim_start().starts_with('/') {
+            return text;
+        }
+        match self.0.take() {
+            Some(prefix) => format!("{prefix}{text}"),
+            None => text,
+        }
     }
 }
 
@@ -561,11 +577,17 @@ mod agent_env_tests {
     }
 
     #[test]
-    fn with_agent_prefix_frames_the_first_prompt_only() {
-        let out = crate::with_agent_prefix(Some(&agent()), "do the thing".to_owned());
+    fn agent_prefix_frames_the_first_ordinary_prompt_only() {
+        let mut prefix = crate::AgentPrefix::new(Some(&agent()));
+        // A slash command passes through untouched and keeps the prefix.
+        assert_eq!(prefix.apply("/review src".to_owned()), "/review src");
+        // The next ordinary prompt gets it — once.
+        let out = prefix.apply("do the thing".to_owned());
         assert!(out.starts_with("<system_instructions>\ninstructions\n</system_instructions>\n\n"));
         assert!(out.ends_with("do the thing"));
-        assert_eq!(crate::with_agent_prefix(None, "plain".to_owned()), "plain");
+        assert_eq!(prefix.apply("again".to_owned()), "again");
+        let mut bare = crate::AgentPrefix::new(None);
+        assert_eq!(bare.apply("plain".to_owned()), "plain");
     }
 }
 

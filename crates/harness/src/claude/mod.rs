@@ -76,8 +76,6 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     crate::executable::find_on_paths("claude", extra)
 }
 
-/// The inline `--mcp-config` JSON for an injected server (the CLI accepts a
-/// JSON string as well as a file path).
 /// Chat-run-only args: the guide instructions appended to the system prompt,
 /// and the staged bundle as a plugin so the `zeron:zeron-cli` skill shows
 /// natively. Title runs keep `--system-prompt` and never see this.
@@ -89,6 +87,8 @@ fn apply_agent_args(cmd: &mut Command, agent: Option<&zeron_proto::AgentContext>
     }
 }
 
+/// The inline `--mcp-config` JSON for an injected server (the CLI accepts a
+/// JSON string as well as a file path).
 fn mcp_config_arg(mcp: &zeron_proto::McpServer) -> String {
     serde_json::json!({
         "mcpServers": {

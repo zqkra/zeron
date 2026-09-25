@@ -347,7 +347,10 @@ impl Harness for CursorHarness {
         // The first prompt of the run carries the injected instructions as a
         // prefix — the SDK exposes no system-prompt channel. The transcript
         // is untouched: the engine writes the user bubble from the request.
-        let first_prompt = crate::with_agent_prefix(request.agent.as_ref(), request.prompt.clone());
+        // A leading slash command passes through untouched; the pending
+        // prefix moves with the session and lands on the next ordinary text.
+        let mut agent_prefix = crate::AgentPrefix::new(request.agent.as_ref());
+        let first_prompt = agent_prefix.apply(request.prompt.clone());
         let first = json!({
             "op": "run",
             "prompt": first_prompt,
@@ -375,6 +378,7 @@ impl Harness for CursorHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
+            agent_prefix,
         }));
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
@@ -495,6 +499,7 @@ struct Session {
     interrupt_grace: Duration,
     kill_grace: Duration,
     stderr_tail: crate::StderrTail,
+    agent_prefix: crate::AgentPrefix,
 }
 
 fn new_message_id() -> String {
@@ -514,6 +519,7 @@ async fn run_session(session: Session) {
         interrupt_grace,
         kill_grace,
         stderr_tail,
+        mut agent_prefix,
     } = session;
     let RunControls {
         request_input: _request_input,
@@ -652,7 +658,8 @@ async fn run_session(session: Session) {
                     pending_steers += 1;
                     parked = false;
                     any_done = false;
-                    let _ = stdin_tx.send(json!({ "op": "steer", "prompt": msg.prompt }).to_string());
+                    let _ = stdin_tx
+                        .send(json!({ "op": "steer", "prompt": agent_prefix.apply(msg.prompt) }).to_string());
                 }
                 None => {
                     steering_open = false;
