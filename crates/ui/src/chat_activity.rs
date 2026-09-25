@@ -562,6 +562,20 @@ impl ChatActivity {
         let event = row.event();
         let query = self.search.read(cx).text().trim().to_owned();
         let label = SharedString::from(row.title().to_owned());
+        // Agent-spawned children dress like native subagent rows: harness
+        // mark beside the status, model faint ahead of the time (spec U4).
+        // Side chats keep the plain title row.
+        let in_agents = self.tab == ActivityTab::Subagents;
+        let (mark, model) = match row {
+            ActivityRow::Chat(row) if in_agents => (
+                row.harness
+                    .map(crate::pickers::harness_brand_icon)
+                    .unwrap_or((icons::BOT, None)),
+                row.model.clone(),
+            ),
+            _ => ((icons::BOT, None), None),
+        };
+        let show_mark = matches!(row, ActivityRow::Chat(row) if in_agents && row.harness.is_some());
         let mut item = div()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id.clone())
@@ -587,6 +601,14 @@ impl ChatActivity {
                 cx.emit(event.clone());
             }))
             .child(glyph)
+            .when(show_mark, |item| {
+                item.child(
+                    icon(mark.0)
+                        .size(px(13.0))
+                        .flex_none()
+                        .text_color(mark.1.unwrap_or(theme.text_muted)),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -597,6 +619,15 @@ impl ChatActivity {
                     .text_color(theme.text)
                     .child(popover::search_highlight(label, Some(&query), &theme)),
             )
+            .when_some(model, |item, model| {
+                item.child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .text_color(theme.text_muted)
+                        .child(model),
+                )
+            })
             .children(pr.map(|pr| {
                 crate::change_requests::pull_request_badge(
                     format!("chat-activity-pr-{ix}").into(),
@@ -840,6 +871,10 @@ pub(crate) struct ChildChatRow {
     pub title: SharedString,
     pub status: ChatIndicator,
     pub time_ago: SharedString,
+    /// The chat's harness/model — the Subagents tab wears them the way the
+    /// sidebar's session rows do (spec U4).
+    pub harness: Option<zeron_proto::HarnessId>,
+    pub model: Option<SharedString>,
     /// The chat's linked pull request, drawn as the sidebar's badge.
     pub change_request: Option<zeron_proto::ChangeRequestSummary>,
     activity: DateTime<Utc>,
@@ -870,6 +905,12 @@ pub(crate) fn child_chat_rows(
                 title: child_chat_title(chat).into(),
                 status: state.display_status_for(chat, now),
                 time_ago: zeron_proto::view::format_time_ago(activity, now).into(),
+                harness: chat.config.as_ref().map(|config| config.harness),
+                model: chat
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.model.clone())
+                    .map(SharedString::from),
                 change_request: state.change_request_for_chat(chat).cloned(),
                 activity,
             }
