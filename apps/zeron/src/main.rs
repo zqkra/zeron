@@ -320,10 +320,7 @@ fn main() -> anyhow::Result<()> {
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
                 data_dir: paths::data_dir(),
-                ipc_port: std::env::var("ZERON_IPC_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
+                ipc_port: ipc_port_from_env(),
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
@@ -370,10 +367,7 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
     zeron_engine::EngineConfig {
         data_dir: paths::data_dir(),
         edge_url: edge_url_from_env(),
-        ipc_port: std::env::var("ZERON_IPC_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
+        ipc_port: ipc_port_from_env(),
         default_harness: harness_from_env(),
         // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
         // default "dev-org") scopes the workspace room otherwise.
@@ -385,10 +379,9 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
     }
 }
 
-/// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
-/// config row — `mock` powers the e2e smoke; default `claude-code`.
-/// `ZERON_IPC_PORT` for the loopback engine IPC (shared by `sync`, `chat`,
-/// `harness`, `model` — `guide` needs no engine).
+/// `ZERON_IPC_PORT` for the loopback engine IPC — the one resolver shared by
+/// `sync`, `chat`, `harness`, `model`, the engine config and the headed app's
+/// daemon probe (`guide` needs no engine).
 fn ipc_port_from_env() -> u16 {
     std::env::var("ZERON_IPC_PORT")
         .ok()
@@ -431,7 +424,9 @@ fn maybe_reexec_injected_cli() {
         std::env::var_os("ZERON_CLI_REEXEC").is_some(),
     );
     let Some(target) = target else { return };
-    // Safety: the child must not re-exec again — the guard is inherited.
+    // Safety: this runs before the tokio runtime or any thread exists — the
+    // process is single-threaded, so mutating the environment cannot race.
+    // The child must not re-exec again — the guard is inherited.
     unsafe { std::env::set_var("ZERON_CLI_REEXEC", "1") };
     #[cfg(unix)]
     {
@@ -451,6 +446,8 @@ fn maybe_reexec_injected_cli() {
     }
 }
 
+/// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
+/// config row — `mock` powers the e2e smoke; default `claude-code`.
 fn harness_from_env() -> zeron_engine::HarnessId {
     match std::env::var("ZERON_HARNESS").as_deref().map(str::trim) {
         Ok("mock") => zeron_engine::HarnessId::Mock,
