@@ -31,6 +31,7 @@
 mod antigravity_paths;
 mod devin_models;
 mod normalize;
+mod pi_mcp;
 mod subagent;
 mod subagent_devin;
 mod system_message;
@@ -243,8 +244,9 @@ fn grok_spec() -> AcpAgentSpec {
                 options: Vec::new(),
             }]
         },
-        // No `_session/steering` extension: steers deliver at turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
+        // No `_session/steering` extension: a steer preempts the generation
+        // (waiting out running tools) and continues the turn — immediate.
+        steering_mode: SteeringMode::StepBoundary,
         // Grok Build's advertised efforts (default high); applied through the
         // session's `thought_level` config option.
         reasoning_levels: &[
@@ -328,7 +330,9 @@ fn devin_spec() -> AcpAgentSpec {
                 },
             ]
         },
-        steering_mode: SteeringMode::TurnBoundary,
+        // No `_session/steering` extension: a steer preempts the generation
+        // (waiting out running tools) and continues the turn — immediate.
+        steering_mode: SteeringMode::StepBoundary,
         // Effort is encoded in Devin's advertised model ids, not a separate
         // thought_level config option.
         reasoning_levels: &[],
@@ -451,8 +455,9 @@ fn pi_spec() -> AcpAgentSpec {
                 options: Vec::new(),
             }]
         },
-        // The adapter has no `_session/steering` extension: turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
+        // No `_session/steering` extension: a steer preempts the generation
+        // (waiting out running tools) and continues the turn — immediate.
+        steering_mode: SteeringMode::StepBoundary,
         // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
         // equivalent and is left to the agent default).
         reasoning_levels: &[
@@ -771,6 +776,9 @@ fn antigravity_spec() -> AcpAgentSpec {
                 },
             ]
         },
+        // No preemption: agy_acp_server 1.1.1 never answers a prompt (or any
+        // later one) when a cancel lands as it starts replying after a tool
+        // (verified on the wire). Steers wait for the turn end instead.
         steering_mode: SteeringMode::TurnBoundary,
         reasoning_levels: &[],
         prompt_transform: identity_transform,
@@ -965,7 +973,8 @@ impl AcpHarness {
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
-        let (_scratch, mut child, _stderr) = self.spawn_agent(home.as_deref(), false, &[]).await?;
+        let (_scratch, mut child, _stderr) =
+            self.spawn_agent(home.as_deref(), false, &[], None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1344,6 +1353,7 @@ impl AcpHarness {
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
+        mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<(Option<ScratchDir>, Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
@@ -1365,6 +1375,13 @@ impl AcpHarness {
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
         }
+        let scratch = if self.spec.id == HarnessId::Pi
+            && let Some(mcp) = mcp
+        {
+            Some(pi_mcp::configure(&mut cmd, mcp)?)
+        } else {
+            scratch
+        };
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1402,7 +1419,7 @@ impl AcpHarness {
         cwd: Option<&std::path::Path>,
     ) -> Result<Vec<SlashCommand>, HarnessError> {
         let (_scratch, mut child, _stderr) = self
-            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[])
+            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[], None)
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1469,7 +1486,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
+        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[], None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1947,8 +1964,9 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (scratch, mut child, stderr_tail) =
-            self.spawn_agent(Some(&request.cwd), true, &[]).await?;
+        let (scratch, mut child, stderr_tail) = self
+            .spawn_agent(Some(&request.cwd), true, &[], request.mcp.as_ref())
+            .await?;
         let stdin = child
             .stdin
             .take()
@@ -1972,6 +1990,7 @@ impl Harness for AcpHarness {
             prompt_transform: self.spec.prompt_transform,
             effort_values: self.spec.effort_values,
             prompt_complete_extension: self.spec.prompt_complete_extension,
+            preempt_steers: self.spec.steering_mode == SteeringMode::StepBoundary,
             prompt_stall: self.spec.prompt_stall,
             stall_hint: self.spec.stall_hint,
             effort_in_model_id: self.spec.effort_in_model_id,
@@ -2010,6 +2029,8 @@ struct Session {
     harness: HarnessId,
     agent_name: &'static str,
     prompt_complete_extension: bool,
+    /// Steers preempt the generation (descriptor: mid-turn steering).
+    preempt_steers: bool,
     prompt_stall: Option<Duration>,
     stall_hint: &'static str,
     effort_in_model_id: bool,
@@ -2048,6 +2069,27 @@ fn initialize_params(harness: HarnessId) -> Value {
         // the diff pane, and commands belong to the agent's own sandbox.
         "clientCapabilities": capabilities,
     })
+}
+
+/// `session/new` `mcpServers` for an injected server: ACP spells a stdio
+/// server as name/command/args plus `[{name, value}]` env pairs. Empty when
+/// the host injected nothing — the user's own servers come from the agent's
+/// config, never from here.
+fn acp_mcp_servers(mcp: Option<&zeron_proto::McpServer>) -> Vec<Value> {
+    mcp.into_iter()
+        .map(|mcp| {
+            json!({
+                "name": mcp.name,
+                "command": mcp.command,
+                "args": mcp.args,
+                "env": mcp
+                    .env
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
@@ -2490,16 +2532,16 @@ fn prompt_turn(
     text: String,
     prompt_id: Option<String>,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
-    Box::pin(async move {
-        let mut params = json!({
-            "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": text }],
-        });
-        if let Some(id) = prompt_id {
-            params["_meta"] = json!({ "promptId": id, "requestId": id });
-        }
-        client.request("session/prompt", params).await
-    })
+    let mut params = json!({
+        "sessionId": session_id,
+        "prompt": [{ "type": "text", "text": text }],
+    });
+    if let Some(id) = prompt_id {
+        params["_meta"] = json!({ "promptId": id, "requestId": id });
+    }
+    // Written now, not on first poll: a steer's `session/cancel` issued in
+    // the same loop iteration must reach the agent after this prompt.
+    client.request_now("session/prompt", params)
 }
 
 /// Answer a server→client request. Permission requests are auto-accepted with
@@ -2964,6 +3006,7 @@ async fn run_session(session: Session) {
         harness,
         agent_name,
         prompt_complete_extension,
+        preempt_steers,
         prompt_stall,
         stall_hint,
         effort_in_model_id,
@@ -2991,7 +3034,10 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        let session_params = json!({
+            "cwd": request.cwd,
+            "mcpServers": acp_mcp_servers(request.mcp.as_ref()),
+        });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
@@ -3301,6 +3347,19 @@ async fn run_session(session: Session) {
     let mut steering_call: Option<(String, BoxFuture<'static, Result<Value, HarnessError>>)> = None;
     let mut steer_backlog: VecDeque<String> = VecDeque::new();
     let mut steering_open = true;
+    // Immediate steering for agents without a mid-turn steering extension:
+    // a steer cancels the current generation (never a running tool — it
+    // waits for open tools to finish) and the cancelled turn continues as the
+    // steer's prompt in the same session, the way Codex `turn/steer` behaves.
+    let mut preempt_pending = false;
+    let mut preempt_sent = false;
+    // Cancel only while the current prompt is visibly generating (its latest
+    // update is text or thought): Grok drops a prompt cancelled before it
+    // produced anything from its history (verified live, grok-4.7), and a
+    // tool boundary is where agents are least ready for a cancel.
+    // `generating_seq` is the prompt (`prompt_seq`) whose latest update is a
+    // text/thought chunk.
+    let mut generating_seq: u64 = 0;
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut done_current = false;
@@ -3475,45 +3534,62 @@ async fn run_session(session: Session) {
                 {
                     break 'main;
                 }
-                let (status, mut error) = stop_outcome(&res, interrupted);
-                if !interrupted && auth_method.is_some() && res.as_ref().is_err_and(is_auth_required) {
-                    error = Some(not_signed_in(agent_name));
-                }
-                done_current = true;
-                if interrupted {
-                    done_after_interrupt = true;
-                }
-                if !send(
-                    &event_tx,
-                    AgentEvent::Done {
-                        status,
-                        result: None,
-                        error,
-                        session_id: Some(session_id.clone()),
-                    },
-                )
-                .await
-                {
-                    break 'main;
-                }
-                if interrupted || res.is_err() {
-                    break 'main;
-                }
-                // Persistent session: a queued steer becomes the next turn;
-                // otherwise stay alive for the mailbox — the caller owns
-                // teardown (mirrors the codex harness).
-                if let Some(text) = queued_steers.pop_front() {
-                    let (prev, next) = rotate(&mut assistant_message_id);
+                // A steer preempted this turn: the session lives on and the
+                // steers continue it below, so there is no turn end to report.
+                let preempted = std::mem::take(&mut preempt_sent)
+                    && !interrupted
+                    && res.is_ok()
+                    && !queued_steers.is_empty();
+                preempt_pending = false;
+                if !preempted {
+                    let (status, mut error) = stop_outcome(&res, interrupted);
+                    if !interrupted
+                        && auth_method.is_some()
+                        && res.as_ref().is_err_and(is_auth_required)
+                    {
+                        error = Some(not_signed_in(agent_name));
+                    }
+                    done_current = true;
+                    if interrupted {
+                        done_after_interrupt = true;
+                    }
                     if !send(
                         &event_tx,
-                        AgentEvent::Steered {
-                            assistant_message_id: Some(prev),
-                            next_assistant_message_id: Some(next),
+                        AgentEvent::Done {
+                            status,
+                            result: None,
+                            error,
+                            session_id: Some(session_id.clone()),
                         },
                     )
                     .await
                     {
                         break 'main;
+                    }
+                    if interrupted || res.is_err() {
+                        break 'main;
+                    }
+                }
+                // Persistent session: queued steers become the next prompt —
+                // all of them at once, each confirmed by its own Steered
+                // boundary; otherwise stay alive for the mailbox — the caller
+                // owns teardown (mirrors the codex harness).
+                if !queued_steers.is_empty() {
+                    let mut texts = Vec::with_capacity(queued_steers.len());
+                    while let Some(text) = queued_steers.pop_front() {
+                        let (prev, next) = rotate(&mut assistant_message_id);
+                        if !send(
+                            &event_tx,
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(next),
+                            },
+                        )
+                        .await
+                        {
+                            break 'main;
+                        }
+                        texts.push(text);
                     }
                     done_current = false;
                     open_tools.clear();
@@ -3526,7 +3602,7 @@ async fn run_session(session: Session) {
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        texts.join("\n\n"),
                         current_prompt_id.clone(),
                     ));
                 } else if !steering_open {
@@ -3560,6 +3636,21 @@ async fn run_session(session: Session) {
                         );
                     if !boilerplate {
                         prompt_stall_deadline = None;
+                    }
+                    if method == "session/update" {
+                        match params
+                            .get("update")
+                            .and_then(|u| u.get("sessionUpdate"))
+                            .and_then(Value::as_str)
+                        {
+                            Some("agent_message_chunk") | Some("agent_thought_chunk") => {
+                                generating_seq = prompt_seq;
+                            }
+                            Some("tool_call") | Some("tool_call_update") | Some("plan") => {
+                                generating_seq = 0;
+                            }
+                            _ => {}
+                        }
                     }
                     // `_x.ai/session/prompt_complete` — the AUTHORITATIVE
                     // turn end for agents advertising it (grok): the
@@ -3611,6 +3702,17 @@ async fn run_session(session: Session) {
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
+                    }
+                    // A waiting steer preempts once no tool is open and the
+                    // agent is generating again.
+                    if preempt_pending
+                        && !preempt_sent
+                        && turn.is_some()
+                        && open_tools.is_empty()
+                        && generating_seq == prompt_seq
+                    {
+                        client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
+                        preempt_sent = true;
                     }
                 }
                 Some(Incoming::Request { id, method, params }) => {
@@ -4011,8 +4113,21 @@ async fn run_session(session: Session) {
                             steering_call = Some((text, fut));
                         }
                     } else {
-                        // No extension (Grok today): turn-boundary delivery.
+                        // No extension: preempt the generation and continue
+                        // the turn with this steer (see `preempt_pending`).
                         queued_steers.push_back(text);
+                        preempt_pending = preempt_steers;
+                        if preempt_pending
+                            && !preempt_sent
+                            && open_tools.is_empty()
+                            && generating_seq == prompt_seq
+                        {
+                            client.notify(
+                                "session/cancel",
+                                Some(json!({ "sessionId": session_id })),
+                            );
+                            preempt_sent = true;
+                        }
                     }
                 }
                 None => {
@@ -5138,4 +5253,32 @@ fn explicit_program_launches_do_not_get_archive_scratch_roots() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-antigravity-acp.sh"),
     );
     assert!(harness.adapter_scratch().unwrap().is_none());
+}
+
+#[cfg(test)]
+mod mcp_injection_tests {
+    use super::*;
+
+    #[test]
+    fn acp_mcp_servers_spell_env_as_name_value_pairs_and_default_empty() {
+        assert!(acp_mcp_servers(None).is_empty());
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/opt/zeron/zeron".into(),
+            args: vec!["mcp".into()],
+            env: [("ZERON_IPC_PORT".to_owned(), "27654".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let servers = acp_mcp_servers(Some(&mcp));
+        assert_eq!(
+            servers,
+            vec![json!({
+                "name": "zeron",
+                "command": "/opt/zeron/zeron",
+                "args": ["mcp"],
+                "env": [{ "name": "ZERON_IPC_PORT", "value": "27654" }],
+            })]
+        );
+    }
 }

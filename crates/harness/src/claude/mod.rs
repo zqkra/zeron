@@ -76,6 +76,21 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     crate::executable::find_on_paths("claude", extra)
 }
 
+/// The inline `--mcp-config` JSON for an injected server (the CLI accepts a
+/// JSON string as well as a file path).
+fn mcp_config_arg(mcp: &zeron_proto::McpServer) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            &mcp.name: {
+                "command": mcp.command,
+                "args": mcp.args,
+                "env": mcp.env,
+            }
+        }
+    })
+    .to_string()
+}
+
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     match options.get(key) {
         Some(Value::Bool(b)) => *b,
@@ -161,6 +176,7 @@ impl ClaudeHarness {
             // Required by the CLI alongside `-p --output-format stream-json`.
             "--verbose",
             "--include-partial-messages",
+            "--replay-user-messages",
             // Newer Claude models emit no readable thinking text unless a
             // summary is asked for (raw reasoning stays provider-private).
             "--thinking-display",
@@ -491,6 +507,7 @@ impl Harness for ClaudeHarness {
         request.resume = None;
         request.worktree = None;
         request.attachments.clear();
+        request.mcp = None;
         request.model_options.clear();
         request.auto_approve = false;
         self.run_with_mode(request, controls, true).await
@@ -518,6 +535,11 @@ impl ClaudeHarness {
                 "--setting-sources",
                 "",
             ]);
+        } else if let Some(mcp) = &request.mcp {
+            // Zeron's own server rides beside the user's configured servers
+            // (no `--strict-mcp-config`): the CLI merges an inline JSON
+            // config with settings-sourced ones.
+            cmd.args(["--mcp-config", &mcp_config_arg(mcp)]);
         }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -725,6 +747,7 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     let mut norm = Normalizer::new();
+    let mut pending_steers = std::collections::VecDeque::new();
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -758,8 +781,25 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
+                    // Only the CLI's replay confirms that a prompt joined its
+                    // conversation. Writing stdin must not split ongoing text.
+                    if let Frame::User(ref user) = frame {
+                        if user.parent_tool_use_id.is_none() && user.uuid.as_ref().is_some_and(|id| pending_steers.front() == Some(id)) {
+                            pending_steers.pop_front();
+                            let (prev, next) = norm.rotate_for_steer();
+                            if event_tx.send(Ok(AgentEvent::Steered {
+                                assistant_message_id: Some(prev), next_assistant_message_id: Some(next),
+                            })).await.is_err() { break 'main; }
+                        }
+                    }
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
+                        // A `now` steer ends the turn it interrupts with a
+                        // result frame; the steer continues the run, so that
+                        // result is a steer boundary, not the end of the turn.
+                        if is_done && !interrupted && !pending_steers.is_empty() {
+                            continue;
+                        }
                         if event_tx.send(Ok(ev)).await.is_err() {
                             break 'main; // consumer gone — reap below
                         }
@@ -781,19 +821,10 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
-                    let _ = stdin_tx.send(StdinMsg::Line(line));
-                    // The CLI consumes the queued line at its own step
-                    // boundary; rotate the assistant message id so post-steer
-                    // output folds into a fresh message.
-                    let (prev, next) = norm.rotate_for_steer();
-                    let ev = AgentEvent::Steered {
-                        assistant_message_id: Some(prev),
-                        next_assistant_message_id: Some(next),
-                    };
-                    if event_tx.send(Ok(ev)).await.is_err() {
-                        break 'main;
-                    }
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let line = wire::steer_message_line(&apply_ultrathink(reasoning, &msg.prompt), &id);
+                    pending_steers.push_back(id);
+                    if stdin_tx.send(StdinMsg::Line(line)).is_err() { break 'main; }
                 }
                 None => {
                     // Mailbox closed: end the input so the run can finish
@@ -1017,5 +1048,32 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod mcp_injection_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_config_arg_spells_the_server_the_way_the_cli_reads_it() {
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/opt/zeron/zeron".into(),
+            args: vec!["mcp".into()],
+            env: [("ZERON_CHAT_ID".to_owned(), "chat-1".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let parsed: Value = serde_json::from_str(&mcp_config_arg(&mcp)).unwrap();
+        assert_eq!(parsed["mcpServers"]["zeron"]["command"], "/opt/zeron/zeron");
+        assert_eq!(
+            parsed["mcpServers"]["zeron"]["args"],
+            serde_json::json!(["mcp"])
+        );
+        assert_eq!(
+            parsed["mcpServers"]["zeron"]["env"]["ZERON_CHAT_ID"],
+            "chat-1"
+        );
     }
 }

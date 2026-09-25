@@ -63,9 +63,11 @@ mod actions_ui;
 mod command_palette;
 mod files_panel;
 mod project_icon;
+mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
-mod spaces;
+pub(crate) mod spaces;
+use side_chats::SideChatTab;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
@@ -174,9 +176,19 @@ enum ChatMenuPage {
     Copy,
 }
 
+#[derive(Clone, Copy)]
+enum TabCloseAction {
+    This,
+    Others,
+    Left,
+    Right,
+}
+
 #[derive(Clone)]
 struct ChatMenuState {
+    // Empty for surfaces that have no underlying chat.
     chat_id: String,
+    tab: Option<(String, RightSurface)>,
     position: Point<Pixels>,
     page: ChatMenuPage,
 }
@@ -667,6 +679,7 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    SideChat(u64),
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -908,7 +921,11 @@ const SIDEBAR_FOOTER_AVATAR_SIZE: f32 = 16.0;
 
 /// Keep the fade short so only the last few glyphs recede. Tracking clipped
 /// content lets the shared paint-time overflow gate leave fitting labels intact.
-fn sidebar_faded_label(id: SharedString, fill: bool, label: impl IntoElement) -> impl IntoElement {
+pub(crate) fn sidebar_faded_label(
+    id: SharedString,
+    fill: bool,
+    label: impl IntoElement,
+) -> impl IntoElement {
     let overflow = gpui::ScrollHandle::new();
     crate::edge_fade::edge_faded(
         20.0,
@@ -1735,6 +1752,10 @@ pub struct Shell {
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
+    side_chats: std::collections::HashMap<u64, SideChatTab>,
+    side_chat_seq: u64,
+    side_chat_creating: bool,
+    side_chat_error: Option<SharedString>,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -2171,6 +2192,10 @@ impl Shell {
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            side_chats: std::collections::HashMap::new(),
+            side_chat_seq: 0,
+            side_chat_creating: false,
+            side_chat_error: None,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -2364,6 +2389,11 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         self.prune_file_explorers(cx);
+        if state.read(cx).engine().is_none() {
+            self.side_chats.clear();
+            self.side_chat_creating = false;
+            self.side_chat_error = None;
+        }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.sidebar_notice = Some(notice.into());
         }
@@ -2482,6 +2512,7 @@ impl Shell {
                 crate::sound::SessionNotificationState,
                 bool,
                 Option<String>,
+                bool,
             );
             let (sessions, connectivity, connectivity_observed) = {
                 let state = state.read(cx);
@@ -2491,12 +2522,10 @@ impl Shell {
                     .map(|s| {
                         let status = crate::sound::SessionNotificationState::new(s, now);
                         let send_pending = state.send_pending(&s.chat_id, now);
-                        let title = state
-                            .chats
-                            .iter()
-                            .find(|c| c.id == s.chat_id)
-                            .and_then(|c| c.title.clone());
-                        (s.chat_id.clone(), status, send_pending, title)
+                        let chat = state.chats.iter().find(|c| c.id == s.chat_id);
+                        let title = chat.and_then(|c| c.title.clone());
+                        let notify = chat.is_some_and(|c| c.parent_chat_id.is_none());
+                        (s.chat_id.clone(), status, send_pending, title, notify)
                     })
                     .collect();
                 (
@@ -2510,9 +2539,12 @@ impl Shell {
             // focused app still stays a chime — you're already looking at
             // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
-            for (chat_id, status, send_pending, title) in sessions {
+            for (chat_id, status, send_pending, title, notify) in sessions {
                 let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
-                if let Some(prev) = prev
+                // Keep side-chat baselines current, but never emit their
+                // completion, input-request, or failure sounds/banners.
+                if notify
+                    && let Some(prev) = prev
                     && let Some(sound) = status.sound_since(&prev, send_pending)
                 {
                     if self.settings.session_sound_enabled(sound) {
@@ -2888,6 +2920,15 @@ impl Shell {
                     .iter()
                     .find(|(k, _, _)| k == tab)
                     .map(|(_, title, _)| (*surface, title.clone(), false, None)),
+                RightSurface::SideChat(id) => self.side_chats.get(id).map(|tab| {
+                    let title = tab
+                        .state
+                        .read(cx)
+                        .selected_chat_row()
+                        .and_then(|c| c.title.clone())
+                        .unwrap_or_else(|| "Side chat".into());
+                    (*surface, title.into(), false, None)
+                }),
                 RightSurface::Subagent(id) => self
                     .subagent_tabs
                     .get(id)
@@ -2916,6 +2957,7 @@ impl Shell {
             RightSurface::Picker
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
+            | RightSurface::SideChat(_)
             | RightSurface::Subagent(_)
             | RightSurface::Browser(_) => {
                 return None;
@@ -2968,7 +3010,7 @@ impl Shell {
         let picked = self.panels.get(&self.panel_key(cx)).right_active;
         let rows = self.right_surface_rows(cx);
         let exists = match picked {
-            RightSurface::Picker => false,
+            RightSurface::Picker => true,
             surface => rows.iter().any(|(s, _, _, _)| *s == surface),
         };
         if exists {
@@ -3021,6 +3063,14 @@ impl Shell {
             }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
+            RightSurface::SideChat(id) => {
+                if let Some(tab) = self.side_chats.get(&id) {
+                    tab.composer.update(cx, |composer, cx| {
+                        composer.focus_pending = true;
+                        cx.notify();
+                    });
+                }
+            }
             RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
             RightSurface::Picker => {}
         }
@@ -3321,6 +3371,13 @@ impl Shell {
                     FilesEvent::CloseReady => {
                         this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
                     }
+                    // Footer rows exist on the explorer only; an editor
+                    // surface never emits them.
+                    FilesEvent::OpenSubagent { .. }
+                    | FilesEvent::OpenChildChat(_)
+                    | FilesEvent::ChildChatContextMenu { .. }
+                    | FilesEvent::NewChildChat
+                    | FilesEvent::ForkChat => {}
                     FilesEvent::CloseCancelled => {
                         this.cancel_file_close(RightSurface::File(id), cx)
                     }
@@ -3575,7 +3632,12 @@ impl Shell {
                 .update(cx, |s, cx| s.watch_subagent_doc(doc_id.to_string(), cx));
             return None;
         };
-        let blob_ref = format!("{chat_id}/{doc_id}");
+        // Copied spawn chips retain their original subagent doc namespace.
+        let source_chat = doc_id
+            .split_once("--sub--")
+            .map(|(source, _)| source)
+            .unwrap_or(chat_id);
+        let blob_ref = format!("{source_chat}/{doc_id}");
         let state = self.state.clone();
         let doc_id = doc_id.to_string();
         Some(cx.spawn(async move |_, cx| {
@@ -3619,8 +3681,36 @@ impl Shell {
         }))
     }
 
-    /// A surface tab's ✕. The active fallback happens naturally through
-    /// [`Self::resolved_right_active`] on the next frame.
+    /// Snapshot the displayed order before closing tabs mutates it.
+    fn tabs_to_close(
+        &self,
+        surface: RightSurface,
+        action: TabCloseAction,
+        cx: &App,
+    ) -> Vec<RightSurface> {
+        let tabs: Vec<_> = self
+            .right_surface_rows(cx)
+            .into_iter()
+            .map(|(tab, _, _, _)| tab)
+            .collect();
+        let Some(index) = tabs.iter().position(|tab| *tab == surface) else {
+            return Vec::new();
+        };
+        tabs.into_iter()
+            .enumerate()
+            .filter_map(|(i, tab)| {
+                let close = match action {
+                    TabCloseAction::This => i == index,
+                    TabCloseAction::Others => i != index,
+                    TabCloseAction::Left => i < index,
+                    TabCloseAction::Right => i > index,
+                };
+                close.then_some(tab)
+            })
+            .collect()
+    }
+
+    /// Close one surface through its normal lifecycle, including unsaved-file prompts.
     fn close_right_surface(
         &mut self,
         surface: RightSurface,
@@ -3668,6 +3758,12 @@ impl Shell {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
             }
+            RightSurface::SideChat(id) => {
+                self.side_chats.remove(&id);
+                if was_active {
+                    window.focus(&self.composer.focus_handle(cx), cx);
+                }
+            }
             RightSurface::Subagent(id) => {
                 // Unwatch drops the watch task — that cancels the engine-side
                 // watch and unpins the subagent doc from the engine LRU.
@@ -3678,9 +3774,16 @@ impl Shell {
             }
             RightSurface::Picker => {}
         }
+        self.close_empty_right_pane(&key, cx);
+        let fallback = self
+            .right_tabs
+            .get(&key)
+            .and_then(|tabs| tabs.first())
+            .copied()
+            .unwrap_or_default();
         self.panels.update(&key, |p| {
             if p.right_active == surface {
-                p.right_active = RightSurface::Picker;
+                p.right_active = fallback;
             }
         });
         self.collapse_surfaces_if_empty(&key, cx);
@@ -3815,9 +3918,16 @@ impl Shell {
             _ => return,
         }
         self.pending_file_closes.remove(&surface);
+        self.close_empty_right_pane(panel_key, cx);
+        let fallback = self
+            .right_tabs
+            .get(panel_key)
+            .and_then(|tabs| tabs.first())
+            .copied()
+            .unwrap_or_default();
         self.panels.update(panel_key, |panel| {
             if panel.right_active == surface {
-                panel.right_active = RightSurface::Picker;
+                panel.right_active = fallback;
             }
         });
         self.collapse_surfaces_if_empty(panel_key, cx);
@@ -6834,6 +6944,7 @@ impl Shell {
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         this.chat_menu.open(ChatMenuState {
+                            tab: None,
                             chat_id: menu_id.clone(),
                             position: event.position,
                             page: ChatMenuPage::Root,
@@ -8526,14 +8637,27 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
-        let selected_chat = self.state.read(cx).selected_chat.clone();
+        // Escape targets the conversation that owns the focused composer: a
+        // side chat's when its composer has focus, the main one otherwise.
+        let (state, composer) = self
+            .side_chats
+            .values()
+            .find(|tab| {
+                tab.composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            })
+            .map(|tab| (tab.state.clone(), tab.composer.clone()))
+            .unwrap_or_else(|| (self.state.clone(), self.composer.clone()));
+        let selected_chat = state.read(cx).selected_chat.clone();
         let indicator = selected_chat
             .as_deref()
-            .map(|chat_id| self.state.read(cx).indicator_for(chat_id, Utc::now()))
+            .map(|chat_id| state.read(cx).indicator_for(chat_id, Utc::now()))
             .unwrap_or(Indicator::None);
         let interrupting = selected_chat
             .as_deref()
-            .is_some_and(|chat_id| self.composer.read(cx).is_interrupting(chat_id));
+            .is_some_and(|chat_id| composer.read(cx).is_interrupting(chat_id));
         let escape_stops_active_agent = self.settings.escape_stops_active_agent;
 
         match resolve_shell_escape(
@@ -8548,8 +8672,7 @@ impl Shell {
             ShellEscapeOutcome::Blocked => cx.stop_propagation(),
             ShellEscapeOutcome::InterruptChat(chat_id) => {
                 cx.stop_propagation();
-                self.composer
-                    .update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
+                composer.update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
             }
             ShellEscapeOutcome::OtherKey | ShellEscapeOutcome::Ignored => {}
         }
@@ -8568,6 +8691,13 @@ impl Shell {
             let chat_id = menu_state.chat_id;
             let position = menu_state.position;
             let chat_menu_closing = self.chat_menu.closing_since();
+            let is_side_chat = matches!(menu_state.tab, Some((_, RightSurface::SideChat(_))))
+                || self
+                    .state
+                    .read(cx)
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == chat_id && chat.parent_chat_id.is_some());
             let is_pinned = self.active_sidebar_pins(cx).contains(&chat_id);
             let rename_id = chat_id.clone();
             let pin_id = chat_id.clone();
@@ -8581,6 +8711,7 @@ impl Shell {
                 .flex()
                 .flex_col();
             let menu = match menu_state.page {
+                _ if chat_id.is_empty() => menu,
                 ChatMenuPage::Root => menu
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
@@ -8591,17 +8722,22 @@ impl Shell {
                             .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Rename…")),
                     )
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
-                            .id("chat-menu-pin")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
-                            }))
-                            .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
-                            .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
-                    )
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
+                    .when(!is_side_chat, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                                .id("chat-menu-pin")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
+                                }))
+                                .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                                .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
+                        )
+                        .child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-menu-archive-{chat_id}"),
+                            )
                             .id("chat-menu-archive")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.archive_chat(archive_id.clone(), cx)
@@ -8612,23 +8748,26 @@ impl Shell {
                                     .text_color(theme.text_muted),
                             )
                             .child(SharedString::from("Archive")),
-                    )
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
-                            .id("chat-menu-copy")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(div().flex_1().child(SharedString::from("Copy")))
-                            .child(
-                                icon(icons::ALT_ARROW_RIGHT)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    )
+                        )
+                        .child(
+                            popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
+                                .id("chat-menu-copy")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)),
+                                )
+                                .child(
+                                    icon(icons::COPY)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(div().flex_1().child(SharedString::from("Copy")))
+                                .child(
+                                    icon(icons::ALT_ARROW_RIGHT)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
                     .child(popover::menu_separator())
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
@@ -8750,8 +8889,42 @@ impl Shell {
                         )
                     })
                 }
+            };
+            let mut menu = menu;
+            if let Some((key, surface)) = menu_state.tab
+                && matches!(menu_state.page, ChatMenuPage::Root)
+            {
+                if !chat_id.is_empty() {
+                    menu = menu.child(popover::menu_separator());
+                }
+                for (action, label) in [
+                    (TabCloseAction::This, "Close tab"),
+                    (TabCloseAction::Others, "Close other tabs"),
+                    (TabCloseAction::Left, "Close tabs to the left"),
+                    (TabCloseAction::Right, "Close tabs to the right"),
+                ] {
+                    let enabled = !self.tabs_to_close(surface, action, cx).is_empty();
+                    let key = key.clone();
+                    menu = menu.child(
+                        popover::menu_row(&theme, false, label)
+                            .id(SharedString::from(label))
+                            .when(!enabled, |el| el.opacity(0.4).cursor_default())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if !enabled {
+                                    return;
+                                }
+                                this.close_chat_menu(cx);
+                                if this.panel_key(cx) == key {
+                                    for tab in this.tabs_to_close(surface, action, cx) {
+                                        this.close_right_surface(tab, window, cx);
+                                    }
+                                }
+                            }))
+                            .child(label),
+                    );
+                }
             }
-            .into_any_element();
+            let menu = menu.into_any_element();
             overlays.push(popover::menu_at(
                 "chat-context-menu",
                 position,
@@ -9724,6 +9897,7 @@ impl Shell {
                     });
                     panel.into_any_element()
                 }
+                RightSurface::SideChat(id) => self.render_side_chat(id, cx),
                 RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
                     let transcript = self
                         .subagent_tabs
@@ -9796,7 +9970,10 @@ impl Shell {
             .overflow_hidden()
             // The titlebar is a glass overlay over the full-height content
             // row; the panel's own chrome starts below it.
-            .pt(px(Theme::TITLEBAR_HEIGHT))
+            .when(
+                !matches!(self.resolved_right_active(cx), RightSurface::SideChat(_)),
+                |el| el.pt(px(Theme::TITLEBAR_HEIGHT)),
+            )
             .child(content);
         let target = self.right_target(cx);
         let edge_offset = self.eval_resize_edge_bounce(
@@ -9848,6 +10025,7 @@ impl Shell {
         };
         div()
             .size_full()
+            .relative()
             .flex()
             .items_center()
             .justify_center()
@@ -10074,6 +10252,7 @@ impl Shell {
                         }
                     })
                     .unwrap_or(icons::LIST),
+                RightSurface::SideChat(_) => icons::CHAT_ROUND_LINE,
                 RightSurface::Subagent(_) => icons::BOT,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
@@ -10091,6 +10270,13 @@ impl Shell {
                 _ => None,
             };
             let subagent_running = match surface {
+                RightSurface::SideChat(id) => self.side_chats.get(&id).is_some_and(|tab| {
+                    let state = tab.state.read(cx);
+                    state
+                        .selected_chat
+                        .as_deref()
+                        .is_some_and(|id| state.indicator_for(id, Utc::now()) == Indicator::Working)
+                }),
                 RightSurface::Browser(id) => self
                     .browsers
                     .get(&id)
@@ -10162,6 +10348,26 @@ impl Shell {
                     this.set_right_active(surface, cx);
                     this.focus_right_file_editor(surface, window, cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        let chat_id = match surface {
+                            RightSurface::SideChat(id) => this
+                                .side_chats
+                                .get(&id)
+                                .and_then(|tab| tab.state.read(cx).selected_chat.clone())
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        this.chat_menu.open(ChatMenuState {
+                            chat_id,
+                            tab: Some((this.panel_key(cx), surface)),
+                            position: event.position,
+                            page: ChatMenuPage::Root,
+                        });
+                        cx.notify();
+                    }),
+                )
                 // Middle-click closes, like every tab strip.
                 .on_mouse_down(
                     gpui::MouseButton::Middle,
@@ -10383,6 +10589,20 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
+                        .child(
+                            popover::menu_row(&theme, false, "right-plus-files")
+                                .id("right-plus-files-row")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_files_surface(window, cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::FOLDER_WITH_FILES)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Files")),
+                        )
                         .child(
                             popover::menu_row(&theme, false, "right-plus-browser")
                                 .id("right-plus-browser-row")
@@ -14225,6 +14445,40 @@ mod exit_regressions {
                     shell.resolved_right_active(cx),
                     RightSurface::Browser(second)
                 );
+
+                shell.add_browser_surface(None, window, cx);
+                let third = shell.browser_seq;
+                let middle = RightSurface::Browser(second);
+                assert_eq!(
+                    shell.tabs_to_close(middle, TabCloseAction::Left, cx),
+                    vec![RightSurface::Browser(first)]
+                );
+                assert_eq!(
+                    shell.tabs_to_close(middle, TabCloseAction::Right, cx),
+                    vec![RightSurface::Browser(third)]
+                );
+                assert_eq!(
+                    shell.tabs_to_close(middle, TabCloseAction::Others, cx),
+                    vec![RightSurface::Browser(first), RightSurface::Browser(third)]
+                );
+                assert_eq!(
+                    shell.tabs_to_close(middle, TabCloseAction::This, cx),
+                    vec![middle]
+                );
+                assert!(
+                    shell
+                        .tabs_to_close(RightSurface::Browser(first), TabCloseAction::Left, cx)
+                        .is_empty()
+                );
+                assert!(
+                    shell
+                        .tabs_to_close(RightSurface::Browser(third), TabCloseAction::Right, cx)
+                        .is_empty()
+                );
+                for tab in shell.tabs_to_close(middle, TabCloseAction::Right, cx) {
+                    shell.close_right_surface(tab, window, cx);
+                }
+                shell.set_right_active(middle, cx);
 
                 // ⌘W closes the active tab, not the window.
                 assert!(shell.close_active_surface(window, cx));

@@ -132,6 +132,9 @@ struct RoutedSteer {
 
 struct Inner {
     device_id: String,
+    /// Loopback IPC port this engine serves, once known (0 = not serving):
+    /// what the injected `zeron mcp` server dials back into.
+    ipc_port: std::sync::atomic::AtomicU16,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
@@ -183,6 +186,7 @@ impl SessionsEngine {
         Self {
             inner: Arc::new(Inner {
                 device_id,
+                ipc_port: std::sync::atomic::AtomicU16::new(0),
                 journal,
                 registry,
                 doc_host: Mutex::new(None),
@@ -197,6 +201,15 @@ impl SessionsEngine {
                 turn_listener: OnceLock::new(),
             }),
         }
+    }
+
+    /// Record the loopback IPC port this engine serves. Runs started after
+    /// this carry Zeron's MCP server (see [`Inner::zeron_mcp`]); until then —
+    /// or with 0 — agents get no Zeron tools rather than a dead server.
+    pub fn set_ipc_port(&self, port: u16) {
+        self.inner
+            .ipc_port
+            .store(port, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -286,6 +299,29 @@ impl SessionsEngine {
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {
         lock(&self.inner.statuses).values().any(is_active)
+    }
+
+    /// A text prompt for `chat_id` would land in the mailbox of a live
+    /// turn-boundary agent mid-turn. The agent reads it only after the turn,
+    /// but a mailbox delivery writes the user message now — above the reply
+    /// still streaming for the message before it. Such prompts belong in the
+    /// visible queue. `request` = a Run that may differ from the live config
+    /// (a different config restarts the runtime instead, which is no hold).
+    pub fn defers_to_turn_end(
+        &self,
+        chat_id: &str,
+        request: Option<(HarnessId, &RunRequest)>,
+    ) -> bool {
+        if !self.turn_in_flight(chat_id) {
+            return false;
+        }
+        let live = lock(&self.inner.runs).get(chat_id).map(|h| {
+            (
+                h.runtime_config.harness_id,
+                h.steerable && request.is_none_or(|(id, r)| h.runtime_config.can_route(id, r)),
+            )
+        });
+        live.is_some_and(|(harness, routable)| routable && !self.steers_mid_turn(harness))
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
@@ -381,7 +417,6 @@ impl SessionsEngine {
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
                 // Register acceptance before a fast boundary can retire it.
-                let mut pending = lock(&ledger);
                 let message = SteerMessage {
                     // OpenCode must see the canonical selection before it
                     // decodes the provider command: a project-scoped command
@@ -393,11 +428,13 @@ impl SessionsEngine {
                     },
                     message_id: Some(user_id.clone()),
                 };
-                if steer_tx.try_send(message).is_ok() {
+                if let Ok(permit) = steer_tx.reserve().await {
+                    let mut pending = lock(&ledger);
                     pending.push_back(RoutedSteer {
                         prompt: request.prompt.clone(),
                         message_id: user_id.clone(),
                     });
+                    permit.send(message);
                     true
                 } else {
                     false
@@ -575,17 +612,20 @@ impl SessionsEngine {
             },
             message_id: Some(user_id.clone()),
         };
+        // Saturation is backpressure, not a dead runtime. Waiting for room
+        // preserves the live process and every accepted message in a burst.
+        let Ok(permit) = steer_tx.reserve().await else {
+            return Ok(SteerOutcome::NotSteerable);
+        };
         {
             // Serialize mailbox acceptance with confirmation and Done-time
             // inspection: a fast consumer must never outrun its ledger entry.
             let mut pending = lock(&ledger);
-            if steer_tx.try_send(message).is_err() {
-                return Ok(SteerOutcome::NotSteerable);
-            }
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),
                 message_id: user_id.clone(),
             });
+            permit.send(message);
         }
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
@@ -767,6 +807,7 @@ impl SessionsEngine {
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
+                            mcp: None,
                             prompt: String::new(),
                             harness: None,
                             model: None,
@@ -1038,6 +1079,30 @@ impl Inner {
     /// The doc host, once wired. `None` before assembly or after retirement.
     fn doc_host(&self) -> Option<DocHost> {
         lock(&self.doc_host).clone()
+    }
+
+    /// Zeron's own MCP server for a run of `chat_id`: this binary's `zeron
+    /// mcp` subcommand, dialing the engine's IPC port and stamped with the
+    /// originating chat + device so the agent's side chats link back here.
+    /// None when the engine serves no port or its executable is unknown.
+    fn zeron_mcp(&self, chat_id: &str) -> Option<zeron_proto::McpServer> {
+        let port = self.ipc_port.load(std::sync::atomic::Ordering::Relaxed);
+        if port == 0 {
+            return None;
+        }
+        let command = std::env::current_exe().ok()?.to_str()?.to_owned();
+        Some(zeron_proto::McpServer {
+            name: "zeron".into(),
+            command,
+            args: vec!["mcp".into()],
+            env: [
+                ("ZERON_IPC_PORT".to_owned(), port.to_string()),
+                ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
+                ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        })
     }
 
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
@@ -1506,6 +1571,11 @@ async fn drive_run(
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
+    // The host stamps its own MCP server onto every run it drives, so the
+    // agent can spawn and talk to side chats through the engine it runs in.
+    if request.mcp.is_none() {
+        request.mcp = inner.zeron_mcp(&chat_id);
+    }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership.
@@ -1513,6 +1583,43 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
+    // A side chat owns a fresh provider session. Bootstrap it from the frozen
+    // conversation, never resume (and mutate) the parent's provider session.
+    if request.resume.is_none()
+        && inner
+            .workspace()
+            .and_then(|ws| ws.chat(&chat_id).ok().flatten())
+            .is_some_and(|chat| chat.parent_chat_id.is_some())
+    {
+        let history: Vec<_> = doc
+            .read_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.id != resume_state.user_message_id)
+            .map(|entry| {
+                let text = entry
+                    .parts
+                    .into_iter()
+                    .filter_map(|part| match part {
+                        zeron_doc::MessagePart::Text { text, .. } => Some(text),
+                        zeron_doc::MessagePart::Tool { call, output, .. } => Some(format!(
+                            "Tool: {}\n{}",
+                            serde_json::to_string(&call).unwrap_or_default(),
+                            output.unwrap_or_default()
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::json!({ "role": entry.role, "text": text })
+            })
+            .collect();
+        request.prompt = format!(
+            "Continue this side conversation using the following prior conversation as context.\n<conversation>\n{}\n</conversation>\n\n{}",
+            serde_json::to_string(&history).unwrap_or_default(),
+            request.prompt
+        );
+    }
     // Startup can stop before the SDK saves user text, with no new session
     // ID or receipt. Bridge that unacknowledged tail from our transcript;
     // a fresh session needs all prior user text, not just the latest tail.
@@ -2379,9 +2486,15 @@ async fn drive_run(
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
+                // Accepted steers still own this runtime. Publishing Idle
+                // here lets the ordinary queue overtake that continuation.
                 inner.set_status_with_completion(
                     &chat_id,
-                    SessionStatus::Idle,
+                    if pending_steer {
+                        SessionStatus::Working
+                    } else {
+                        SessionStatus::Idle
+                    },
                     false,
                     completed_turn,
                 );
@@ -2636,6 +2749,7 @@ mod tests {
 
     fn request() -> RunRequest {
         RunRequest {
+            mcp: None,
             prompt: "first".into(),
             harness: None,
             model: Some("grok-4.6".into()),

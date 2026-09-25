@@ -118,6 +118,10 @@ case "$first" in
   emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
   # The queued steering user line, applied at "the step boundary" (here: now).
   read -r steer || exit 1
+  case "$steer" in *'"priority":"now"'*) ;; *) exit 9 ;; esac
+  # Old output continues until Claude actually consumes the input.
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"-still-first"}}}'
+  emit "$steer"
   content=$(printf '%s\n' "$steer" | sed 's/.*"content":"\([^"]*\)".*/\1/')
   emit "{\"type\":\"stream_event\",\"parent_tool_use_id\":null,\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"steered:$content\"}}}"
   emit '{"type":"result","subtype":"success","result":"steered","errors":[],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-steer"}'

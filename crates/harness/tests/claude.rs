@@ -38,6 +38,7 @@ fn harness() -> ClaudeHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -416,6 +417,18 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
             _ => None,
         })
         .expect("Steered emitted");
+    let boundary = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .unwrap();
+    let continuation = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "-still-first"))
+        .unwrap();
+    assert!(
+        continuation < boundary,
+        "sending input must not split unconsumed response text"
+    );
     assert!(steered.0.is_some() && steered.1.is_some());
     assert_ne!(steered.0, steered.1);
 

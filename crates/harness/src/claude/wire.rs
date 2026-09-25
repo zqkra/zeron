@@ -81,6 +81,8 @@ pub(crate) struct Delta {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct MessageFrame {
     #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
     pub parent_tool_use_id: Option<String>,
     #[serde(default)]
     pub message: MessageBody,
@@ -211,6 +213,17 @@ pub(crate) fn user_message_line(text: &str) -> String {
         "message": { "role": "user", "content": text },
         "parent_tool_use_id": null,
     })
+    .to_string()
+}
+
+/// Fold this input into the next model step without aborting tools or tasks.
+/// `priority: "now"` is immediate steering, verified against CLI 2.1.280:
+/// streaming text stops at once and the steer is answered next; a running
+/// tool is never killed (it finishes, background children survive) and the
+/// steer follows its result. The interrupted turn still emits a `result`.
+pub(crate) fn steer_message_line(text: &str, id: &str) -> String {
+    serde_json::json!({"type":"user", "uuid":id, "priority":"now",
+        "message":{"role":"user","content":text}, "parent_tool_use_id":null})
     .to_string()
 }
 
