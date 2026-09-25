@@ -32,6 +32,28 @@ fn capture(
     Ok(())
 }
 
+/// Region crop of the compositor output — the native-vs-orchestration spawn
+/// close-up. `geometry` is grim's `"x,y wxh"` in output coordinates.
+fn capture_region(
+    _window: gpui::AnyWindowHandle,
+    _cx: &mut AsyncApp,
+    directory: &std::path::Path,
+    name: &str,
+    geometry: &str,
+) -> anyhow::Result<()> {
+    let out = std::process::Command::new("grim")
+        .arg("-g")
+        .arg(geometry)
+        .arg(directory.join(format!("{name}.png")))
+        .output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "grim failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
 fn port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -153,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                     {"id":"u1","role":"user","parts":[{"id":"t","kind":"text","text":"Fan out the review: audit the sync layer and sketch the retry backoff, then read both reports back."}],"createdAt":1788900000000_i64,"deviceId":device},
                     {"id":"a1","role":"assistant","status":"complete","createdAt":1788900001000_i64,"deviceId":device,"parts":[
                         {"id":"p0","kind":"text","text":"Splitting the work into two child chats now — I'll wait for both and read their outputs."},
+                        {"id":"n1","kind":"tool","call":{"kind":"unknown","name":"Agent: Verify the lock ordering","input":{"model":"claude-opus-4-7"}},"resolved":true,"subagentRef":"w5-main--sub--n1","subagentStatus":"done"},
                         {"id":"t1","kind":"tool","call":{"kind":"exec","command":"zeron chat spawn --title \"Audit the sync layer\" --harness codex --model gpt-5.3-codex --prompt-file /tmp/brief-sync.md"},"resolved":true,"output":"Spawning child chat…\n@chat:3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b"},
                         {"id":"t2","kind":"tool","call":{"kind":"exec","command":"zeron chat spawn --title \"Sketch the retry backoff\" --model claude-sonnet-4-6 --prompt-file /tmp/brief-backoff.md"},"resolved":true,"output":"Spawning child chat…\n@chat:aa10bb22-1111-2222-3333-444455556666"},
                         {"id":"t3","kind":"tool","call":{"kind":"exec","command":"zeron chat tell 3f6b2a18 \"focus on the ledger rewrite\" --mode steer"},"resolved":true,"output":"delivered"},
@@ -181,6 +204,11 @@ fn main() -> anyhow::Result<()> {
                 window.update(cx,|s,_,cx|s.fixture_appshots_transcript_start(cx))?;
                 pause(cx,500).await;
                 capture(window.into(),cx,&output,"w5-transcript-dark")?;
+                // Native-vs-orchestration spawn proof: the transcript opens
+                // scrolled to the top, so the first assistant's two adjacent
+                // agent chips (native Claude "Agent:", then `zeron chat
+                // spawn`) sit in a fixed band of the floated window.
+                capture_region(window.into(),cx,&output,"w5-compare-dark","470,258 760x105")?;
                 cx.update(|cx|appearance::set_mode(appearance::AppearanceMode::Light,cx));
                 pause(cx,700).await;
                 capture(window.into(),cx,&output,"w5-transcript-light")?;
