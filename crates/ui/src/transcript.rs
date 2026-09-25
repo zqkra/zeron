@@ -2080,7 +2080,13 @@ fn part_prefix(id: &str) -> &str {
 /// live→split handoff cannot shift a pixel. Tool groups get one larger global
 /// step on either boundary so their dense chip stack has room to breathe.
 pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
-    if row.turn_start {
+    // Child-update rows are system notifications GLUED into the assistant's
+    // run — no turn gap across that seam in either direction (a following
+    // user row still starts a turn). The run keeps chip spacing throughout.
+    let child_update_seam = matches!(row.kind, RowKind::ChildUpdates { .. })
+        || (prev.is_some_and(|prev| matches!(prev.kind, RowKind::ChildUpdates { .. }))
+            && !matches!(row.kind, RowKind::User { .. }));
+    if row.turn_start && !child_update_seam {
         return Theme::SPACE_LG;
     }
     let is_md = |k: &RowKind| matches!(k, RowKind::Markdown { .. } | RowKind::LiveMarkdown { .. });
@@ -4835,6 +4841,20 @@ impl Transcript {
         // Child-update cards from back-to-back system entries collapse into
         // one "N subagents updated" row.
         merge_child_updates(&mut new_rows);
+        // The update cards continue the run they were delivered into — an
+        // entry seam's reserved timestamp strip would read as a hole between
+        // the chips and the card, so the row before a card gives it up (the
+        // run's tail row still carries the timestamp).
+        for ix in 1..new_rows.len() {
+            if matches!(new_rows[ix].kind, RowKind::ChildUpdates { .. }) {
+                let prev = &mut new_rows[ix - 1];
+                if prev.timestamp.is_some() {
+                    prev.timestamp = None;
+                    prev.copy_text = None;
+                    prev.version ^= 1 << 62;
+                }
+            }
+        }
 
         let baseline = self
             .chat_id
