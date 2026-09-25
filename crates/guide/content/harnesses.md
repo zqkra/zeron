@@ -12,7 +12,7 @@ zeron model list claude-code
 shows the models that harness offers, with their reasoning levels.
 
 `--model` accepts a full id or a shorthand that matches exactly one model
-(`sonnet` → `claude-sonnet-5`). When a shorthand matches several, or none,
+(`haiku` → `claude-haiku-4-5`). When a shorthand matches several, or none,
 the error names candidate ids — run `model list` and pick one.
 
 ## Inheritance

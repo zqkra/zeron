@@ -13,7 +13,7 @@ the Zeron that started your chat (`ZERON_CLI`), whatever PATH resolves.
 
 ```
 zeron chat spawn --prompt "Summarize the diff" --title "Diff summary"
-zeron chat spawn --prompt-file - --harness claude-code --model sonnet --reasoning high
+zeron chat spawn --prompt-file - --harness claude-code --model haiku --reasoning high
 zeron chat spawn --prompt "Fix the flaky test" --wait --timeout 20m
 ```
 

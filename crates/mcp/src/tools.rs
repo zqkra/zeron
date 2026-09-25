@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::{
-    Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
-    Space, UserInputAnswer, WorktreeSpec,
+    Chat, ChatConfig, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel, Session,
+    SessionStatus, Space, UserInputAnswer, WorktreeSpec,
 };
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
@@ -1466,12 +1466,27 @@ async fn resolve_model(zeron: &Zeron, harness: HarnessId, raw: &str) -> Result<S
     if models.is_empty() || models.iter().any(|m| m.id == raw) {
         return Ok(raw.to_owned());
     }
+    pick_model(&models, harness, raw)
+}
+
+/// Shorthand matching over the catalog: a unique substring hit on id or label
+/// wins; when every match is the shortest match or an id that extends it (a
+/// dated snapshot of the same model, `claude-haiku-4-5-20251001`), the shortest
+/// id wins; genuinely different models stay ambiguous.
+fn pick_model(models: &[Model], harness: HarnessId, raw: &str) -> Result<String, ChatError> {
     let token = raw.to_lowercase();
-    let matches: Vec<&str> = models
+    let mut matches: Vec<&str> = models
         .iter()
         .filter(|m| m.id.to_lowercase().contains(&token) || m.label.to_lowercase().contains(&token))
         .map(|m| m.id.as_str())
         .collect();
+    matches.sort_unstable_by_key(|id| id.len());
+    let matches = match matches.as_slice() {
+        [shortest, rest @ ..] if rest.iter().all(|id| id.starts_with(shortest)) => {
+            matches.split_first().map(|(s, _)| vec![*s]).unwrap()
+        }
+        many => many.to_vec(),
+    };
     match matches.as_slice() {
         [only] => Ok((*only).to_owned()),
         [] => Err(ChatError::failed(format!(
@@ -1721,6 +1736,29 @@ mod tests {
         let err = m("gpt-9").await.unwrap_err().to_string();
         assert!(err.contains("not offered"), "{err}");
         assert!(err.contains("opus"), "{err}");
+
+        // A model plus its dated snapshot collapses to the shortest id;
+        // different models sharing a token stay ambiguous.
+        let model = |id: &str| Model {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![],
+        };
+        let catalog = vec![
+            model("claude-haiku-4-5"),
+            model("claude-haiku-4-5-20251001"),
+            model("claude-sonnet-5"),
+        ];
+        assert_eq!(
+            pick_model(&catalog, HarnessId::ClaudeCode, "haiku").unwrap(),
+            "claude-haiku-4-5"
+        );
+        let err = pick_model(&catalog, HarnessId::ClaudeCode, "claude-")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "{err}");
     }
 
     #[tokio::test]
