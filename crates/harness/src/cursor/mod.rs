@@ -306,6 +306,7 @@ impl Harness for CursorHarness {
             cmd.env("ZERON_CURSOR_STATE_DIR", state::state_root());
         }
         crate::compose_child_path(&mut cmd, &exe);
+        crate::apply_agent_env(&mut cmd, request.agent.as_ref());
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -343,9 +344,13 @@ impl Harness for CursorHarness {
 
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(stdin_writer(stdin, stdin_rx));
+        // The first prompt of the run carries the injected instructions as a
+        // prefix — the SDK exposes no system-prompt channel. The transcript
+        // is untouched: the engine writes the user bubble from the request.
+        let first_prompt = crate::with_agent_prefix(request.agent.as_ref(), request.prompt.clone());
         let first = json!({
             "op": "run",
-            "prompt": request.prompt,
+            "prompt": first_prompt,
             "cwd": request.cwd,
             "model": request.model,
             // Typed parameter picks (thinking/context/effort/fast/…) — the

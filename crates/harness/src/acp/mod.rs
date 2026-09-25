@@ -973,8 +973,9 @@ impl AcpHarness {
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
-        let (_scratch, mut child, _stderr) =
-            self.spawn_agent(home.as_deref(), false, &[], None).await?;
+        let (_scratch, mut child, _stderr) = self
+            .spawn_agent(home.as_deref(), false, &[], None, None)
+            .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1354,6 +1355,7 @@ impl AcpHarness {
         block_on_install: bool,
         extra_args: &[String],
         mcp: Option<&zeron_proto::McpServer>,
+        agent: Option<&zeron_proto::AgentContext>,
     ) -> Result<(Option<ScratchDir>, Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
@@ -1361,6 +1363,7 @@ impl AcpHarness {
         cmd.args(extra_args);
         child::configure(&mut cmd);
         crate::compose_child_path(&mut cmd, &exe);
+        crate::apply_agent_env(&mut cmd, agent);
         self.configure_adapter_environment(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
@@ -1419,7 +1422,7 @@ impl AcpHarness {
         cwd: Option<&std::path::Path>,
     ) -> Result<Vec<SlashCommand>, HarnessError> {
         let (_scratch, mut child, _stderr) = self
-            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[], None)
+            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[], None, None)
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1486,7 +1489,8 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (_scratch, mut child, stderr_tail) = self.spawn_agent(None, false, &[], None).await?;
+        let (_scratch, mut child, stderr_tail) =
+            self.spawn_agent(None, false, &[], None, None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1965,7 +1969,13 @@ impl Harness for AcpHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let (scratch, mut child, stderr_tail) = self
-            .spawn_agent(Some(&request.cwd), true, &[], request.mcp.as_ref())
+            .spawn_agent(
+                Some(&request.cwd),
+                true,
+                &[],
+                request.mcp.as_ref(),
+                request.agent.as_ref(),
+            )
             .await?;
         let stdin = child
             .stdin
@@ -3331,7 +3341,14 @@ async fn run_session(session: Session) {
         prompt_turn(
             client.clone(),
             session_id.clone(),
-            prompt_transform(request.reasoning, &request.prompt),
+            // The first `session/prompt` after `session/new`/`session/load`
+            // (fresh-session fallback included) carries the injected
+            // instructions — ACP has no system-prompt channel. Exactly once
+            // per session: later turns and steers never see it.
+            crate::with_agent_prefix(
+                request.agent.as_ref(),
+                prompt_transform(request.reasoning, &request.prompt),
+            ),
             current_prompt_id.clone(),
         )
     });

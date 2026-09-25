@@ -282,19 +282,20 @@ impl OpencodeHarness {
         &self,
         cwd: Option<&str>,
         mcp: Option<&zeron_proto::McpServer>,
+        agent: Option<&zeron_proto::AgentContext>,
     ) -> Result<Server, HarnessError> {
         if let Some(base) = &self.base_url {
             return Ok(Server::attached(base.clone()));
         }
         let exe = self.resolve_executable()?;
-        Server::spawn(&exe, cwd, self.startup_timeout, mcp).await
+        Server::spawn(&exe, cwd, self.startup_timeout, mcp, agent).await
     }
 
     /// One short-lived server answers both discovery calls. Also primes the
     /// commands cache so concurrent picker/composer fetches share one boot.
     async fn probe_models(&self) -> Result<Vec<Model>, HarnessError> {
         let _guard = self.probe_lock.lock().await;
-        let mut server = self.server(None, None).await?;
+        let mut server = self.server(None, None, None).await?;
         let result = async {
             let providers = server.provider_catalog(None).await?;
             let mut models = models_from_providers(&providers);
@@ -326,7 +327,7 @@ impl OpencodeHarness {
         if let Some(commands) = self.commands_cache.get() {
             return Ok(commands.clone());
         }
-        let mut server = self.server(None, None).await?;
+        let mut server = self.server(None, None, None).await?;
         let result = server
             .commands_wire(None)
             .await
@@ -404,7 +405,7 @@ impl Harness for OpencodeHarness {
         let directory = cwd
             .to_str()
             .ok_or_else(|| HarnessError::Protocol("Project path is not UTF-8".into()))?;
-        let mut server = self.server(Some(directory), None).await?;
+        let mut server = self.server(Some(directory), None, None).await?;
         let result = server.commands_wire(Some(directory)).await;
         server.shutdown(self.kill_grace).await;
         let commands = result?;
@@ -424,7 +425,7 @@ impl Harness for OpencodeHarness {
         let directory = cwd
             .to_str()
             .ok_or_else(|| HarnessError::Protocol("Project path is not UTF-8".into()))?;
-        let mut server = self.server(Some(directory), None).await?;
+        let mut server = self.server(Some(directory), None, None).await?;
         let result = server
             .commands_wire(Some(directory))
             .await
@@ -444,7 +445,9 @@ impl Harness for OpencodeHarness {
         let initial_native_command_selected = selected_native_command(&request.prompt, self.id());
         request.prompt = zeron_proto::invocation::harness_prompt(&request.prompt, self.id());
         let cwd = (!request.cwd.is_empty()).then(|| request.cwd.clone());
-        let server = self.server(cwd.as_deref(), request.mcp.as_ref()).await?;
+        let server = self
+            .server(cwd.as_deref(), request.mcp.as_ref(), request.agent.as_ref())
+            .await?;
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             server,
@@ -591,6 +594,7 @@ impl Server {
         cwd: Option<&str>,
         startup: Duration,
         mcp: Option<&zeron_proto::McpServer>,
+        agent: Option<&zeron_proto::AgentContext>,
     ) -> Result<Self, HarnessError> {
         let port = free_localhost_port().ok_or_else(|| {
             HarnessError::Protocol("no free localhost port for opencode serve".into())
@@ -631,6 +635,7 @@ impl Server {
             );
         }
         crate::compose_child_path(&mut cmd, exe);
+        crate::apply_agent_env(&mut cmd, agent);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -1681,6 +1686,11 @@ async fn run_session(session: Session) {
         dir,
         &commands,
         &request.prompt,
+        request
+            .agent
+            .as_ref()
+            .map(|agent| agent.prompt_prefix())
+            .as_deref(),
         initial_native_command_selected,
         turn_generation,
         &command_failure_tx,
@@ -1792,6 +1802,7 @@ async fn run_session(session: Session) {
                     dir,
                     &commands,
                     &steer,
+                    None,
                     native_command_selected,
                     turn_generation,
                     &command_failure_tx,
@@ -1995,6 +2006,7 @@ async fn run_session(session: Session) {
                                 dir,
                                 &commands,
                                 &prompt,
+                                None,
                                 native_command_selected,
                                 turn_generation,
                                 &command_failure_tx,
@@ -2418,6 +2430,12 @@ async fn post_prompt(
     dir: Option<&str>,
     commands: &[SlashCommand],
     prompt: &str,
+    // `instructions_prefix`: the injected system-instructions frame,
+    // prepended when this prompt posts as an ordinary turn — first prompt of
+    // a session only (the OpenCode API has no system-prompt channel). Never
+    // on steers, and a prompt that resolves to a native slash command drops
+    // it (commands carry no free text).
+    instructions_prefix: Option<&str>,
     native_command_selected: bool,
     turn_generation: u64,
     command_failure_tx: &mpsc::UnboundedSender<NativeCommandFailure>,
@@ -2490,6 +2508,14 @@ async fn post_prompt(
         });
         return Ok(());
     }
+    let wire_prompt;
+    let prompt = match instructions_prefix {
+        Some(prefix) => {
+            wire_prompt = format!("{prefix}{prompt}");
+            wire_prompt.as_str()
+        }
+        None => prompt,
+    };
     let (path, body) = match protocol {
         Protocol::V1 => (
             format!("/session/{session_id}/prompt_async"),
@@ -4199,6 +4225,7 @@ http.createServer((req, res) => {{
                 fixture.path().to_str(),
                 Duration::from_secs(5),
                 Some(&first),
+                None,
             )
             .await
             .unwrap();
@@ -4207,6 +4234,7 @@ http.createServer((req, res) => {{
                 fixture.path().to_str(),
                 Duration::from_secs(5),
                 Some(&second),
+                None,
             )
             .await
             .unwrap();
