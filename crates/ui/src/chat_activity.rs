@@ -3,13 +3,13 @@
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
+use crate::popover;
 use crate::state::AppState;
 use crate::theme::Theme;
-use crate::{loaders, popover};
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, MouseButton,
-    ScrollHandle, SharedString, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, ScrollHandle,
+    SharedString, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
 };
 use std::hash::{Hash, Hasher};
 use zeron_doc::{MessagePart, SubagentStatus};
@@ -204,10 +204,24 @@ impl ChatActivity {
             .update(cx, |input, cx| input.set_placeholder(tab.placeholder(), cx));
         cx.notify();
     }
+    /// Appshots fixture entry: open the menu on a named tab (or the
+    /// auto-picked one when `None`).
+    #[cfg(feature = "appshots-fixture")]
+    pub fn fixture_open(&mut self, tab: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(tab) = tab {
+            self.tab = match tab {
+                "chats" => ActivityTab::Chats,
+                _ => ActivityTab::Subagents,
+            };
+        }
+        self.open(cx);
+    }
+
     fn open(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let agents = subagent_rows(state, &self.chat_id).len();
-        let chats = child_chat_rows(state, &self.chat_id, Utc::now()).len();
+        let agents = subagent_rows(state, &self.chat_id).len()
+            + child_chat_rows(state, &self.chat_id, true, Utc::now()).len();
+        let chats = child_chat_rows(state, &self.chat_id, false, Utc::now()).len();
         let tab = match (self.tab, agents, chats) {
             (ActivityTab::Subagents, 0, 1..) => ActivityTab::Chats,
             (ActivityTab::Chats, 1.., 0) => ActivityTab::Subagents,
@@ -222,11 +236,18 @@ impl ChatActivity {
     fn rows(&self, cx: &gpui::App) -> Vec<ActivityRow> {
         let state = self.state.read(cx);
         let rows: Vec<_> = match self.tab {
+            // The Subagents tab covers BOTH kinds of agent-made activity:
+            // native subagent docs and `spawned_by_agent` child chats.
             ActivityTab::Subagents => subagent_rows(state, &self.chat_id)
                 .into_iter()
                 .map(ActivityRow::Subagent)
+                .chain(
+                    child_chat_rows(state, &self.chat_id, true, Utc::now())
+                        .into_iter()
+                        .map(ActivityRow::Chat),
+                )
                 .collect(),
-            ActivityTab::Chats => child_chat_rows(state, &self.chat_id, Utc::now())
+            ActivityTab::Chats => child_chat_rows(state, &self.chat_id, false, Utc::now())
                 .into_iter()
                 .map(ActivityRow::Chat)
                 .collect(),
@@ -298,8 +319,9 @@ impl ChatActivity {
     ) -> AnyElement {
         let state = self.state.read(cx);
         let counts = [
-            subagent_rows(state, &self.chat_id).len(),
-            child_chat_rows(state, &self.chat_id, Utc::now()).len(),
+            subagent_rows(state, &self.chat_id).len()
+                + child_chat_rows(state, &self.chat_id, true, Utc::now()).len(),
+            child_chat_rows(state, &self.chat_id, false, Utc::now()).len(),
         ];
         let mut tabs = div()
             .flex_none()
@@ -536,7 +558,7 @@ impl ChatActivity {
                 row.change_request.clone(),
             ),
         };
-        let glyph = status_glyph(id.clone(), status, cx.entity_id(), &theme, cx);
+        let glyph = crate::chat_pill::status_glyph(id.clone(), status, cx.entity_id(), &theme, cx);
         let event = row.event();
         let query = self.search.read(cx).text().trim().to_owned();
         let label = SharedString::from(row.title().to_owned());
@@ -626,8 +648,9 @@ impl Render for ChatActivity {
         }
         let theme = Theme::of(cx).clone();
         let state = self.state.read(cx);
-        let agents = subagent_rows(state, &self.chat_id).len();
-        let chats = child_chat_rows(state, &self.chat_id, Utc::now()).len();
+        let agents = subagent_rows(state, &self.chat_id).len()
+            + child_chat_rows(state, &self.chat_id, true, Utc::now()).len();
+        let chats = child_chat_rows(state, &self.chat_id, false, Utc::now()).len();
         let count = agents + chats;
         if count == 0 {
             self.menu = popover::Popup::default();
@@ -823,16 +846,23 @@ pub(crate) struct ChildChatRow {
 }
 
 /// The live (unarchived) children of `chat_id`, most recent activity first —
-/// the same order the sidebar's Sessions list keeps.
+/// the same order the sidebar's Sessions list keeps. `spawned_by_agent`
+/// selects which tab a child belongs to: `true` lists agent-spawned chats
+/// under Subagents, `false` lists the user's own side chats and forks.
 pub(crate) fn child_chat_rows(
     state: &AppState,
     chat_id: &str,
+    spawned_by_agent: bool,
     now: DateTime<Utc>,
 ) -> Vec<ChildChatRow> {
     let mut rows: Vec<ChildChatRow> = state
         .chats
         .iter()
-        .filter(|chat| !chat.archived && chat.parent_chat_id.as_deref() == Some(chat_id))
+        .filter(|chat| {
+            !chat.archived
+                && chat.parent_chat_id.as_deref() == Some(chat_id)
+                && chat.spawned_by_agent == spawned_by_agent
+        })
         .map(|chat| {
             let activity = chat.last_message_at.unwrap_or(chat.created_at);
             ChildChatRow {
@@ -868,52 +898,19 @@ pub(crate) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -
         (row.status.map(|s| s as u8)).hash(&mut hasher);
     }
     0xC0FFEEu64.hash(&mut hasher);
-    for row in child_chat_rows(state, chat_id, now) {
-        row.chat_id.hash(&mut hasher);
-        row.title.as_ref().hash(&mut hasher);
-        (row.status as u8).hash(&mut hasher);
-        row.time_ago.as_ref().hash(&mut hasher);
-        row.change_request
-            .as_ref()
-            .map(|pr| (pr.number, pr.state as u8))
-            .hash(&mut hasher);
+    for spawned_by_agent in [true, false] {
+        for row in child_chat_rows(state, chat_id, spawned_by_agent, now) {
+            row.chat_id.hash(&mut hasher);
+            row.title.as_ref().hash(&mut hasher);
+            (row.status as u8).hash(&mut hasher);
+            row.time_ago.as_ref().hash(&mut hasher);
+            row.change_request
+                .as_ref()
+                .map(|pr| (pr.number, pr.state as u8))
+                .hash(&mut hasher);
+        }
     }
     hasher.finish()
-}
-
-fn status_glyph(
-    key: String,
-    status: ChatIndicator,
-    view: EntityId,
-    theme: &Theme,
-    cx: &mut gpui::App,
-) -> AnyElement {
-    let color = crate::shell::spaces::status_dot_color(status, theme);
-    let glyph: AnyElement = match status {
-        ChatIndicator::Completed => icon(icons::CHECK)
-            .size(px(11.0))
-            .flex_none()
-            .text_color(color)
-            .into_any_element(),
-        ChatIndicator::Working => {
-            loaders::mini_glyph_spinner(format!("{key}-working"), 2.0, theme.glyph, view, cx)
-                .into_any_element()
-        }
-        _ => div()
-            .size(px(6.0))
-            .flex_none()
-            .rounded_full()
-            .bg(color)
-            .into_any_element(),
-    };
-    div()
-        .flex_none()
-        .size(px(13.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(glyph)
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1204,7 +1201,7 @@ mod tests {
             chat("unrelated", Some("elsewhere"), 2),
             archived,
         ]);
-        let rows = child_chat_rows(&state, "main", Utc::now());
+        let rows = child_chat_rows(&state, "main", false, Utc::now());
         assert_eq!(
             rows.iter().map(|r| r.chat_id.as_str()).collect::<Vec<_>>(),
             ["a", "b"]
@@ -1212,6 +1209,30 @@ mod tests {
         assert_eq!(rows[0].title.as_ref(), "New side chat");
         assert_eq!(rows[1].title.as_ref(), "Investigate caching");
         assert_eq!(rows[0].status, ChatIndicator::Idle);
+    }
+
+    #[test]
+    fn child_chat_rows_split_agent_spawns_from_side_chats() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("main", None, 60)]);
+        let mut spawned = chat("agent-child", Some("main"), 5);
+        spawned.spawned_by_agent = true;
+        state.chats.push(spawned);
+        state.chats.push(chat("side", Some("main"), 3));
+        assert_eq!(
+            child_chat_rows(&state, "main", true, Utc::now())
+                .iter()
+                .map(|r| r.chat_id.as_str())
+                .collect::<Vec<_>>(),
+            ["agent-child"]
+        );
+        assert_eq!(
+            child_chat_rows(&state, "main", false, Utc::now())
+                .iter()
+                .map(|r| r.chat_id.as_str())
+                .collect::<Vec<_>>(),
+            ["side"]
+        );
     }
 
     #[test]

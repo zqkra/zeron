@@ -22,6 +22,7 @@ pub mod browser;
 pub mod change_requests;
 pub mod changes;
 mod chat_activity;
+pub(crate) mod chat_pill;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
