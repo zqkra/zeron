@@ -9568,18 +9568,28 @@ impl Render for Composer {
                 self.pickers
                     .update(cx, |pickers, cx| pickers.render_footer(cx))
             });
-            if session_chrome_opacity > 0.0 {
+            let change_request = if session_chrome_opacity > 0.0 {
                 let harness = self.pickers.read(cx).resolved(cx).harness;
-                let target = {
+                let (target, change_request) = {
                     let state = self.state.read(cx);
-                    state
+                    let target = state
                         .selected_chat_row()
                         .map(|chat| chat.device_id.clone())
-                        .filter(|device| state.local_device_id.as_ref() != Some(device))
+                        .filter(|device| state.local_device_id.as_ref() != Some(device));
+                    let change_request = state
+                        .selected_space_row()
+                        .filter(|space| space.git_detected)
+                        .and_then(|_| state.selected_chat_row())
+                        .and_then(|chat| state.change_request_for_chat(chat))
+                        .cloned();
+                    (target, change_request)
                 };
                 self.account_usage
                     .update(cx, |usage, cx| usage.track(harness, target, cx));
-            }
+                change_request
+            } else {
+                None
+            };
             container.child(
                 div()
                     .w_full()
@@ -9611,9 +9621,10 @@ impl Render for Composer {
                                 .opacity(session_chrome_opacity)
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
                                 .child(
-                                    // The footer row's own 4px gap: the PR badge
-                                    // ends flush with the row, so the activity
-                                    // menu and the rings keep their distance here.
+                                    // The trailing group owns its 4px gap, so
+                                    // the activity menu, the PR badge and the
+                                    // rings stay evenly separated while the
+                                    // footer row still ends flush.
                                     div()
                                         .flex_none()
                                         .flex()
@@ -9621,6 +9632,14 @@ impl Render for Composer {
                                         .gap(px(4.0))
                                         .pr(px(10.0))
                                         .children(self.chat_activity.clone())
+                                        .children(change_request.map(|summary| {
+                                            crate::change_requests::pull_request_badge(
+                                                "composer-pull-request".into(),
+                                                summary,
+                                                crate::change_requests::ChangeRequestBadgeSurface::Composer,
+                                                &theme,
+                                            )
+                                        }))
                                         .child(self.account_usage.clone()),
                                 ),
                         )
