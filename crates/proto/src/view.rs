@@ -544,6 +544,9 @@ pub struct ZeronChatCommand {
     /// The `--harness` value, when given — the spawn chip shows its brand
     /// mark even before the child chat resolves.
     pub harness: Option<String>,
+    /// The `--model` value, when given — the spawn chip's model trail before
+    /// the child chat resolves.
+    pub model: Option<String>,
 }
 
 /// Split one shell line into words: single/double quotes and backslash
@@ -726,6 +729,7 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
     let mut targets = Vec::new();
     let mut label = None;
     let mut harness = None;
+    let mut model = None;
     let mut ix = at + 3;
     while let Some(word) = words.get(ix) {
         ix += 1;
@@ -753,6 +757,9 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
                     "--harness" if harness.is_none() => {
                         harness = value;
                     }
+                    "--model" if model.is_none() => {
+                        model = value;
+                    }
                     _ => {}
                 }
             }
@@ -772,6 +779,7 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
         targets,
         label,
         harness,
+        model,
     })
 }
 
@@ -952,7 +960,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: Some("scan the repo".into()),
-                harness: Some("claude-code".into())
+                harness: Some("claude-code".into()),
+                model: None
             })
         );
         assert_eq!(
@@ -961,7 +970,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: None,
-                harness: None
+                harness: None,
+                model: Some("opus".into())
             })
         );
         assert_eq!(
@@ -970,7 +980,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: Some("hi".into()),
-                harness: None
+                harness: None,
+                model: None
             })
         );
         assert_eq!(
@@ -979,7 +990,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         assert_eq!(
@@ -988,7 +1000,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Output,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
     }
@@ -1001,7 +1014,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["main".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         assert_eq!(
@@ -1010,7 +1024,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Wait,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         assert_eq!(
@@ -1019,7 +1034,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Wait,
                 targets: vec!["a".into(), "b".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         assert_eq!(
@@ -1028,7 +1044,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Output,
                 targets: vec!["My title".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         // A chained tail command does not become a target.
@@ -1038,7 +1055,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: Some("go".into()),
-                harness: None
+                harness: None,
+                model: None
             })
         );
     }
@@ -1053,7 +1071,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         assert_eq!(
@@ -1062,7 +1081,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Wait,
                 targets: vec!["a".into(), "b".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         assert_eq!(
@@ -1071,7 +1091,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec![CHILD.into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
         // `self` is a real target.
@@ -1081,7 +1102,8 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["self".into()],
                 label: None,
-                harness: None
+                harness: None,
+                model: None
             })
         );
     }
