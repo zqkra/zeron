@@ -12,8 +12,8 @@ use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel, Session,
+    SessionStatus, SteeringMode, UserInputQuestion,
 };
 use zeron_rpc::methods;
 
@@ -398,10 +398,15 @@ async fn two_children_coalesce_into_one_prompt_and_two_cards() {
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let prompts = system_prompts(&bed.requests);
     assert_eq!(prompts.len(), 1, "two settles must share one prompt");
-    assert_eq!(
-        prompts[0],
-        "[Zeron system]\n\nChild chat updates:\n\n- @chat:child-a completed.\n- @chat:child-b completed."
-    );
+    // Sibling settles race; the bullet order follows claim order.
+    let prompt = &prompts[0];
+    assert!(prompt.starts_with("[Zeron system]\n\nChild chat updates:\n\n"));
+    for child in ["child-a", "child-b"] {
+        assert!(
+            prompt.contains(&format!("- @chat:{child} completed.")),
+            "missing {child} bullet in {prompt}"
+        );
+    }
     assert_eq!(child_update_cards(&bed.core, "parent").len(), 2);
     bed.core.shutdown().await;
 }
@@ -755,5 +760,68 @@ async fn archiving_a_chat_archives_descendants_children_first() {
     );
     assert!(bed.core.workspace.chat("parent").unwrap().unwrap().archived);
     assert!(bed.core.workspace.chat("child").unwrap().unwrap().archived);
+    bed.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn child_host_restart_mid_turn_reports_interrupted() {
+    let bed = bed();
+    top_chat(&bed.core, "parent");
+    // The child is hosted on ANOTHER device: this engine only ever sees its
+    // registry session rows — which is exactly where the dead host's
+    // recovery write lands.
+    bed.core
+        .workspace
+        .create_chat_with_parent(
+            "child",
+            None,
+            Some("remote-host"),
+            None,
+            Some("/tmp".into()),
+            Some("parent".into()),
+            true,
+        )
+        .unwrap();
+    // Mid-turn row first (the completed-turn marker carried forward), then
+    // the restart write: Idle with the marker wiped. Staggered so the
+    // notifier observes the Working row before the settle lands.
+    let now = chrono::Utc::now();
+    bed.core.workspace.record_session(&Session {
+        last_completed_turn: Some("t0".into()),
+        chat_id: "child".into(),
+        device_id: "remote-host".into(),
+        status: SessionStatus::Working,
+        started_at: Some(now),
+        updated_at: now,
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    bed.core.workspace.record_session(&Session {
+        last_completed_turn: None,
+        chat_id: "child".into(),
+        device_id: "remote-host".into(),
+        status: SessionStatus::Idle,
+        started_at: None,
+        updated_at: chrono::Utc::now(),
+    });
+    wait_for("interrupted notification", || {
+        !system_prompts(&bed.requests).is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let prompts = system_prompts(&bed.requests);
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(
+        prompts[0],
+        "[Zeron system]\n\n@chat:child was interrupted.\n\nReview the chat before deciding next steps.\n\nIf the user stopped it manually, do not resume, restart, retry, replace, or continue the work unless the user explicitly asks."
+    );
+    let cards = child_update_cards(&bed.core, "parent");
+    assert_eq!(cards.len(), 1);
+    match &cards[0].parts[0] {
+        MessagePart::ChildUpdate { outcome, .. } => assert_eq!(
+            *outcome,
+            zeron_proto::orchestration::ChildOutcome::Interrupted
+        ),
+        _ => panic!("not a child update"),
+    }
     bed.core.shutdown().await;
 }

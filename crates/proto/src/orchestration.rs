@@ -61,12 +61,15 @@ pub fn child_update(prev: Option<&Session>, next: &Session) -> Option<ChildUpdat
         return Some(update(ChildOutcome::NeedsInput, format!("input:{at}")));
     }
     // Working -> Idle without a new completed-turn marker = the run was
-    // stopped. Checked BEFORE completion: a Working predecessor satisfies the
+    // stopped. The marker simply being ABSENT qualifies too: a host that
+    // restarts mid-turn rewrites the row Idle with the marker wiped (boot
+    // recovery has no turn id to keep), and that death must still report.
+    // Checked BEFORE completion: a Working predecessor satisfies the
     // "prev was not Idle" clause there too, and the interrupted reading wins.
     if next.status == SessionStatus::Idle
         && let Some(p) = prev
         && p.status == SessionStatus::Working
-        && next.last_completed_turn == p.last_completed_turn
+        && (next.last_completed_turn.is_none() || next.last_completed_turn == p.last_completed_turn)
     {
         let at = p
             .started_at
@@ -296,11 +299,18 @@ mod tests {
                 key: "done:t3".into()
             })
         );
-        // A marker of None is "no information", never a completion — and a
-        // Working->Idle settle whose marker VANISHED matches nothing either.
+        // A marker of None is "no information", never a completion — but a
+        // Working->Idle settle whose marker VANISHED is an interruption:
+        // that's the row a child host's restart writes when it recovers.
         let idle_none = session(SessionStatus::Idle, None, None, 4_000);
         assert_eq!(child_update(None, &idle_none), None);
-        assert_eq!(child_update(Some(&working()), &idle_none), None);
+        assert_eq!(
+            child_update(Some(&working()), &idle_none),
+            Some(ChildUpdate {
+                outcome: ChildOutcome::Interrupted,
+                key: "stopped:1000".into()
+            })
+        );
         // Working->Idle with an UNCHANGED marker = interrupted, not completed.
         assert_eq!(
             child_update(
