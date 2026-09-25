@@ -123,8 +123,8 @@ pub(crate) fn chat_refs_fingerprint<'a>(
 
 /// The chip itself: 12px harness mark (BOT until the harness is known), a
 /// truncating title, and the sidebar's status glyph. Sized to ride inline in
-/// markdown text — the U1 inline-mention workstream renders `@chat:` pills
-/// with it; tool rows deliberately do NOT (they keep the native chip look).
+/// markdown text — the inline `@chat:` mention pills render with it; tool
+/// rows deliberately do NOT (they keep the native chip look).
 /// It is a label, not a button; callers that want a click wrap it.
 #[allow(dead_code)]
 pub(crate) fn chat_chip(

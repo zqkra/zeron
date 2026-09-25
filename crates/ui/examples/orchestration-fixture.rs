@@ -1,7 +1,8 @@
-//! W5 orchestration transcript evidence: `zeron chat` exec chips
-//! (spawn/tell/wait/output), single and grouped child-update cards, and the
-//! activity menu's Subagents/Chats split — all against isolated fixture data.
-//! No agent messages are sent.
+//! Orchestration transcript fixture for appshots: `zeron chat` exec chips
+//! (spawn/tell/wait/output), a native subagent chip beside them for
+//! comparison, single and grouped child-update cards, and the activity
+//! menu's Subagents/Chats split — all against isolated fixture data. No
+//! agent messages are sent.
 use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -87,7 +88,7 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
     core.workspace.create_chat(
-        "w5-main",
+        "fan-out-parent",
         None,
         Some(&core.device_id),
         Some(chat_config(
@@ -97,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         None,
     )?;
     core.workspace
-        .rename_chat("w5-main", "Fan out the review")?;
+        .rename_chat("fan-out-parent", "Fan out the review")?;
     // The spawned children the chips and update cards resolve against.
     let child_a = "3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
     let child_b = "aa10bb22-1111-2222-3333-444455556666";
@@ -107,7 +108,7 @@ fn main() -> anyhow::Result<()> {
         Some(&core.device_id),
         Some(chat_config(zeron_proto::HarnessId::Codex, "gpt-5.3-codex")),
         None,
-        Some("w5-main".into()),
+        Some("fan-out-parent".into()),
         true,
     )?;
     core.workspace
@@ -121,22 +122,22 @@ fn main() -> anyhow::Result<()> {
             "claude-sonnet-4-6",
         )),
         None,
-        Some("w5-main".into()),
+        Some("fan-out-parent".into()),
         true,
     )?;
     core.workspace
         .rename_chat(child_b, "Sketch the retry backoff")?;
     // A user-opened side chat — belongs on the Chats tab only.
     core.workspace.create_chat_with_parent(
-        "w5-side",
+        "side-chat",
         None,
         Some(&core.device_id),
         Some(chat_config(zeron_proto::HarnessId::Pi, "pi-1")),
         None,
-        Some("w5-main".into()),
+        Some("fan-out-parent".into()),
         false,
     )?;
-    core.workspace.rename_chat("w5-side", "Quick follow-up")?;
+    core.workspace.rename_chat("side-chat", "Quick follow-up")?;
     let ipc_port = port();
     let _ipc = runtime.block_on(zeron_engine::serve_ipc(ipc_port, core.rpc_service()))?;
     let data = temp.path().join("ui");
@@ -163,10 +164,10 @@ fn main() -> anyhow::Result<()> {
         theme_library::init(data.clone(),cx); appearance::init(appearance::AppearanceMode::Dark,settings.theme_selection,settings.accent,settings.surface,cx);
         history::init(settings.git_history_columns,settings.git_history_column_widths,settings.git_history_column_order,settings.git_history_author_display,cx);
         composer::init(cx,settings.composer_send_behavior); terminal::panel::init(cx); app_menus::init(cx);
-        let state=cx.new(|_| { let mut s=state::AppState::new(); s.fixture_attachment_engine(handle); s.connection=zeron_proto::view::ConnectionStatus::Ready; s.workspace_scope=Some(zeron_proto::WorkspaceScope::Development); s.local_device_id=Some(device.clone()); s.devices=vec![serde_json::from_value(serde_json::json!({"id":device,"name":"This device","platform":std::env::consts::OS,"lastSeenAt":null})).unwrap()]; s.chats=chats; s.selected_chat=Some("w5-main".into()); s.auto_selected=true; s.chats_synced=true; s.spaces_synced=true; s.no_project=true; s });
+        let state=cx.new(|_| { let mut s=state::AppState::new(); s.fixture_attachment_engine(handle); s.connection=zeron_proto::view::ConnectionStatus::Ready; s.workspace_scope=Some(zeron_proto::WorkspaceScope::Development); s.local_device_id=Some(device.clone()); s.devices=vec![serde_json::from_value(serde_json::json!({"id":device,"name":"This device","platform":std::env::consts::OS,"lastSeenAt":null})).unwrap()]; s.chats=chats; s.selected_chat=Some("fan-out-parent".into()); s.auto_selected=true; s.chats_synced=true; s.spaces_synced=true; s.no_project=true; s });
         // One child is still mid-run: its send reads as Working, so the
         // spawn chip and the update cards show the live spinner.
-        state.update(cx,|s,_| s.begin_pending_send(child_a,"w5-pending",chrono::Utc::now()));
+        state.update(cx,|s,_| s.begin_pending_send(child_a,"pending-send",chrono::Utc::now()));
         let window=cx.open_window(WindowOptions {window_background:theme::Theme::of(cx).window_background_appearance(),window_bounds:Some(WindowBounds::Windowed(Bounds::new(gpui::point(px(20.),px(40.)),size(px(1100.),px(900.))))),..Default::default()},|_,cx|cx.new(|cx|shell::Shell::new(state.clone(),boot,cx))).unwrap();
         state.update(cx,|_,cx|cx.notify()); cx.activate(true);
         cx.spawn(async move |cx| {
@@ -175,7 +176,7 @@ fn main() -> anyhow::Result<()> {
                     {"id":"u1","role":"user","parts":[{"id":"t","kind":"text","text":"Fan out the review: audit the sync layer and sketch the retry backoff, then read both reports back."}],"createdAt":1788900000000_i64,"deviceId":device},
                     {"id":"a1","role":"assistant","status":"complete","createdAt":1788900001000_i64,"deviceId":device,"parts":[
                         {"id":"p0","kind":"text","text":"Splitting the work into two child chats now — I'll wait for both and read their outputs."},
-                        {"id":"n1","kind":"tool","call":{"kind":"unknown","name":"Agent: Verify the lock ordering","input":{"model":"claude-opus-4-7"}},"resolved":true,"subagentRef":"w5-main--sub--n1","subagentStatus":"done"},
+                        {"id":"n1","kind":"tool","call":{"kind":"unknown","name":"Agent: Verify the lock ordering","input":{"model":"claude-opus-4-7"}},"resolved":true,"subagentRef":"fan-out-parent--sub--n1","subagentStatus":"done"},
                         {"id":"t1","kind":"tool","call":{"kind":"exec","command":"zeron chat spawn --title \"Audit the sync layer\" --harness codex --model gpt-5.3-codex --prompt-file /tmp/brief-sync.md"},"resolved":true,"output":"Spawning child chat…\n@chat:3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b"},
                         {"id":"t2","kind":"tool","call":{"kind":"exec","command":"zeron chat spawn --title \"Sketch the retry backoff\" --model claude-sonnet-4-6 --prompt-file /tmp/brief-backoff.md"},"resolved":true,"output":"Spawning child chat…\n@chat:aa10bb22-1111-2222-3333-444455556666"},
                         {"id":"t3","kind":"tool","call":{"kind":"exec","command":"zeron chat tell 3f6b2a18 \"focus on the ledger rewrite\" --mode steer"},"resolved":true,"output":"delivered"},
@@ -203,34 +204,34 @@ fn main() -> anyhow::Result<()> {
                 pause(cx,1200).await;
                 window.update(cx,|s,_,cx|s.fixture_appshots_transcript_start(cx))?;
                 pause(cx,500).await;
-                capture(window.into(),cx,&output,"w5-transcript-dark")?;
+                capture(window.into(),cx,&output,"orchestration-transcript-dark")?;
                 // Native-vs-orchestration spawn proof: the transcript opens
                 // scrolled to the top, so the first assistant's two adjacent
                 // agent chips (native Claude "Agent:", then `zeron chat
                 // spawn`) sit in a fixed band of the floated window.
-                capture_region(window.into(),cx,&output,"w5-compare-dark","470,258 760x105")?;
+                capture_region(window.into(),cx,&output,"orchestration-compare-dark","470,258 760x105")?;
                 cx.update(|cx|appearance::set_mode(appearance::AppearanceMode::Light,cx));
                 pause(cx,700).await;
-                capture(window.into(),cx,&output,"w5-transcript-light")?;
+                capture(window.into(),cx,&output,"orchestration-transcript-light")?;
                 // Activity menu: Subagents tab (native + agent-spawned), then Chats.
                 window.update(cx,|s,_,cx|s.fixture_appshots_activity(Some("subagents"),cx))?;
                 pause(cx,800).await;
-                capture(window.into(),cx,&output,"w5-activity-subagents-light")?;
+                capture(window.into(),cx,&output,"orchestration-activity-subagents-light")?;
                 window.update(cx,|s,_,cx|s.fixture_appshots_activity(Some("chats"),cx))?;
                 pause(cx,600).await;
-                capture(window.into(),cx,&output,"w5-activity-chats-light")?;
+                capture(window.into(),cx,&output,"orchestration-activity-chats-light")?;
                 cx.update(|cx|appearance::set_mode(appearance::AppearanceMode::Dark,cx));
                 pause(cx,700).await;
                 window.update(cx,|s,_,cx|s.fixture_appshots_activity(Some("subagents"),cx))?;
                 pause(cx,600).await;
-                capture(window.into(),cx,&output,"w5-activity-subagents-dark")?;
+                capture(window.into(),cx,&output,"orchestration-activity-subagents-dark")?;
                 window.update(cx,|s,_,cx|s.fixture_appshots_activity(Some("chats"),cx))?;
                 pause(cx,600).await;
-                capture(window.into(),cx,&output,"w5-activity-chats-dark")?;
-                std::fs::write(output.join("result.txt"),"W5: agent exec chips, grouped child-update cards, activity split. Fixture data only; no agent traffic.\n")?;
+                capture(window.into(),cx,&output,"orchestration-activity-chats-dark")?;
+                std::fs::write(output.join("result.txt"),"orchestration: agent exec chips, grouped child-update cards, activity split. Fixture data only; no agent traffic.\n")?;
                 Ok(())
             }.await;
-            if let Err(error)=run {eprintln!("W5 fixture failed: {error:#}");*result.lock().unwrap()=Some(format!("{error:#}"));}
+            if let Err(error)=run {eprintln!("orchestration fixture failed: {error:#}");*result.lock().unwrap()=Some(format!("{error:#}"));}
             let _=window.update(cx,|_,w,_|w.remove_window());pause(cx,100).await;cx.update(|cx|cx.quit());
         }).detach();
     });

@@ -34,7 +34,7 @@ name = "appshots-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
-name = "w5-orchestration-fixture"
+name = "orchestration-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]

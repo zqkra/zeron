@@ -563,8 +563,8 @@ impl ChatActivity {
         let query = self.search.read(cx).text().trim().to_owned();
         let label = SharedString::from(row.title().to_owned());
         // Agent-spawned children dress like native subagent rows: harness
-        // mark beside the status, model faint ahead of the time (spec U4).
-        // Side chats keep the plain title row.
+        // mark beside the status, model faint ahead of the time. Side chats
+        // keep the plain title row.
         let in_agents = self.tab == ActivityTab::Subagents;
         let (mark, model) = match row {
             ActivityRow::Chat(row) if in_agents => (
@@ -872,7 +872,7 @@ pub(crate) struct ChildChatRow {
     pub status: ChatIndicator,
     pub time_ago: SharedString,
     /// The chat's harness/model — the Subagents tab wears them the way the
-    /// sidebar's session rows do (spec U4).
+    /// sidebar's session rows do.
     pub harness: Option<zeron_proto::HarnessId>,
     pub model: Option<SharedString>,
     /// The chat's linked pull request, drawn as the sidebar's badge.
