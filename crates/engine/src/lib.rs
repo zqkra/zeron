@@ -21,6 +21,7 @@ pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
+pub(crate) mod child_notify;
 pub mod diff_sync;
 pub mod doc_host;
 mod http_error;
@@ -221,6 +222,7 @@ impl EngineCore {
         registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
+        let store_for_notify = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         // The `zeron` CLI shim + staged skill bundle every chat run is
@@ -318,6 +320,16 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        // Parent notifications for agent-spawned children (spec D9): the
+        // loop rides the doc host's worker tracker, so `shutdown_workers`
+        // retires it with everything else.
+        child_notify::start(
+            &doc_host,
+            &workspace,
+            &sessions,
+            store_for_notify,
+            device_id.clone(),
+        );
         Ok(Self {
             sessions,
             doc_host,

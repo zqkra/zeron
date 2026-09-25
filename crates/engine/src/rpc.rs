@@ -1143,11 +1143,21 @@ impl EngineRpc {
                 .set_chat_host(&chat_id, &device_id)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatArchived { chat_id, archived } => self
-                .workspace
-                .set_chat_archived(&chat_id, archived)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatArchived { chat_id, archived } => {
+                // Archive cascades to descendants (children first); unarchive
+                // touches only the named chat — spec D11.
+                if archived {
+                    self.workspace
+                        .archive_chat_tree(&chat_id)
+                        .map_err(failed)
+                        .map(drop)
+                } else {
+                    self.workspace
+                        .set_chat_archived(&chat_id, false)
+                        .map_err(failed)
+                        .map(drop)
+                }
+            }
             MutateParams::ChangeSidebarPin { change } => {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)
             }
@@ -1929,10 +1939,31 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&chat)
             }
             methods::ACK_CHILD_UPDATES => {
-                let _p: zeron_proto::orchestration::AckChildUpdatesParams =
-                    parse_params(params)?;
-                // Recorded by the child notifier once it exists; the ack is
-                // already durable on the caller's side.
+                let p: zeron_proto::orchestration::AckChildUpdatesParams = parse_params(params)?;
+                let store = self.doc_host.docs_store();
+                for update in &p.updates {
+                    // Only accept acks whose parentChatId matches the child's
+                    // actual parent — anything else is a stale or foreign
+                    // caller and must not suppress another parent's ledger.
+                    let parent_ok = self
+                        .workspace
+                        .chat(&update.child_chat_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|chat| {
+                            chat.parent_chat_id.as_deref() == Some(p.parent_chat_id.as_str())
+                        });
+                    if !parent_ok {
+                        continue;
+                    }
+                    store
+                        .ack_child_notification(
+                            &update.child_chat_id,
+                            &update.turn_key,
+                            &p.parent_chat_id,
+                        )
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::WATCH_DOC_MESSAGES => {

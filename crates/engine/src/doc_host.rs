@@ -916,7 +916,7 @@ impl DocHost {
     /// Every background task rides the tracker, raced against the shutdown
     /// token: the loops' own exits stay authoritative in normal operation;
     /// the token is the retirement override.
-    fn spawn_worker(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    pub(crate) fn spawn_worker(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
         let cancel = self.inner.shutdown.clone();
         self.inner.tasks.spawn(async move {
             tokio::select! {
@@ -4090,8 +4090,15 @@ impl DocHost {
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = item.attachments.clone();
         let harness = self.harness_for_request(chat_id, &request);
-        self.dispatch_with_source_context(&sessions, chat_id, harness, request, Some(message_id))
-            .await?;
+        self.dispatch_with_source_context(
+            &sessions,
+            chat_id,
+            harness,
+            request,
+            Some(message_id),
+            false,
+        )
+        .await?;
         Ok(())
     }
 
@@ -5181,6 +5188,7 @@ impl DocHost {
                     harness,
                     request,
                     Some(message_id.clone()),
+                    false,
                 )
                 .await?;
                 // A fresh user-authored turn is the deliberate action that
@@ -5263,7 +5271,7 @@ impl DocHost {
                         "orphaned input resolve failed");
                 }
                 let harness = self.harness_for_request(chat_id, &request);
-                self.dispatch_with_source_context(sessions, chat_id, harness, request, None)
+                self.dispatch_with_source_context(sessions, chat_id, harness, request, None, false)
                     .await?;
                 Ok((
                     SessionCommandStatus::Applied,
@@ -5368,8 +5376,10 @@ impl DocHost {
                 // images; this prompt's own refs (if any) ride its text.
                 request.attachments = Vec::new();
                 let harness = self.harness_for_request(chat_id, &request);
-                self.dispatch_with_source_context(sessions, chat_id, harness, request, message_id)
-                    .await?;
+                self.dispatch_with_source_context(
+                    sessions, chat_id, harness, request, message_id, false,
+                )
+                .await?;
                 handle.queue_paused.store(false, Ordering::Release);
                 Ok((
                     SessionCommandStatus::Applied,
@@ -5407,12 +5417,18 @@ impl DocHost {
         harness: HarnessId,
         request: zeron_proto::RunRequest,
         message_id: Option<String>,
+        hidden: bool,
     ) -> Result<String, EngineError> {
         if let Some(workspace) = self.workspace()
             && let Some(context) = self.capture_source_context(&request.cwd).await
             && let Err(err) = workspace.set_chat_source_context(chat_id, &context)
         {
             tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
+        }
+        if hidden {
+            return sessions
+                .dispatch_agent_prompt(chat_id, harness, request)
+                .await;
         }
         sessions
             .dispatch(chat_id, harness, request, message_id)
@@ -5611,10 +5627,98 @@ impl DocHost {
 
     /// A fork must be durable before publishing its discoverable registry row.
     pub(crate) fn persist_fork(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
+        self.persist_doc(handle)
+    }
+
+    /// Snapshot this doc to the store now — the durability point for writes
+    /// made outside the turn pipeline (fork seams, child-update cards).
+    pub(crate) fn persist_doc(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
         let bytes = handle.doc.export_snapshot()?;
         self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
         handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The engine's durable store — the child-notification ledger lives here.
+    #[doc(hidden)]
+    pub fn docs_store(&self) -> Arc<DocsStore> {
+        self.inner.store.clone()
+    }
+
+    /// Child-notifier delivery (spec D9): append each `role: System`
+    /// ChildUpdate card — idempotent by its `child:<childId>:<turnKey>` entry
+    /// id — then push ONE combined agent-only prompt through the steer path.
+    ///
+    /// Never surfaces a user bubble and never interrupts a running turn: a
+    /// live steerable run takes it through the mailbox (read at the next
+    /// boundary); a parent busy on a non-steerable runtime makes the dispatch
+    /// bail retryably and the notifier holds it until the turn ends.
+    pub(crate) async fn deliver_child_updates(
+        &self,
+        parent_chat_id: &str,
+        cards: &[zeron_doc::SessionMessageEntry],
+        prompt: &str,
+    ) -> Result<(), EngineError> {
+        let handle = self.open(parent_chat_id)?;
+        {
+            let existing: HashSet<String> = handle
+                .doc()
+                .read_entries()?
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect();
+            let mut wrote = false;
+            for card in cards {
+                if existing.contains(&card.id) {
+                    continue;
+                }
+                handle.doc().push_message(card)?;
+                wrote = true;
+            }
+            if wrote {
+                handle.publish_messages_if_watched();
+                self.persist_doc(&handle)?;
+            }
+        }
+        let Some(sessions) = self.sessions() else {
+            return Err(EngineError::Other("sessions engine not wired".into()));
+        };
+        match sessions.steer_agent(parent_chat_id, prompt).await? {
+            SteerOutcome::Accepted => Ok(()),
+            SteerOutcome::NotSteerable => {
+                if sessions.turn_in_flight(parent_chat_id) {
+                    return Err(EngineError::Other(
+                        "parent chat busy; child update held".into(),
+                    ));
+                }
+                let request = sessions
+                    .last_request(parent_chat_id)
+                    .or_else(|| self.request_from_chat_row(parent_chat_id, prompt));
+                let Some(mut request) = request else {
+                    return Err(EngineError::Other(
+                        "no live run and no prior run config".into(),
+                    ));
+                };
+                request.prompt = prompt.to_string();
+                request.resume = None; // dispatch re-derives the harness session
+                // A reused request must not re-inline the previous turn's
+                // attachments, and a stale worktree spec must not mint a
+                // second checkout for what is only a notification prompt.
+                request.attachments = Vec::new();
+                request.worktree = None;
+                let harness = self.harness_for_request(parent_chat_id, &request);
+                self.dispatch_with_source_context(
+                    &sessions,
+                    parent_chat_id,
+                    harness,
+                    request,
+                    None,
+                    true,
+                )
+                .await?;
+                Ok(())
+            }
+        }
     }
 
     /// Persist every open doc now (shutdown path; bypasses the debounce).
