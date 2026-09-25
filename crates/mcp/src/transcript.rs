@@ -163,7 +163,9 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                     zeron_proto::orchestration::ChildOutcome::Interrupted => "was interrupted",
                     zeron_proto::orchestration::ChildOutcome::NeedsInput => "needs help",
                 };
-                tools.push(format!("Child {child_title} (@chat:{child_chat_id}) {verb}"));
+                tools.push(format!(
+                    "Child {child_title} (@chat:{child_chat_id}) {verb}"
+                ));
             }
         }
     }

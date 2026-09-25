@@ -9,16 +9,17 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::{
     Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
-    Space, UserInputAnswer,
+    Space, UserInputAnswer, WorktreeSpec,
 };
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
-use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
+use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, resolve_chat_in, session_for, short};
 
 /// Default and ceiling for the blocking waits.
 const MAX_BATCH: usize = 32;
@@ -27,6 +28,60 @@ const MAX_WAIT: Duration = Duration::from_secs(3600);
 /// A session row older than this is not trusted to still be working
 /// (the UI's staleness window): a crashed host must not read as busy forever.
 const SESSION_STALE: chrono::Duration = chrono::Duration::seconds(45);
+/// How many `parent_chat_id` hops an agent-spawned chat may sit below the
+/// top level. The hop count is the depth (a first-level child is 1).
+const MAX_SPAWN_DEPTH: usize = 4;
+/// Running (Working/AwaitingInput) agent-spawned children one parent may
+/// have at once. Over the cap a spawn refuses — batch or wait first.
+const MAX_RUNNING_CHILDREN: usize = 8;
+
+/// A `create_chat` failure the caller can branch on: the per-parent running
+/// cap is a "try later" condition (CLI exit 5), everything else is a plain
+/// error. Rendered into the same `Err(String)` for MCP `tools/call`.
+#[derive(Debug)]
+pub enum ChatError {
+    Limit(String),
+    Failed(anyhow::Error),
+}
+
+impl ChatError {
+    fn failed(message: impl Into<String>) -> Self {
+        Self::Failed(anyhow::anyhow!(message.into()))
+    }
+}
+
+/// Which checkout a spawned chat runs in.
+enum Placement {
+    /// Host materializes a fresh worktree when it drains the Run.
+    Worktree(WorktreeSpec),
+    /// Run in an existing directory (space root, parent's cwd, --cwd).
+    Cwd(String),
+}
+
+/// Narrowness ordering for the only-lower rule: ReadOnly < WorkspaceWrite <
+/// DangerFullAccess.
+fn sandbox_rank(level: SandboxLevel) -> u8 {
+    match level {
+        SandboxLevel::ReadOnly => 0,
+        SandboxLevel::WorkspaceWrite => 1,
+        SandboxLevel::DangerFullAccess => 2,
+    }
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limit(m) => write!(f, "{m}"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<anyhow::Error> for ChatError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Failed(e)
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +92,7 @@ pub struct ToolDef {
 }
 
 pub struct Tools {
-    zeron: Arc<Zeron>,
+    pub(crate) zeron: Arc<Zeron>,
 }
 
 fn chat_key_schema(extra: Value) -> Value {
@@ -116,13 +171,17 @@ fn catalog() -> Vec<ToolDef> {
                     "project": { "type": "string", "description": "Project id, path, or name. Required unless device is given." },
                     "device": { "type": "string", "description": "Host device (id or name) for a project-less chat; defaults to this device." },
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
-                    "harness": { "type": "string", "description": "Harness id (see list_harnesses). Defaults to claude-code when available." },
-                    "model": { "type": "string", "description": "Model id from list_models. Omit for the harness default." },
-                    "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max)." },
-                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write" },
+                    "no_parent": { "type": "boolean", "default": false, "description": "Spawn a top-level chat even when called from inside a chat." },
+                    "harness": { "type": "string", "description": "Harness id (see list_harnesses). Defaults to the parent's, else claude-code when available." },
+                    "model": { "type": "string", "description": "Model id from list_models. Defaults to the parent's, else the harness default." },
+                    "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max). Defaults to the parent's." },
+                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "description": "Defaults to the parent's (or workspace-write); may only be lowered below it." },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
-                    "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
+                    "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to a fresh worktree for git projects, else the project folder." },
+                    "worktree": { "type": "boolean", "description": "Force a fresh git worktree of the project repo (the default for git projects). Errors when the project is not a git repo." },
+                    "base": { "type": "string", "description": "Base ref for the new worktree branch; defaults to the parent's branch, else the repo's HEAD." },
+                    "same_checkout": { "type": "boolean", "default": false, "description": "Share the parent's working directory instead of a new worktree." },
                     "prompt": { "type": "string", "description": "First message to send right away." },
                     "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
@@ -186,6 +245,20 @@ fn catalog() -> Vec<ToolDef> {
                 "archived": { "type": "boolean", "default": true }
             })),
         },
+        ToolDef {
+            name: "chat_output",
+            description: "The last assistant reply of a chat's latest settled turn (text only). Fails when the chat has no settled reply yet.",
+            input_schema: chat_key_schema(json!({})),
+        },
+        ToolDef {
+            name: "fork_chat",
+            description: "Copy a chat's settled history into a new chat (a side chat under the same parent, or under the source itself when it is top-level) and optionally start it with a prompt.",
+            input_schema: chat_key_schema(json!({
+                "prompt": { "type": "string", "description": "First message to send the fork right away." },
+                "wait": { "type": "boolean", "default": false },
+                "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
+            })),
+        },
     ];
     for (name, single, description) in [
         (
@@ -225,8 +298,8 @@ struct BatchArgs {
 }
 
 #[derive(Deserialize)]
-struct ChatArgs {
-    chat: String,
+pub(crate) struct ChatArgs {
+    pub(crate) chat: String,
 }
 
 #[derive(Deserialize)]
@@ -244,22 +317,31 @@ struct ListChatsArgs {
     limit: Option<usize>,
 }
 
+/// `create_chat` args — `pub(crate)` so the `zeron chat spawn` command
+/// builds the same request the MCP tool accepts.
 #[derive(Deserialize, Default)]
-struct CreateChatArgs {
-    project: Option<String>,
-    device: Option<String>,
-    parent: Option<String>,
-    harness: Option<String>,
-    model: Option<String>,
-    reasoning: Option<String>,
-    sandbox: Option<String>,
-    title: Option<String>,
-    branch: Option<String>,
-    cwd: Option<String>,
-    prompt: Option<String>,
+pub(crate) struct CreateChatArgs {
+    pub(crate) project: Option<String>,
+    pub(crate) device: Option<String>,
+    pub(crate) parent: Option<String>,
+    pub(crate) harness: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning: Option<String>,
+    pub(crate) sandbox: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
-    wait: bool,
-    timeout_secs: Option<u64>,
+    pub(crate) worktree: bool,
+    pub(crate) base: Option<String>,
+    #[serde(default)]
+    pub(crate) same_checkout: bool,
+    #[serde(default)]
+    pub(crate) no_parent: bool,
+    pub(crate) prompt: Option<String>,
+    #[serde(default)]
+    pub(crate) wait: bool,
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -293,6 +375,15 @@ struct WaitArgs {
 struct ArchiveArgs {
     chat: String,
     archived: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ForkArgs {
+    pub(crate) chat: String,
+    pub(crate) prompt: Option<String>,
+    #[serde(default)]
+    pub(crate) wait: bool,
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -373,6 +464,7 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
         "reasoning": chat.config.as_ref().and_then(|c| c.reasoning),
         "archived": chat.archived,
         "parentChatId": chat.parent_chat_id,
+        "spawnedByAgent": chat.spawned_by_agent,
         "status": status,
         "statusAgeSecs": status_age,
         "lastMessageAt": chat.last_message_at,
@@ -411,7 +503,10 @@ impl Tools {
             "list_models" => self.list_models(parse(args)?).await,
             "list_chats" => self.list_chats(parse(args)?).await,
             "get_chat" => self.get_chat(parse(args)?).await,
-            "create_chat" => self.create_chat(parse(args)?).await,
+            "create_chat" => self
+                .create_chat(parse(args)?)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string())),
             "create_chats" => self.batch(parse(args)?, true).await,
             "send_messages" => self.batch(parse(args)?, false).await,
             "read_chat" => self.read_chat(parse(args)?).await,
@@ -420,6 +515,8 @@ impl Tools {
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
+            "chat_output" => self.chat_output(parse(args)?).await,
+            "fork_chat" => self.fork_chat(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| e.to_string())
@@ -436,7 +533,10 @@ impl Tools {
             |(index, args)| async move {
                 let result = if create {
                     match serde_json::from_value(args) {
-                        Ok(args) => self.create_chat(args).await,
+                        Ok(args) => self
+                            .create_chat(args)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string())),
                         Err(error) => Err(error.into()),
                     }
                 } else {
@@ -595,90 +695,237 @@ impl Tools {
         Ok(summary)
     }
 
-    async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+    /// Create a chat row (agent-spawned) and optionally start it with a
+    /// prompt. Defaults follow the parent chat; the limits on nesting depth
+    /// and running children are the orchestration spec's, enforced for both
+    /// the CLI and the MCP surface.
+    pub(crate) async fn create_chat(&self, args: CreateChatArgs) -> Result<Value, ChatError> {
+        // One snapshot up front: parent-chain walks, sibling counts and the
+        // project lookup all read the same world view.
+        let chats = self.zeron.chats().await?;
+        // A USER side chat (has a parent, not spawned by an agent) cannot
+        // create chats. Agent-spawned children may nest, bounded below.
         if let Some(origin) = self.zeron.origin().chat_id.as_deref() {
-            let chat = self.zeron.resolve_chat(origin).await?;
-            anyhow::ensure!(
-                chat.parent_chat_id.is_none(),
-                "Side chats cannot create chats. Ask your parent chat to create another side chat."
-            );
+            let origin = resolve_chat_in(&chats, origin)?;
+            if origin.parent_chat_id.is_some() && !origin.spawned_by_agent {
+                return Err(ChatError::failed(
+                    "Side chats cannot create chats. Ask your parent chat to create another side chat.",
+                ));
+            }
         }
+        // Parent: explicit `parent`, else the chat this server speaks for.
+        // `no_parent` forces a top-level spawn.
+        let parent: Option<Chat> = if args.no_parent {
+            None
+        } else {
+            match args
+                .parent
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                Some(key) => Some(resolve_chat_in(&chats, key)?),
+                None => match self.zeron.origin().chat_id.as_deref() {
+                    Some(id) => Some(resolve_chat_in(&chats, id)?),
+                    None => None,
+                },
+            }
+        };
+        if let Some(parent) = &parent {
+            // A user-made side chat or fork is a leaf of the tree — nothing
+            // hangs under it, so delegation fans out only from real chats.
+            if parent.parent_chat_id.is_some() && !parent.spawned_by_agent {
+                return Err(ChatError::failed(format!(
+                    "{} is a child of a side chat and cannot be a parent. Create the new chat under a top-level chat or an agent-spawned child.",
+                    parent.title.as_deref().unwrap_or("that chat")
+                )));
+            }
+            // Depth counts parent_chat_id hops: a first-level child is 1.
+            // Past MAX_SPAWN_DEPTH a fan-out is no longer reviewable.
+            let mut hops = 0usize;
+            let mut at = parent.parent_chat_id.clone();
+            while let Some(id) = at {
+                hops += 1;
+                at = chats
+                    .iter()
+                    .find(|c| c.id == id)
+                    .and_then(|c| c.parent_chat_id.clone());
+                if hops > MAX_SPAWN_DEPTH {
+                    break; // a dangling/cyclic chain has already lost
+                }
+            }
+            if hops + 1 > MAX_SPAWN_DEPTH {
+                return Err(ChatError::failed(format!(
+                    "nesting depth limit: agent-spawned chats nest at most {MAX_SPAWN_DEPTH} deep; spawn from a chat closer to the top"
+                )));
+            }
+            // Per-parent cap on running children — stale rows don't count
+            // (the host may be dead), archived children are done.
+            let sessions = self.zeron.sessions().await?;
+            let now = chrono::Utc::now();
+            let running = chats
+                .iter()
+                .filter(|c| {
+                    c.parent_chat_id.as_deref() == Some(parent.id.as_str())
+                        && c.spawned_by_agent
+                        && !c.archived
+                })
+                .filter(|c| {
+                    session_for(&sessions, c).is_some_and(|s| {
+                        now - s.updated_at <= SESSION_STALE
+                            && matches!(
+                                s.status,
+                                SessionStatus::Working | SessionStatus::AwaitingInput
+                            )
+                    })
+                })
+                .count();
+            if running >= MAX_RUNNING_CHILDREN {
+                return Err(ChatError::Limit(format!(
+                    "the parent chat already has {running} running children (max {MAX_RUNNING_CHILDREN})"
+                )));
+            }
+        }
+
+        let parent_config = parent.as_ref().and_then(|p| p.config.clone());
         let harnesses = self.zeron.harnesses().await?;
         let harness = match args.harness.as_deref() {
             Some(raw) => {
-                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
+                let id: HarnessId = parse_enum("harness", raw).map_err(ChatError::failed)?;
                 if let Some(info) = harnesses.iter().find(|h| h.id == id)
                     && !info.available()
                 {
-                    anyhow::bail!(
+                    return Err(ChatError::failed(format!(
                         "harness {raw} is not available on this device (see list_harnesses)"
-                    );
+                    )));
                 }
                 id
             }
-            None => default_harness(&harnesses)?,
+            None => match parent_config.as_ref() {
+                // The parent's harness keeps a delegation chain on whatever
+                // the user picked; only when it is gone locally do we fall
+                // back to the device default.
+                Some(config)
+                    if harnesses
+                        .iter()
+                        .any(|h| h.id == config.harness && h.available()) =>
+                {
+                    config.harness
+                }
+                _ => default_harness(&harnesses)?,
+            },
         };
+        let model = args
+            .model
+            .clone()
+            .or_else(|| parent_config.as_ref().and_then(|c| c.model.clone()));
         if let Some(model) = args.model.as_deref()
             && let Ok(models) = self.zeron.models(harness).await
             && !models.is_empty()
             && !models.iter().any(|m| m.id == model)
         {
-            anyhow::bail!(
+            return Err(ChatError::failed(format!(
                 "model {model:?} is not offered by {harness:?}; available: {}",
                 models
                     .iter()
                     .map(|m| m.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            );
+            )));
         }
         let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
-            Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
-            None => None,
+            Some(raw) => Some(parse_enum("reasoning level", raw).map_err(ChatError::failed)?),
+            None => parent_config.as_ref().and_then(|c| c.reasoning),
         };
+        let parent_sandbox = parent_config
+            .as_ref()
+            .map(|c| c.sandbox)
+            .unwrap_or(SandboxLevel::WorkspaceWrite);
         let sandbox: SandboxLevel = match args.sandbox.as_deref() {
-            Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
-            None => SandboxLevel::WorkspaceWrite,
+            Some(raw) => {
+                let requested: SandboxLevel =
+                    parse_enum("sandbox", raw).map_err(ChatError::failed)?;
+                if sandbox_rank(requested) > sandbox_rank(parent_sandbox) {
+                    return Err(ChatError::failed(format!(
+                        "sandbox {raw} is wider than the parent's; the sandbox can only be lowered"
+                    )));
+                }
+                requested
+            }
+            None => parent_sandbox,
         };
         let config = ChatConfig {
             harness,
-            model: args.model.clone(),
+            model: model.clone(),
             reasoning,
             model_options: Default::default(),
             sandbox,
         };
 
-        let (space, device_id) = match args.project.as_deref() {
-            Some(project) => {
-                let space = self.zeron.resolve_space(project).await?;
-                let device_id = space.device_id.clone();
-                (Some(space), device_id)
-            }
-            None => (
-                None,
-                self.zeron.resolve_device_id(args.device.as_deref()).await?,
-            ),
+        // Project: explicit `project`, else the parent's space.
+        let space = match args.project.as_deref() {
+            Some(project) => Some(self.zeron.resolve_space(project).await?),
+            None => match parent.as_ref().and_then(|p| p.space_id.as_deref()) {
+                Some(id) => self.zeron.spaces().await?.into_iter().find(|s| s.id == id),
+                None => None,
+            },
+        };
+        let device_id = match &space {
+            Some(space) => space.device_id.clone(),
+            None => self.zeron.resolve_device_id(args.device.as_deref()).await?,
         };
 
-        // Parent: the explicit `parent` argument, else the chat this server
-        // speaks for. Resolved so a prefix/title works and a typo fails loud.
-        let parent_chat_id = match args
-            .parent
+        let explicit_cwd = args
+            .cwd
             .as_deref()
             .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            Some(key) => Some(self.zeron.resolve_chat(key).await?.id),
-            None => self.zeron.origin().chat_id.clone(),
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
+        // Environment: a fresh worktree for git projects keeps siblings out
+        // of each other's dirty checkout; everything else shares the
+        // parent's cwd (falling back to the project root).
+        let fallback_cwd = parent
+            .as_ref()
+            .and_then(|p| p.cwd.clone())
+            .or_else(|| space.as_ref().map(|s| s.path.clone()))
+            .unwrap_or_else(|| "~".into());
+        let placement = match (explicit_cwd, args.same_checkout, space.as_ref()) {
+            (Some(cwd), _, _) => Placement::Cwd(cwd),
+            (None, true, _) => Placement::Cwd(fallback_cwd),
+            (None, false, Some(space)) if space.git_detected || args.worktree => {
+                if !space.git_detected {
+                    return Err(ChatError::failed(
+                        "the project is not a git repo; use --same-checkout or --cwd instead of --worktree",
+                    ));
+                }
+                Placement::Worktree(WorktreeSpec {
+                    repo_path: space.path.clone(),
+                    base: args
+                        .base
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_owned)
+                        .or_else(|| parent.as_ref().and_then(|p| p.branch.clone()))
+                        .unwrap_or_else(|| "HEAD".into()),
+                    space_id: Some(space.id.clone()),
+                })
+            }
+            (None, false, _) => {
+                if args.worktree {
+                    return Err(ChatError::failed(
+                        "no project repo to make a worktree from; pass --project or --cwd",
+                    ));
+                }
+                Placement::Cwd(fallback_cwd)
+            }
         };
-
-        if let Some(parent) = parent_chat_id.as_deref() {
-            let chat = self.zeron.resolve_chat(parent).await?;
-            anyhow::ensure!(
-                chat.parent_chat_id.is_none(),
-                "Cannot create a child of a side chat. Choose a top-level parent chat."
-            );
+        if args.base.is_some() && !matches!(placement, Placement::Worktree(_)) {
+            return Err(ChatError::failed(
+                "--base only applies to a worktree spawn (git project or --worktree)",
+            ));
         }
+
         let chat_id = uuid::Uuid::new_v4().to_string();
         let mut mutate = json!({
             "op": "createChat",
@@ -692,8 +939,8 @@ impl Tools {
         if let Some(space) = &space {
             mutate["spaceId"] = json!(space.id);
         }
-        if let Some(parent) = &parent_chat_id {
-            mutate["parentChatId"] = json!(parent);
+        if let Some(parent) = &parent {
+            mutate["parentChatId"] = json!(parent.id);
         }
         if let Some(branch) = args
             .branch
@@ -703,9 +950,13 @@ impl Tools {
         {
             mutate["branch"] = json!(branch);
         }
-        if let Some(cwd) = args.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            mutate["cwd"] = json!(cwd);
-        }
+        let cwd = match &placement {
+            Placement::Cwd(cwd) => cwd.clone(),
+            // The worktree path exists only after the host materializes it;
+            // the row points at the repo root until then.
+            Placement::Worktree(spec) => spec.repo_path.clone(),
+        };
+        mutate["cwd"] = json!(cwd);
         self.zeron.mutate(mutate).await?;
         if let Some(title) = args
             .title
@@ -718,16 +969,23 @@ impl Tools {
                 .await?;
         }
 
+        let worktree = match &placement {
+            Placement::Worktree(spec) => Some(spec.clone()),
+            Placement::Cwd(_) => None,
+        };
         let mut result = json!({
             "chatId": chat_id,
             "deviceId": device_id,
             "project": space.as_ref().map(|s| json!({ "id": s.id, "name": s.display_name(), "path": s.path })),
             "harness": harness,
-            "model": args.model,
+            "model": model,
             "reasoning": reasoning,
+            "sandbox": sandbox,
             "title": args.title,
-            "parentChatId": parent_chat_id,
+            "parentChatId": parent.as_ref().map(|p| p.id.clone()),
             "spawnedByAgent": true,
+            "worktree": worktree,
+            "cwd": cwd,
         });
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
             // The row may not have folded into WatchChats yet; build the
@@ -737,7 +995,7 @@ impl Tools {
                 device_id: device_id.clone(),
                 title: args.title.clone(),
                 archived: false,
-                cwd: args.cwd.clone(),
+                cwd: Some(cwd),
                 branch: args.branch.clone(),
                 checkout_id: None,
                 source_context: None,
@@ -747,14 +1005,22 @@ impl Tools {
                 created_at: chrono::Utc::now(),
                 harness_session_id: None,
                 harness_session_cwd: None,
-                parent_chat_id: parent_chat_id.clone(),
+                parent_chat_id: parent.as_ref().map(|p| p.id.clone()),
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 room_gen: None,
                 spawned_by_agent: true,
             };
             let sent = self
-                .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
+                .deliver(
+                    &chat,
+                    space.as_ref(),
+                    &harnesses,
+                    None,
+                    prompt,
+                    "run",
+                    worktree,
+                )
                 .await?;
             result["sent"] = sent;
             if args.wait {
@@ -799,12 +1065,22 @@ impl Tools {
         }))
     }
 
-    async fn send_message(&self, args: SendArgs) -> anyhow::Result<Value> {
-        let text = args.text.trim();
+    /// Resolve, attribute and deliver — shared by `send_message` (which
+    /// waits with [`Tools::await_turn`]) and the CLI's `tell`, which waits
+    /// with the orchestration crate's settle detection instead. Returns the
+    /// target, the session baseline taken before the send, and the delivery
+    /// report.
+    pub(crate) async fn send_text(
+        &self,
+        chat_key: &str,
+        text: &str,
+        mode: &str,
+    ) -> anyhow::Result<(Chat, Option<Session>, Value)> {
+        let text = text.trim();
         if text.is_empty() {
             anyhow::bail!("text is empty");
         }
-        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let chat = self.zeron.resolve_chat(chat_key).await?;
         if self.zeron.origin().chat_id.as_deref() == Some(chat.id.as_str()) {
             anyhow::bail!(
                 "refusing to send a message to your own chat ({})",
@@ -821,16 +1097,30 @@ impl Tools {
             .as_deref()
             .and_then(|id| spaces.iter().find(|s| s.id == id));
         let baseline = session_for(&sessions, &chat);
+        let body = self.attribute(&chat, text).await;
+        let sent = self
+            .deliver(
+                &chat,
+                space,
+                &harnesses,
+                baseline.as_ref(),
+                body,
+                mode,
+                None,
+            )
+            .await?;
+        Ok((chat, baseline, sent))
+    }
+
+    async fn send_message(&self, args: SendArgs) -> anyhow::Result<Value> {
         let mode = args.mode.as_deref().unwrap_or("auto");
         let sent_at = now_millis();
-        let body = self.attribute(&chat, text).await;
+        let (chat, baseline, sent) = self.send_text(&args.chat, &args.text, mode).await?;
         let mut result = json!({
             "chatId": chat.id,
             "title": chat.title,
         });
-        result["sent"] = self
-            .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
-            .await?;
+        result["sent"] = sent;
         if args.wait {
             result["turn"] = self
                 .await_turn(
@@ -841,6 +1131,94 @@ impl Tools {
                     sent_at,
                 )
                 .await?;
+        }
+        Ok(result)
+    }
+
+    /// The last assistant reply of the latest settled turn — the text of
+    /// the newest complete assistant message, nothing when the chat has
+    /// never finished a turn.
+    pub(crate) async fn last_reply(&self, chat: &Chat) -> anyhow::Result<Option<String>> {
+        let entries = self.zeron.transcript(&chat.id).await?;
+        let rendered = render_entries(
+            &entries,
+            RenderOptions {
+                include_reasoning: false,
+                include_tools: false,
+            },
+        );
+        let reply = rendered
+            .iter()
+            .rev()
+            .find(|m| {
+                m.role == zeron_doc::MessageRole::Assistant
+                    && !m.text.trim().is_empty()
+                    && m.status != Some(zeron_doc::MessageStatus::Streaming)
+            })
+            .map(|m| m.text.clone());
+        Ok(reply)
+    }
+
+    pub(crate) async fn chat_output(&self, args: ChatArgs) -> anyhow::Result<Value> {
+        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let reply = self
+            .last_reply(&chat)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("chat {} has no settled reply yet", short(&chat.id)))?;
+        Ok(json!({ "chatId": chat.id, "title": chat.title, "reply": reply }))
+    }
+
+    /// `ForkSideChat` (client-minted id so retries dedupe) plus an optional
+    /// first prompt, matching the composer fork's shape.
+    pub(crate) async fn fork_chat(&self, args: ForkArgs) -> anyhow::Result<Value> {
+        let source = self.zeron.resolve_chat(&args.chat).await?;
+        // A fork of a side chat lands as a sibling under the same parent;
+        // a fork of a top-level chat hangs under the source itself.
+        let parent = source
+            .parent_chat_id
+            .clone()
+            .unwrap_or_else(|| source.id.clone());
+        let reply = self
+            .zeron
+            .call(
+                zeron_rpc::methods::FORK_SIDE_CHAT,
+                json!({
+                    "chatId": uuid::Uuid::new_v4().to_string(),
+                    "sourceChatId": source.id,
+                    "parentChatId": parent,
+                    "targetDeviceId": source.device_id,
+                }),
+            )
+            .await?;
+        let fork: Chat = serde_json::from_value(reply).context("ForkSideChat: unexpected reply")?;
+        let mut result = json!({
+            "chatId": fork.id,
+            "title": fork.title,
+            "sourceChatId": source.id,
+            "parentChatId": fork.parent_chat_id,
+        });
+        if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
+            let (spaces, harnesses) =
+                tokio::try_join!(self.zeron.spaces(), self.zeron.harnesses())?;
+            let space = fork
+                .space_id
+                .as_deref()
+                .and_then(|id| spaces.iter().find(|s| s.id == id));
+            let sent = self
+                .deliver(&fork, space, &harnesses, None, prompt, "run", None)
+                .await?;
+            result["sent"] = sent;
+            if args.wait {
+                result["turn"] = self
+                    .await_turn(
+                        &fork,
+                        None,
+                        true,
+                        wait_duration(args.timeout_secs),
+                        now_millis(),
+                    )
+                    .await?;
+            }
         }
         Ok(result)
     }
@@ -932,7 +1310,10 @@ impl Tools {
         zeron_proto::orchestration::agent_message(title.as_deref(), origin_id, text)
     }
 
-    /// Pick and perform the delivery the composer would.
+    /// Pick and perform the delivery the composer would. `worktree` rides
+    /// only on a fresh `run` — steering or queueing into an existing turn
+    /// keeps whatever checkout that turn is running in.
+    #[allow(clippy::too_many_arguments)] // delivery seam, not a public API
     async fn deliver(
         &self,
         chat: &Chat,
@@ -941,6 +1322,7 @@ impl Tools {
         session: Option<&Session>,
         text: String,
         mode: &str,
+        worktree: Option<WorktreeSpec>,
     ) -> anyhow::Result<Value> {
         let harness = chat
             .config
@@ -989,7 +1371,7 @@ impl Tools {
                     auto_approve: false,
                     resume: None,
                     attachments: Vec::new(),
-                    worktree: None,
+                    worktree,
                     agent: None,
                 };
                 self.zeron
@@ -1280,6 +1662,7 @@ mod tests {
                 Some(&session),
                 "follow up".into(),
                 "auto",
+                None,
             )
             .await
             .unwrap();
