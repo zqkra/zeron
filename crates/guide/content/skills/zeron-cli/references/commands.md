@@ -16,7 +16,9 @@ zeron chat spawn (--prompt <text> | --prompt-file <path|->)
 ```
 
 Harness, model, reasoning and sandbox inherit the parent; sandbox can only be
-lowered. Environment defaults to a new worktree of the parent's repo.
+lowered. `--model` takes a full id or a unique shorthand (`sonnet` →
+`claude-sonnet-5`); ambiguous or unknown shorthands error listing candidates.
+Environment defaults to a new worktree of the parent's repo.
 `--parent` nests under another chat, `--no-parent` spawns top-level. Human
 output ends with `@chat:<full-id>`.
 

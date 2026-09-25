@@ -11,6 +11,10 @@ zeron model list claude-code
 `harness list` shows installed and enabled harnesses. `model list <harness>`
 shows the models that harness offers, with their reasoning levels.
 
+`--model` accepts a full id or a shorthand that matches exactly one model
+(`sonnet` → `claude-sonnet-5`). When a shorthand matches several, or none,
+the error names candidate ids — run `model list` and pick one.
+
 ## Inheritance
 
 A spawned chat inherits its parent's harness, model, reasoning level and

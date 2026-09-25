@@ -815,24 +815,13 @@ impl Tools {
                 _ => default_harness(&harnesses)?,
             },
         };
-        let model = args
-            .model
-            .clone()
-            .or_else(|| parent_config.as_ref().and_then(|c| c.model.clone()));
-        if let Some(model) = args.model.as_deref()
-            && let Ok(models) = self.zeron.models(harness).await
-            && !models.is_empty()
-            && !models.iter().any(|m| m.id == model)
-        {
-            return Err(ChatError::failed(format!(
-                "model {model:?} is not offered by {harness:?}; available: {}",
-                models
-                    .iter()
-                    .map(|m| m.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
+        // Agents pass shorthand ("haiku", "sonnet") as readily as full ids:
+        // resolve exact id → unique case-insensitive substring of the id or
+        // label → ambiguous tokens and unknowns error naming the catalog.
+        let model = match args.model.as_deref() {
+            Some(raw) => Some(resolve_model(&self.zeron, harness, raw).await?),
+            None => parent_config.as_ref().and_then(|c| c.model.clone()),
+        };
         let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
             Some(raw) => Some(parse_enum("reasoning level", raw).map_err(ChatError::failed)?),
             None => parent_config.as_ref().and_then(|c| c.reasoning),
@@ -1465,6 +1454,42 @@ fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
         })
 }
 
+/// Resolve an agent-typed model name against the harness catalog: exact id
+/// wins, else a single case-insensitive substring match on id or label.
+/// Several matches is ambiguous; zero means the name is not offered — the
+/// error names up to five candidate ids either way. When the catalog cannot
+/// be read the token passes through untouched (the engine will report it).
+async fn resolve_model(zeron: &Zeron, harness: HarnessId, raw: &str) -> Result<String, ChatError> {
+    let Ok(models) = zeron.models(harness).await else {
+        return Ok(raw.to_owned());
+    };
+    if models.is_empty() || models.iter().any(|m| m.id == raw) {
+        return Ok(raw.to_owned());
+    }
+    let token = raw.to_lowercase();
+    let matches: Vec<&str> = models
+        .iter()
+        .filter(|m| m.id.to_lowercase().contains(&token) || m.label.to_lowercase().contains(&token))
+        .map(|m| m.id.as_str())
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok((*only).to_owned()),
+        [] => Err(ChatError::failed(format!(
+            "model {raw:?} is not offered by {harness:?}; available: {}",
+            models
+                .iter()
+                .take(5)
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        many => Err(ChatError::failed(format!(
+            "model {raw:?} is ambiguous for {harness:?}: {} — use a full id",
+            many.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1671,6 +1696,31 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[0].1["command"]["kind"], "steer");
+    }
+
+    #[tokio::test]
+    async fn model_names_resolve_exact_alias_then_error() {
+        let world = Arc::new(World::default());
+        let tools = tools(world, Origin::default());
+        let m = |raw: &str| {
+            let z = tools.zeron.clone();
+            let raw = raw.to_owned();
+            async move { resolve_model(&z, HarnessId::ClaudeCode, &raw).await }
+        };
+
+        // Exact id passes through untouched.
+        assert_eq!(m("sonnet").await.unwrap(), "sonnet");
+        // A unique substring of an id or label resolves to that id.
+        assert_eq!(m("Sonn").await.unwrap(), "sonnet");
+        assert_eq!(m("opus").await.unwrap(), "opus");
+        // Several matches is an error naming the candidates.
+        let err = m("o").await.unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("opus") && err.contains("sonnet"), "{err}");
+        // Zero matches is "not offered" with candidate ids to pick from.
+        let err = m("gpt-9").await.unwrap_err().to_string();
+        assert!(err.contains("not offered"), "{err}");
+        assert!(err.contains("opus"), "{err}");
     }
 
     #[tokio::test]
