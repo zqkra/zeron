@@ -1,0 +1,23 @@
+# Harnesses and models
+
+A harness is the agent runtime a chat runs on (for example Claude Code or
+Codex); a model and reasoning level ride on top.
+
+```
+zeron harness list
+zeron model list claude-code
+```
+
+`harness list` shows installed and enabled harnesses. `model list <harness>`
+shows the models that harness offers, with their reasoning levels.
+
+## Inheritance
+
+A spawned chat inherits its parent's harness, model, reasoning level and
+sandbox unless you pass `--harness`, `--model`, `--reasoning` on
+`zeron chat spawn`. Sandbox can only be lowered from the parent's, never
+raised. Chats spawned outside a parent default to the workspace default
+harness.
+
+Pick the cheapest harness and model that can do the job: a cheap reviewer or
+researcher costs the same supervision as an expensive one.

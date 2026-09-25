@@ -13,6 +13,7 @@ members = [
     "crates/ui",
     "crates/syntax",
     "crates/mcp",
+    "crates/guide",
     "apps/zeron",
 ]
 
@@ -35,6 +36,7 @@ zeron-ui = { path = "crates/ui" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-theme = { path = "crates/theme" }
 zeron-mcp = { path = "crates/mcp" }
+zeron-guide = { path = "crates/guide" }
 
 # CRDT
 loro = "1.13"
