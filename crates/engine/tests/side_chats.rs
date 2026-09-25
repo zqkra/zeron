@@ -170,6 +170,7 @@ async fn fork_is_frozen_durable_idempotent_and_has_an_independent_provider_sessi
                 resume: None,
                 attachments: vec![],
                 worktree: None,
+                agent: None,
             },
             Some("side-user".into()),
         )

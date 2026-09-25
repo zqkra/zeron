@@ -409,9 +409,7 @@ impl ChatConnectionSnapshot {
             sync_requested,
             stats: client.as_ref().map(|client| client.stats()),
             delivery_live: sync_started
-                && client
-                    .as_ref()
-                    .is_some_and(|client| client.delivery_live()),
+                && client.as_ref().is_some_and(|client| client.delivery_live()),
         }
     }
 
@@ -5574,6 +5572,7 @@ impl DocHost {
             attachments: Vec::new(),
             resume: None,
             worktree: None,
+            agent: None,
         })
     }
 
