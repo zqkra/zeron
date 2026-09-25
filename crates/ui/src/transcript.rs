@@ -1644,6 +1644,9 @@ pub fn rows_for_entry(
                             compact_fold: None,
                         });
                     }
+                    // No row for now: the child update card renders it (see
+                    // the notifications UI).
+                    MessagePart::ChildUpdate { .. } => {}
                     // Tools and thoughts are grouped by the outer arms;
                     // nothing reaches here.
                     MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
