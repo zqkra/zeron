@@ -74,6 +74,21 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE sync_job_clock (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL) STRICT;
     INSERT INTO sync_job_clock VALUES (1,0);",
     "ALTER TABLE chat_sync_jobs ADD COLUMN cursor TEXT NOT NULL DEFAULT '';",
+    // Agent-spawned child settle notifications: claim-before-send ledger so a
+    // transition detected on the child's session row reaches the parent
+    // exactly once, even across engine restarts. `state` flows
+    // pending -> delivered|dropped|superseded|acked (acked outranks
+    // everything: `zeron chat wait`/`output` saw the turn before we sent).
+    "CREATE TABLE child_notifications (
+        child_chat_id  TEXT NOT NULL,
+        turn_key       TEXT NOT NULL,
+        parent_chat_id TEXT NOT NULL,
+        outcome        TEXT,
+        state          TEXT NOT NULL CHECK(state IN ('pending','delivered','acked','superseded','dropped')),
+        created_at     INTEGER NOT NULL,
+        delivered_at   INTEGER,
+        PRIMARY KEY(child_chat_id, turn_key)
+    ) STRICT;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -562,11 +577,237 @@ impl DocsStore {
         Ok(())
     }
 
+    /// One child-notifier ledger row.
+    pub fn child_notification(
+        &self,
+        child_chat_id: &str,
+        turn_key: &str,
+    ) -> Result<Option<ChildNotification>, StoreError> {
+        store_blocking(|| {
+            Ok(self
+                .conn()
+                .query_row(
+                    "SELECT child_chat_id, turn_key, parent_chat_id, outcome, state
+                     FROM child_notifications WHERE child_chat_id=?1 AND turn_key=?2",
+                    params![child_chat_id, turn_key],
+                    |row| {
+                        Ok(ChildNotification {
+                            child_chat_id: row.get(0)?,
+                            turn_key: row.get(1)?,
+                            parent_chat_id: row.get(2)?,
+                            outcome: row.get(3)?,
+                            state: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    /// Claim `(child_chat_id, turn_key)` for delivery — call BEFORE the card
+    /// write or prompt send (same ledger rule as `mark_processed`: a crash
+    /// mid-delivery must not double-notify the parent). `true` when this call
+    /// claimed the key; `false` when a prior claim — of ANY state — already
+    /// owns it (acked rows win: a `zeron chat wait` ack that beat the claim
+    /// suppresses the notification entirely).
+    pub fn claim_child_notification(
+        &self,
+        child_chat_id: &str,
+        turn_key: &str,
+        parent_chat_id: &str,
+        outcome: &str,
+    ) -> Result<bool, StoreError> {
+        store_blocking(|| {
+            Ok(self.conn().execute(
+                "INSERT OR IGNORE INTO child_notifications
+                     (child_chat_id, turn_key, parent_chat_id, outcome, state, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                params![child_chat_id, turn_key, parent_chat_id, outcome, now_ms()],
+            )? > 0)
+        })
+    }
+
+    /// Coalescing rule: per child only the NEWEST pending update is owed to
+    /// the parent — every other still-pending key for the child supersedes.
+    pub fn supersede_pending_child_notifications(
+        &self,
+        child_chat_id: &str,
+        keep_turn_key: &str,
+    ) -> Result<(), StoreError> {
+        store_blocking(|| {
+            self.conn().execute(
+                "UPDATE child_notifications SET state='superseded'
+                 WHERE child_chat_id=?1 AND turn_key!=?2 AND state='pending'",
+                params![child_chat_id, keep_turn_key],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every ledger row for a child, any state (tests, diagnostics).
+    pub fn child_notifications_for(
+        &self,
+        child_chat_id: &str,
+    ) -> Result<Vec<ChildNotification>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(
+                "SELECT child_chat_id, turn_key, parent_chat_id, outcome, state
+                 FROM child_notifications WHERE child_chat_id=?1 ORDER BY created_at, rowid",
+            )?;
+            Ok(stmt
+                .query_map(params![child_chat_id], |row| {
+                    Ok(ChildNotification {
+                        child_chat_id: row.get(0)?,
+                        turn_key: row.get(1)?,
+                        parent_chat_id: row.get(2)?,
+                        outcome: row.get(3)?,
+                        state: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Still-owed updates for one parent, oldest claim first so the combined
+    /// prompt reads in settle order.
+    pub fn pending_child_notifications(
+        &self,
+        parent_chat_id: &str,
+    ) -> Result<Vec<ChildNotification>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(
+                "SELECT child_chat_id, turn_key, parent_chat_id, outcome, state
+                 FROM child_notifications
+                 WHERE parent_chat_id=?1 AND state='pending' ORDER BY created_at, rowid",
+            )?;
+            Ok(stmt
+                .query_map(params![parent_chat_id], |row| {
+                    Ok(ChildNotification {
+                        child_chat_id: row.get(0)?,
+                        turn_key: row.get(1)?,
+                        parent_chat_id: row.get(2)?,
+                        outcome: row.get(3)?,
+                        state: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Parents with any still-pending rows — the restart re-arm set.
+    pub fn pending_child_notification_parents(&self) -> Result<Vec<String>, StoreError> {
+        store_blocking(|| {
+            let conn = self.conn();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT parent_chat_id FROM child_notifications WHERE state='pending'",
+            )?;
+            Ok(stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Terminal-state transition for one claimed row (`delivered`, `dropped`,
+    /// `acked`, `superseded`). `delivered` also stamps `delivered_at`.
+    /// No-op for rows already in another terminal state — an ack landing
+    /// between claim and flush wins.
+    pub fn settle_child_notification(
+        &self,
+        child_chat_id: &str,
+        turn_key: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        store_blocking(|| {
+            self.conn().execute(
+                "UPDATE child_notifications
+                 SET state=?3, delivered_at = CASE WHEN ?3='delivered' THEN ?4 ELSE delivered_at END
+                 WHERE child_chat_id=?1 AND turn_key=?2 AND state='pending'",
+                params![child_chat_id, turn_key, state, now_ms()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A consumer ack (`zeron chat wait`/`output` inside the parent) for a key
+    /// the notifier may not have claimed yet: insert the row ALREADY `acked`
+    /// so the later claim's INSERT OR IGNORE no-ops. Returns `false` when the
+    /// row already exists under a DIFFERENT parent — such acks are rejected.
+    pub fn ack_child_notification(
+        &self,
+        child_chat_id: &str,
+        turn_key: &str,
+        parent_chat_id: &str,
+    ) -> Result<bool, StoreError> {
+        store_blocking(|| {
+            // NB: bind before the update — `if let` keeps the `conn()` guard
+            // alive for its whole block, and a nested `conn()` would
+            // deadlock the non-reentrant mutex.
+            let existing_parent: Option<String> = self
+                .conn()
+                .query_row(
+                    "SELECT parent_chat_id FROM child_notifications
+                     WHERE child_chat_id=?1 AND turn_key=?2",
+                    params![child_chat_id, turn_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(existing_parent) = existing_parent {
+                if existing_parent != parent_chat_id {
+                    return Ok(false);
+                }
+                self.conn().execute(
+                    "UPDATE child_notifications SET state='acked'
+                     WHERE child_chat_id=?1 AND turn_key=?2 AND state='pending'",
+                    params![child_chat_id, turn_key],
+                )?;
+                return Ok(true);
+            }
+            self.conn().execute(
+                "INSERT INTO child_notifications
+                     (child_chat_id, turn_key, parent_chat_id, state, created_at)
+                 VALUES (?1, ?2, ?3, 'acked', ?4)",
+                params![child_chat_id, turn_key, parent_chat_id, now_ms()],
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Every still-pending row for an archived parent: `dropped`. Sending
+    /// would unarchive the chat, which is exactly what archiving was meant
+    /// to stop.
+    pub fn drop_pending_child_notifications(&self, parent_chat_id: &str) -> Result<(), StoreError> {
+        store_blocking(|| {
+            self.conn().execute(
+                "UPDATE child_notifications SET state='dropped'
+                 WHERE parent_chat_id=?1 AND state='pending'",
+                params![parent_chat_id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         // A poisoned lock only means another thread panicked mid-query; the
         // connection itself is still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// One row of the child-notification ledger (spec D9): a settle transition
+/// detected on an agent-spawned child, owed to its parent chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildNotification {
+    pub child_chat_id: String,
+    /// The stable dedupe key from `child_update` (`done:<turn>`,
+    /// `error:<ms>`, `input:<ms>`, `stopped:<ms>`).
+    pub turn_key: String,
+    pub parent_chat_id: String,
+    /// `ChildOutcome`'s camelCase wire name, kept for rebuilds and debugging.
+    pub outcome: Option<String>,
+    /// `pending` | `delivered` | `acked` | `superseded` | `dropped`.
+    pub state: String,
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
@@ -744,6 +985,108 @@ mod tests {
         assert!(
             !store.mark_processed("cmd-1").unwrap(),
             "second mark must not re-claim"
+        );
+    }
+
+    #[test]
+    fn child_notification_ledger_claims_coalesces_and_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+
+        // First claim wins; repeats are deduped by the (child, key) PK.
+        assert!(
+            store
+                .claim_child_notification("c1", "done:t1", "p", "completed")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_child_notification("c1", "done:t1", "p", "completed")
+                .unwrap()
+        );
+        // A second pending key for the same child supersedes the first.
+        assert!(
+            store
+                .claim_child_notification("c1", "done:t2", "p", "completed")
+                .unwrap()
+        );
+        store
+            .supersede_pending_child_notifications("c1", "done:t2")
+            .unwrap();
+        let pending = store.pending_child_notifications("p").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].turn_key, "done:t2");
+        assert_eq!(pending[0].outcome.as_deref(), Some("completed"));
+        assert_eq!(
+            store
+                .child_notification("c1", "done:t1")
+                .unwrap()
+                .unwrap()
+                .state,
+            "superseded"
+        );
+        // Parents with pending rows are the restart re-arm set.
+        assert_eq!(
+            store.pending_child_notification_parents().unwrap(),
+            vec!["p".to_string()]
+        );
+        // Delivery is a terminal transition; a second settle no-ops.
+        store
+            .settle_child_notification("c1", "done:t2", "delivered")
+            .unwrap();
+        store
+            .settle_child_notification("c1", "done:t2", "acked")
+            .unwrap();
+        assert_eq!(
+            store
+                .child_notification("c1", "done:t2")
+                .unwrap()
+                .unwrap()
+                .state,
+            "delivered"
+        );
+        assert!(store.pending_child_notifications("p").unwrap().is_empty());
+        assert!(
+            store
+                .pending_child_notification_parents()
+                .unwrap()
+                .is_empty()
+        );
+        // An ack for an unclaimed key inserts the row already acked so a
+        // later claim is ignored; a mismatched parent is rejected.
+        assert!(store.ack_child_notification("c2", "done:t9", "p").unwrap());
+        assert!(
+            !store
+                .claim_child_notification("c2", "done:t9", "p", "completed")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .ack_child_notification("c2", "done:t9", "other")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .child_notification("c2", "done:t9")
+                .unwrap()
+                .unwrap()
+                .state,
+            "acked"
+        );
+        // Archived parents drop their pending rows.
+        assert!(
+            store
+                .claim_child_notification("c3", "error:1", "p2", "errored")
+                .unwrap()
+        );
+        store.drop_pending_child_notifications("p2").unwrap();
+        assert_eq!(
+            store
+                .child_notification("c3", "error:1")
+                .unwrap()
+                .unwrap()
+                .state,
+            "dropped"
         );
     }
 
