@@ -685,6 +685,9 @@ impl Tools {
             "chatId": chat_id,
             "deviceId": device_id,
             "config": config,
+            // Every caller of this tool is an agent: the child notifies its
+            // parent when it settles (Chat::spawned_by_agent).
+            "spawnedByAgent": true,
         });
         if let Some(space) = &space {
             mutate["spaceId"] = json!(space.id);
@@ -724,6 +727,7 @@ impl Tools {
             "reasoning": reasoning,
             "title": args.title,
             "parentChatId": parent_chat_id,
+            "spawnedByAgent": true,
         });
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
             // The row may not have folded into WatchChats yet; build the
@@ -747,6 +751,7 @@ impl Tools {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 room_gen: None,
+                spawned_by_agent: true,
             };
             let sent = self
                 .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
@@ -1324,6 +1329,10 @@ mod tests {
         );
         assert_eq!(writes[0].1["config"]["harness"], "claude-code");
         assert_eq!(writes[0].1["config"]["model"], "sonnet");
+        // Every MCP caller is an agent: the child is marked so it notifies
+        // its parent when it settles.
+        assert_eq!(writes[0].1["spawnedByAgent"], true);
+        assert_eq!(created["spawnedByAgent"], true);
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");

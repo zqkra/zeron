@@ -892,11 +892,14 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
     ) -> Result<(), EngineError> {
-        self.create_chat_with_parent(chat_id, space_id, device_id, config, cwd, None)
+        self.create_chat_with_parent(chat_id, space_id, device_id, config, cwd, None, false)
     }
 
     /// [`create_chat`](Self::create_chat) recording the creating chat
     /// (`parentChatId`) — the Zeron MCP's orchestration link.
+    /// `spawned_by_agent` marks agent-spawned children: only they push settle
+    /// notifications to their parent.
+    #[allow(clippy::too_many_arguments)] // Mutate seam, not a public API
     pub fn create_chat_with_parent(
         &self,
         chat_id: &str,
@@ -905,6 +908,7 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
         parent_chat_id: Option<String>,
+        spawned_by_agent: bool,
     ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
@@ -953,6 +957,7 @@ impl WorkspaceHost {
                 space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
                 parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
+                spawned_by_agent,
             })
         })?;
         Ok(())
