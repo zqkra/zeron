@@ -5242,6 +5242,8 @@ pub struct Composer {
     /// Composer actions row plus the new-session floating target tab
     /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
+    /// Installed only on the main conversation's composer by the shell.
+    pub(crate) chat_activity: Option<Entity<crate::chat_activity::ChatActivity>>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
@@ -5523,6 +5525,7 @@ impl Composer {
             input,
             queue_edit_draft: None,
             pickers,
+            chat_activity: None,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             appshots: HashMap::new(),
@@ -9609,12 +9612,15 @@ impl Render for Composer {
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
                                 .child(
                                     // The footer row's own 4px gap: the PR badge
-                                    // ends flush with the row, so the rings keep
-                                    // their distance here.
+                                    // ends flush with the row, so the activity
+                                    // menu and the rings keep their distance here.
                                     div()
                                         .flex_none()
-                                        .pl(px(4.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.0))
                                         .pr(px(10.0))
+                                        .children(self.chat_activity.clone())
                                         .child(self.account_usage.clone()),
                                 ),
                         )
