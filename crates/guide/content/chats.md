@@ -6,7 +6,8 @@ reads chats on any device in the workspace.
 Everywhere a command takes `<chat>`, you may pass a full chat id, a unique id
 prefix, an exact title, or `self` for your own chat (the `ZERON_CHAT_ID` env).
 Every command accepts `--json` for machine-readable output; human output goes
-to stdout, logs to stderr.
+to stdout, logs to stderr. Inside a chat, `zeron` always runs the binary of
+the Zeron that started your chat (`ZERON_CLI`), whatever PATH resolves.
 
 ## Spawn
 

@@ -18,6 +18,7 @@ with `--json` to see its fields rather than guessing names.
 
 Timeouts accept `90s`, `20m`, `1h`, or bare seconds.
 
-Branch on the code, not the wording: `0` and `124` both mean "no result yet
-worth retrying", but `2` and `3` need a different next step, and `4` means a
-human may have stopped it on purpose.
+Branch on the code, not the wording: `0` means the turn completed, `124`
+means your deadline elapsed with the chat still working — worth a retry;
+`2` and `3` need a different next step, and `4` means a human may have
+stopped it on purpose.
