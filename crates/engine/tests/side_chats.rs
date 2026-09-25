@@ -387,3 +387,28 @@ async fn forking_a_side_chat_can_land_as_a_sibling_under_the_main_chat() {
         .unwrap();
     assert_eq!(nested.parent_chat_id.as_deref(), Some("side"));
 }
+
+#[tokio::test]
+async fn ack_child_updates_parses_and_replies_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(
+        dir.path(),
+        Arc::new(HarnessRegistry::new()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let reply = client
+        .call(
+            methods::ACK_CHILD_UPDATES,
+            serde_json::json!({
+                "parentChatId": "main",
+                "updates": [{ "childChatId": "child", "turnKey": "done:t1" }],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, serde_json::json!({}));
+    core.shutdown().await;
+}

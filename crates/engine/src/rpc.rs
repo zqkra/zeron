@@ -1928,6 +1928,13 @@ impl RpcService for EngineRpc {
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)
             }
+            methods::ACK_CHILD_UPDATES => {
+                let _p: zeron_proto::orchestration::AckChildUpdatesParams =
+                    parse_params(params)?;
+                // Recorded by the child notifier once it exists; the ack is
+                // already durable on the caller's side.
+                RpcReply::value(&serde_json::json!({}))
+            }
             methods::WATCH_DOC_MESSAGES => {
                 // Opt-in: older viewports retain the full-reset contract.
                 let opening_tail = params
