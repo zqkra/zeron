@@ -399,6 +399,12 @@ pub struct AgentExec {
     /// The spawned child: the last `@chat:<uuid>` mention in the output.
     /// `None` while the spawn is still running (or printed no id).
     pub child: Option<SharedString>,
+    /// Requested label (`--title`, else the inline `--prompt` text) — the
+    /// running "Spawning" chip shows it before the child's id arrives.
+    pub label: Option<SharedString>,
+    /// Requested `--harness` id, so a still-running spawn wears the right
+    /// brand mark before the registry knows the child.
+    pub harness: Option<SharedString>,
 }
 
 /// Classify an exec as orchestration CLI traffic, and for spawns lift the
@@ -422,6 +428,8 @@ fn agent_exec(call: &ToolCall, output: Option<&str>) -> Option<AgentExec> {
         verb: command.verb,
         targets: command.targets.iter().map(SharedString::from).collect(),
         child,
+        label: command.label.map(SharedString::from),
+        harness: command.harness.map(SharedString::from),
     })
 }
 
@@ -2070,8 +2078,10 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     });
     if same_part_markdown {
         render::MD_BLOCK_GAP
-    } else if matches!(row.kind, RowKind::ToolGroup { .. })
-        || prev.is_some_and(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
+    } else if matches!(row.kind, RowKind::ToolGroup { .. } | RowKind::ChildUpdates { .. })
+        || prev.is_some_and(|row| {
+            matches!(row.kind, RowKind::ToolGroup { .. } | RowKind::ChildUpdates { .. })
+        })
     {
         Theme::SPACE_MD
     } else {
@@ -7858,9 +7868,6 @@ impl Transcript {
             (child, resolved)
         };
         let running = !tool.resolved;
-        let child_working = child
-            .as_ref()
-            .is_some_and(|c| c.known && c.indicator == ChatIndicator::Working);
         let child_errored = child
             .as_ref()
             .is_some_and(|c| c.known && c.indicator == ChatIndicator::Errored);
@@ -7884,9 +7891,18 @@ impl Transcript {
         };
         // Leading tile: the child's harness mark for spawns (BOT until the
         // registry resolves it), the BOT glyph for the messaging verbs.
+        // Leading mark: the resolved child's harness, else the `--harness`
+        // the spawn asked for, else the generic agent glyph.
         let mark = child
             .as_ref()
             .and_then(|c| c.harness)
+            .or_else(|| {
+                agent
+                    .harness
+                    .as_deref()
+                    .and_then(|id| serde_json::from_value(serde_json::json!(id)).ok())
+                    .map(|h: zeron_proto::HarnessId| h)
+            })
             .map(crate::pickers::harness_brand_icon)
             .unwrap_or((crate::icons::BOT, None));
         let mut header = div()
@@ -7944,13 +7960,20 @@ impl Transcript {
                     ));
                 }
                 None => {
-                    if let Some(target) = agent.targets.first() {
+                    // No child id yet: show what the spawn was asked to be —
+                    // `--title`, else the inline `--prompt` text, else the
+                    // first raw positional.
+                    let label = agent
+                        .label
+                        .clone()
+                        .or_else(|| agent.targets.first().cloned());
+                    if let Some(label) = label {
                         detail = detail.child(
                             div()
                                 .min_w_0()
                                 .truncate()
                                 .text_color(tint)
-                                .child(target.clone()),
+                                .child(label),
                         );
                     }
                 }
@@ -8021,10 +8044,11 @@ impl Transcript {
                     .child(model),
             );
         }
-        // Live status: the spawn spins while its command or its child runs;
-        // the other verbs spin only while the exec itself is unresolved.
-        let spinning = running || (agent.verb == ZeronChatVerb::Spawn && child_working);
-        if spinning && !failed {
+        // While the exec itself is unresolved (no output, no child id yet)
+        // the header owns the spinner; once the child resolves, the chat
+        // chip's OWN status glyph carries the live state — a second trailing
+        // glyph would double it.
+        if running && !failed {
             header = header.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
                 format!("agent-exec-{}", tool.part_id),
                 2.0,
@@ -8032,14 +8056,6 @@ impl Transcript {
                 view_cx.entity_id(),
                 view_cx,
             )));
-        } else if let Some(chat) = child.as_ref().filter(|c| c.known) {
-            header = header.child(crate::chat_pill::status_glyph(
-                format!("agent-exec-{}", tool.part_id),
-                chat.indicator,
-                view_cx.entity_id(),
-                theme,
-                view_cx,
-            ));
         }
         if let Some(chat) = child.as_ref().filter(|c| c.known) {
             let chat_id = chat.chat_id.clone();

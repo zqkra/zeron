@@ -12,26 +12,21 @@ async fn pause(cx: &mut AsyncApp, ms: u64) {
 }
 
 /// `render_to_image` is unimplemented on the Linux backend, so the fixture
-/// runs on X11 (XWayland) and the focused window is grabbed with
-/// ImageMagick's `import` — the same visual output an external screenshot
-/// would see.
+/// runs on the private headless Wayland display and the compositor output is
+/// grabbed with `grim` — real chrome, real translucency, nothing on the
+/// user's desktop.
 fn capture(
     _window: gpui::AnyWindowHandle,
     _cx: &mut AsyncApp,
     directory: &std::path::Path,
     name: &str,
 ) -> anyhow::Result<()> {
-    let id = std::process::Command::new("xdotool")
-        .arg("getactivewindow")
-        .output()?;
-    let id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
-    let out = std::process::Command::new("import")
-        .args(["-window", &id])
+    let out = std::process::Command::new("grim")
         .arg(directory.join(format!("{name}.png")))
         .output()?;
     anyhow::ensure!(
         out.status.success(),
-        "import failed: {}",
+        "grim failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(())

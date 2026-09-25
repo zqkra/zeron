@@ -538,6 +538,12 @@ pub struct ZeronChatCommand {
     /// Positional arguments after flag stripping — chat ids, prefixes or
     /// titles (`wait` can take several; `spawn` normally carries none).
     pub targets: Vec<String>,
+    /// Display label the caller asked for: `--title`, else the inline
+    /// `--prompt` text (`--prompt-file` paths are NOT titles — skipped).
+    pub label: Option<String>,
+    /// The `--harness` value, when given — the spawn chip shows its brand
+    /// mark even before the child chat resolves.
+    pub harness: Option<String>,
 }
 
 /// Split one shell line into words: single/double quotes and backslash
@@ -718,6 +724,8 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
         _ => return None,
     };
     let mut targets = Vec::new();
+    let mut label = None;
+    let mut harness = None;
     let mut ix = at + 3;
     while let Some(word) = words.get(ix) {
         ix += 1;
@@ -725,12 +733,27 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
             // A later pipeline/chain is a different command; stop there.
             "&&" | "||" | ";" | "|" | ">" => break,
             w if w.starts_with("--") => {
-                let flag = w.split_once('=').map(|(f, _)| f).unwrap_or(w);
-                if !w.contains('=')
-                    && ZERON_CHAT_VALUE_FLAGS.contains(&flag)
-                    && words.get(ix).is_some()
-                {
-                    ix += 1;
+                let (flag, inline) = match w.split_once('=') {
+                    Some((flag, value)) => (flag, Some(value.to_owned())),
+                    None => (w, None),
+                };
+                let value = inline.or_else(|| {
+                    ZERON_CHAT_VALUE_FLAGS
+                        .contains(&flag)
+                        .then(|| words.get(ix).cloned())
+                        .flatten()
+                        .inspect(|_| ix += 1)
+                });
+                match flag {
+                    "--title" | "--prompt" => {
+                        if label.is_none() {
+                            label = value;
+                        }
+                    }
+                    "--harness" if harness.is_none() => {
+                        harness = value;
+                    }
+                    _ => {}
                 }
             }
             w if w.starts_with('-') && w.len() > 1 => {}
@@ -744,7 +767,12 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
             }
         }
     }
-    Some(ZeronChatCommand { verb, targets })
+    Some(ZeronChatCommand {
+        verb,
+        targets,
+        label,
+        harness,
+    })
 }
 
 /// The status-dot palette, as oklch triples (L, C, H°).
@@ -922,35 +950,45 @@ mod zeron_chat_command_tests {
             cmd("zeron chat spawn --prompt \"scan the repo\" --harness claude-code"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Spawn,
-                targets: vec![]
+                targets: vec![],
+                label: Some("scan the repo".into()),
+                harness: Some("claude-code".into())
             })
         );
         assert_eq!(
             cmd("zeron chat spawn --prompt-file /tmp/brief.md --model opus --wait --timeout 20m"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Spawn,
-                targets: vec![]
+                targets: vec![],
+                label: None,
+                harness: None
             })
         );
         assert_eq!(
             cmd("$ZERON_CLI chat spawn --prompt hi --worktree --base main"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Spawn,
-                targets: vec![]
+                targets: vec![],
+                label: Some("hi".into()),
+                harness: None
             })
         );
         assert_eq!(
             cmd("\"$ZERON_CLI\" chat tell 3f6b2a18 \"done?\""),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Tell,
-                targets: vec!["3f6b2a18".into()]
+                targets: vec!["3f6b2a18".into()],
+                label: None,
+                harness: None
             })
         );
         assert_eq!(
             cmd("/home/u/.zeron/bin/zeron chat output --json 3f6b2a18"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Output,
-                targets: vec!["3f6b2a18".into()]
+                targets: vec!["3f6b2a18".into()],
+                label: None,
+                harness: None
             })
         );
     }
@@ -961,28 +999,36 @@ mod zeron_chat_command_tests {
             cmd("cd /repo && zeron chat tell main --message-file ./note.md"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Tell,
-                targets: vec!["main".into()]
+                targets: vec!["main".into()],
+                label: None,
+                harness: None
             })
         );
         assert_eq!(
             cmd("ZERON_CHAT_ID=abc zeron chat wait 3f6b2a18 --timeout 90s"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Wait,
-                targets: vec!["3f6b2a18".into()]
+                targets: vec!["3f6b2a18".into()],
+                label: None,
+                harness: None
             })
         );
         assert_eq!(
             cmd("env FOO=1 bash -lc 'zeron chat wait a b --any'"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Wait,
-                targets: vec!["a".into(), "b".into()]
+                targets: vec!["a".into(), "b".into()],
+                label: None,
+                harness: None
             })
         );
         assert_eq!(
             cmd("sh -c \"zeron chat output 'My title'\""),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Output,
-                targets: vec!["My title".into()]
+                targets: vec!["My title".into()],
+                label: None,
+                harness: None
             })
         );
         // A chained tail command does not become a target.
@@ -990,7 +1036,9 @@ mod zeron_chat_command_tests {
             cmd("zeron chat spawn --prompt go && echo done"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Spawn,
-                targets: vec![]
+                targets: vec![],
+                label: Some("go".into()),
+                harness: None
             })
         );
     }
@@ -1003,21 +1051,27 @@ mod zeron_chat_command_tests {
             cmd("zeron chat tell 3f6b2a18 --mode steer hello there"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Tell,
-                targets: vec!["3f6b2a18".into()]
+                targets: vec!["3f6b2a18".into()],
+                label: None,
+                harness: None
             })
         );
         assert_eq!(
             cmd("zeron chat wait --any a --timeout=5m b"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Wait,
-                targets: vec!["a".into(), "b".into()]
+                targets: vec!["a".into(), "b".into()],
+                label: None,
+                harness: None
             })
         );
         assert_eq!(
             cmd(&format!("zeron chat tell {CHILD} --wait --timeout 1h")),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Tell,
-                targets: vec![CHILD.into()]
+                targets: vec![CHILD.into()],
+                label: None,
+                harness: None
             })
         );
         // `self` is a real target.
@@ -1025,7 +1079,9 @@ mod zeron_chat_command_tests {
             cmd("zeron chat tell self hi"),
             Some(ZeronChatCommand {
                 verb: ZeronChatVerb::Tell,
-                targets: vec!["self".into()]
+                targets: vec!["self".into()],
+                label: None,
+                harness: None
             })
         );
     }
