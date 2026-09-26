@@ -21,6 +21,10 @@ zeron chat output <id1>
 Each child gets its own worktree by default, so parallel edits never collide.
 Stay under 8 running children; queue the rest behind `--wait` waves.
 
+Children report through the notification, not through `tell`: a child's
+final reply arrives as the completion notification, so a `tell` from a
+child is a blocker — it needs a decision before it can continue.
+
 ## Reviewer loop
 
 Spawn a fresh-eyes reviewer on your own diff, then act on its findings:

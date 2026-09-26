@@ -19,6 +19,13 @@ Several children settling close together arrive as one combined
 `Child chat updates:` message. If you are mid-turn, delivery waits until
 your turn ends — nothing interrupts your work.
 
+## How children report
+
+Children do not message you with results: their final reply arrives as the
+notification above, so a child that ends its turn cleanly needs no
+`zeron chat tell` from its side. Treat a `tell` from a child as a blocker —
+it needs a decision before it can continue.
+
 ## Acks
 
 Running `zeron chat wait` or `zeron chat output` on a child from inside your

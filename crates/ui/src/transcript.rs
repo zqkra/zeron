@@ -1187,6 +1187,20 @@ pub enum RowKind {
     ChildUpdates {
         items: Arc<Vec<ChildUpdateItem>>,
     },
+    /// An agent-to-agent message with a chat-attributed header (a child's
+    /// `zeron chat tell`). It renders as the same compact card a child update
+    /// wears instead of a user bubble: the child is reporting, not the user
+    /// speaking. Legacy headers without a chat id keep the bubble.
+    AgentMessage {
+        /// The sender's chat — resolved live for the card's title and opened
+        /// by its arrow.
+        sender_chat_id: SharedString,
+        /// The header's label, the title fallback while the sender is unknown.
+        sender_label: SharedString,
+        /// The message body, expanded behind the card's chevron and copied by
+        /// the entry's hover action.
+        body: SharedString,
+    },
 }
 
 /// One child-chat update inside a [`RowKind::ChildUpdates`] row.
@@ -1517,6 +1531,33 @@ pub fn rows_for_entry(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
+        // An attributed agent message is a child reporting, not the user
+        // speaking: it renders as a compact report card (the child-update
+        // card's path). A legacy header carries no chat id, and an ordinary
+        // prompt does not parse at all — both keep the bubble.
+        if let Some(sender) = zeron_proto::orchestration::parse_agent_message(&body)
+            && let Some(sender_chat_id) = sender.sender_chat_id
+        {
+            let body = sender.body.to_owned();
+            let mut stamp = Vec::with_capacity(sender_chat_id.len() + body.len() + 1);
+            stamp.extend_from_slice(sender_chat_id.as_bytes());
+            stamp.push(0);
+            stamp.extend_from_slice(body.as_bytes());
+            return vec![Row {
+                id: entry.id.clone().into(),
+                version: (fnv1a(&stamp) << 1) | pending as u64,
+                turn_start: true,
+                kind: RowKind::AgentMessage {
+                    sender_chat_id: sender_chat_id.to_owned().into(),
+                    sender_label: sender.sender_label.to_owned().into(),
+                    body: body.clone().into(),
+                },
+                entry_id,
+                timestamp: Some(entry.created_at),
+                copy_text: (!body.trim().is_empty()).then(|| SharedString::from(body)),
+                compact_fold: None,
+            }];
+        }
         let (body, sender) = agent_message_display(&body);
         let (text, mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
@@ -2163,12 +2204,18 @@ fn part_prefix(id: &str) -> &str {
 /// live→split handoff cannot shift a pixel. Tool groups get one larger global
 /// step on either boundary so their dense chip stack has room to breathe.
 pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
-    // Child-update rows are system notifications GLUED into the assistant's
-    // run — no turn gap across that seam in either direction (a following
-    // user row still starts a turn). The run keeps chip spacing throughout.
-    let child_update_seam = matches!(row.kind, RowKind::ChildUpdates { .. })
-        || (prev.is_some_and(|prev| matches!(prev.kind, RowKind::ChildUpdates { .. }))
-            && !matches!(row.kind, RowKind::User { .. }));
+    // Child-update and agent-message rows are reports GLUED into the
+    // assistant's run — no turn gap across that seam in either direction (a
+    // following user row still starts a turn). The run keeps chip spacing
+    // throughout.
+    let seam = |kind: &RowKind| {
+        matches!(
+            kind,
+            RowKind::ChildUpdates { .. } | RowKind::AgentMessage { .. }
+        )
+    };
+    let child_update_seam = seam(&row.kind)
+        || (prev.is_some_and(|prev| seam(&prev.kind)) && !matches!(row.kind, RowKind::User { .. }));
     if row.turn_start && !child_update_seam {
         return Theme::SPACE_LG;
     }
@@ -2180,11 +2227,11 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
         render::MD_BLOCK_GAP
     } else if matches!(
         row.kind,
-        RowKind::ToolGroup { .. } | RowKind::ChildUpdates { .. }
+        RowKind::ToolGroup { .. } | RowKind::ChildUpdates { .. } | RowKind::AgentMessage { .. }
     ) || prev.is_some_and(|row| {
         matches!(
             row.kind,
-            RowKind::ToolGroup { .. } | RowKind::ChildUpdates { .. }
+            RowKind::ToolGroup { .. } | RowKind::ChildUpdates { .. } | RowKind::AgentMessage { .. }
         )
     }) {
         Theme::SPACE_MD
@@ -5534,6 +5581,9 @@ impl Transcript {
                 RowKind::ChildUpdates { items } => {
                     refs.extend(items.iter().map(|item| item.child_chat_id.to_string()));
                 }
+                RowKind::AgentMessage { sender_chat_id, .. } => {
+                    refs.insert(sender_chat_id.to_string());
+                }
                 RowKind::User { chat_refs, .. } => {
                     refs.extend(chat_refs.iter().map(|r| r.chat_id.clone()));
                 }
@@ -7175,6 +7225,11 @@ impl Transcript {
             RowKind::ChildUpdates { items } => {
                 self.render_child_updates(&row.id, items, &theme, cx)
             }
+            RowKind::AgentMessage {
+                sender_chat_id,
+                sender_label,
+                body,
+            } => self.render_agent_message(&row.id, sender_chat_id, sender_label, body, &theme, cx),
         };
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -8501,10 +8556,10 @@ impl Transcript {
             .into_any_element()
     }
 
-    /// One child-update card: the same chip chrome every agent row wears —
-    /// a synthetic `Agent` call pins the BOT tile, the override carries the
-    /// outcome label and the child's live title. The whole card opens the
-    /// child chat; the excerpt expands behind a hover-revealed chevron.
+    /// One child-update card: a synthetic `Agent` call pins the BOT tile the
+    /// native spawn chip carries; the override carries the outcome label and
+    /// the child's live title. The whole card opens the child chat; the
+    /// excerpt expands behind a hover-revealed chevron.
     fn child_update_card(
         &mut self,
         row_id: &SharedString,
@@ -8530,66 +8585,107 @@ impl Transcript {
             ChildOutcome::Interrupted => ("Agent interrupted", false),
             ChildOutcome::NeedsInput => ("Agent needs input", false),
         };
-        // A synthetic "Agent" call pins the BOT tile the native spawn chip
-        // carries; the override supplies the label and live title.
-        let tool = ToolItem {
-            part_id: item.part_id.to_string(),
-            call: ToolCall::Unknown {
-                name: "Agent".into(),
-                input: None,
-            },
-            is_error: failed,
-            resolved: true,
-            detail: None,
-            invocation: None,
-            output_ref: None,
-            output_bytes: None,
-            diff_ref: None,
-            subagent_ref: None,
-            subagent_status: None,
-            subagent_tail: None,
-            kind: ToolItemKind::Call,
-            agent: None,
-        };
+        let tool = report_tool(item.part_id.clone(), failed);
         let content = ChipContent {
             label: label.into(),
             detail: title,
             trail_text: None,
             icon: Some(crate::icons::BOT),
         };
-        // The excerpt rides the ordinary output block behind a hover chevron.
-        let excerpt_detail = excerpt_detail(item);
-        let excerpt_h = excerpt_detail
+        self.report_card(
+            SharedString::from(format!("{row_id}#c{ix}")),
+            &tool,
+            &content,
+            excerpt_detail(item),
+            item.child_chat_id.clone(),
+            theme,
+            cx,
+        )
+    }
+
+    /// An agent message card: a child's attributed `zeron chat tell` wears
+    /// the same chrome as a child-update card — the chip names the sender and
+    /// the arrow opens it — with the message body behind the same hover
+    /// chevron, so a report reads like the settle notification instead of a
+    /// user bubble.
+    fn render_agent_message(
+        &mut self,
+        row_id: &SharedString,
+        sender_chat_id: &SharedString,
+        sender_label: &SharedString,
+        body: &SharedString,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat = {
+            let state = self.state.read(cx);
+            crate::chat_pill::ChatRef::resolve(state, sender_chat_id)
+        };
+        // The chip names the sender; the written label is only the fallback
+        // for a sender the registry cannot resolve yet.
+        let title = if chat.known {
+            chat.title.clone()
+        } else {
+            sender_label.clone()
+        };
+        let tool = report_tool(row_id.clone(), false);
+        let content = ChipContent {
+            label: "Agent message".into(),
+            detail: title,
+            trail_text: None,
+            icon: Some(crate::icons::BOT),
+        };
+        self.report_card(
+            SharedString::from(format!("{row_id}#m")),
+            &tool,
+            &content,
+            (!body.is_empty()).then(|| body_excerpt(body)),
+            sender_chat_id.clone(),
+            theme,
+            cx,
+        )
+    }
+
+    /// The compact report card shared by child-update and agent-message rows:
+    /// the whole card opens `target_chat_id`'s chat (the spawn chip's
+    /// contract) and an optional detail expands behind a hover-revealed
+    /// chevron, exactly like a rail chip's output block.
+    #[allow(clippy::too_many_arguments)] // render seam, not a public API
+    fn report_card(
+        &mut self,
+        fold_key: SharedString,
+        tool: &ToolItem,
+        content: &ChipContent,
+        detail: Option<ToolDetail>,
+        target_chat_id: SharedString,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let detail_h = detail
             .as_ref()
             .map(|detail| detail_height(detail) - DETAIL_SEPARATOR)
             .unwrap_or(0.0);
-        let fold_key = SharedString::from(format!("{row_id}#c{ix}"));
-        let excerpt_fold = self.folds.get(&fold_key).copied().unwrap_or_default();
-        let excerpt_open = excerpt_fold.open.unwrap_or(false);
+        let fold = self.folds.get(&fold_key).copied().unwrap_or_default();
+        let open = fold.open.unwrap_or(false);
         let now = Instant::now();
         let reduce_motion = cx.reduce_motion();
         let mut animating = false;
-        let excerpt_current = if let Some(at) = excerpt_fold.toggled_at.filter(|_| !reduce_motion) {
+        let current = if let Some(at) = fold.toggled_at.filter(|_| !reduce_motion) {
             let t = TOOL_FOLD.curve.eval(
                 now.saturating_duration_since(at).as_secs_f32() / TOOL_FOLD.total().as_secs_f32(),
             );
             if t < 1.0 {
                 animating = true;
             }
-            motion::lerp(
-                excerpt_fold.from,
-                if excerpt_open { excerpt_h } else { 0.0 },
-                t,
-            )
-        } else if excerpt_open {
-            excerpt_h
+            motion::lerp(fold.from, if open { detail_h } else { 0.0 }, t)
+        } else if open {
+            detail_h
         } else {
             0.0
         };
-        let chat_id = item.child_chat_id.to_string();
-        let excerpt_toggle = fold_key.clone();
-        // The whole card opens the child chat (the spawn chip's contract);
-        // the excerpt's chevron appears on hover, like a rail chip's.
+        let toggle = fold_key.clone();
+        // The whole card opens the target chat (the spawn chip's contract);
+        // the detail's chevron appears on hover, like a rail chip's.
         let header = div()
             .group("tool-header")
             .id(fold_key.clone())
@@ -8611,18 +8707,18 @@ impl Transcript {
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.stop_propagation();
                 cx.emit(TranscriptEvent::OpenChildChat {
-                    chat_id: chat_id.clone(),
+                    chat_id: target_chat_id.to_string(),
                 });
             }))
             .child(div().flex_1().min_w_0().child(chip_header_row(
-                &tool,
-                Some(&content),
+                tool,
+                Some(content),
                 None,
                 theme,
                 cx.entity_id(),
                 cx,
             )))
-            .when(excerpt_detail.is_some(), |row| {
+            .when(detail.is_some(), |row| {
                 row.child(
                     div()
                         .id(SharedString::from(format!("{fold_key}-tog")))
@@ -8636,9 +8732,9 @@ impl Transcript {
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            let entry = this.folds.entry(excerpt_toggle.clone()).or_default();
+                            let entry = this.folds.entry(toggle.clone()).or_default();
                             let was_open = entry.open.unwrap_or(false);
-                            entry.from = if was_open { excerpt_h } else { 0.0 };
+                            entry.from = if was_open { detail_h } else { 0.0 };
                             entry.open = Some(!was_open);
                             entry.epoch += 1;
                             entry.toggled_at = Some(Instant::now());
@@ -8646,7 +8742,7 @@ impl Transcript {
                             cx.notify();
                         }))
                         .child(
-                            crate::icons::icon(if excerpt_open {
+                            crate::icons::icon(if open {
                                 crate::icons::ALT_ARROW_DOWN
                             } else {
                                 crate::icons::ALT_ARROW_RIGHT
@@ -8672,8 +8768,8 @@ impl Transcript {
                     ),
             );
         let mut card = div().w_full().flex_none().flex().flex_col().child(header);
-        if excerpt_current > 0.0
-            && let Some(detail) = &excerpt_detail
+        if current > 0.0
+            && let Some(detail) = &detail
         {
             card = card.child(
                 div()
@@ -8681,7 +8777,7 @@ impl Transcript {
                     .min_w_0()
                     .flex_none()
                     .overflow_hidden()
-                    .h(px(excerpt_current))
+                    .h(px(current))
                     .child(detail_body(detail, None, theme)),
             );
         }
@@ -8702,26 +8798,58 @@ impl Transcript {
     }
 }
 
-/// The excerpt's expanded height: capped at 8 lines of the detail row pitch
-/// plus its vertical padding.
+/// The synthetic "Agent" call every report card pins the BOT tile with; the
+/// override supplies the label and live detail.
+fn report_tool(part_id: SharedString, failed: bool) -> ToolItem {
+    ToolItem {
+        part_id: part_id.to_string(),
+        call: ToolCall::Unknown {
+            name: "Agent".into(),
+            input: None,
+        },
+        is_error: failed,
+        resolved: true,
+        detail: None,
+        invocation: None,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        subagent_ref: None,
+        subagent_status: None,
+        subagent_tail: None,
+        kind: ToolItemKind::Call,
+        agent: None,
+    }
+}
+
+/// The excerpt's expanded height: capped at [`EXCERPT_MAX_LINES`] lines of
+/// the detail row pitch plus its vertical padding.
+const EXCERPT_MAX_LINES: usize = 8;
+
 /// The excerpt as a chip output block — the same lines cap and counted tail
 /// every expanded chip gets, so [`detail_height`] answers the card's open
 /// height exactly.
 fn excerpt_detail(item: &ChildUpdateItem) -> Option<ToolDetail> {
-    let excerpt = item.excerpt.as_ref()?;
-    Some(ToolDetail::Output {
-        truncated_by: excerpt.lines().skip(8).count(),
-        lines: excerpt
+    item.excerpt.as_ref().map(|excerpt| body_excerpt(excerpt))
+}
+
+/// A report body as a chip output block: the same line cap and counted tail
+/// the child-update excerpt uses.
+fn body_excerpt(body: &str) -> ToolDetail {
+    ToolDetail::Output {
+        truncated_by: body.lines().skip(EXCERPT_MAX_LINES).count(),
+        lines: body
             .lines()
-            .take(8)
+            .take(EXCERPT_MAX_LINES)
             .map(|line| SharedString::from(line.to_string()))
             .collect(),
-    })
+    }
 }
 
 fn excerpt_height(item: &ChildUpdateItem) -> f32 {
     excerpt_detail(item)
-        .map(|detail| detail_height(&detail) - DETAIL_SEPARATOR)
+        .as_ref()
+        .map(|detail| detail_height(detail) - DETAIL_SEPARATOR)
         .unwrap_or(0.0)
 }
 
@@ -12644,6 +12772,56 @@ mod tests {
         assert_eq!(top_gap_for(None, &rows[0]), Theme::SPACE_LG);
     }
 
+    /// A report row (a child's message rendered as a card) is glued into the
+    /// run: no turn gap before it or before the assistant reply it triggers;
+    /// a real user bubble after it still starts a turn.
+    #[test]
+    fn report_rows_keep_chip_spacing_across_their_seam() {
+        let id = "3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
+        let mut message = assistant("m3", MessageStatus::Complete, vec![]);
+        message.role = MessageRole::User;
+        message.status = None;
+        message.parts = vec![text_part(
+            "t0",
+            &zeron_proto::orchestration::agent_message(Some("Scout"), id, "body"),
+        )];
+        let report = rows_for_entry(&message, false, false, &mut parse);
+
+        let prev = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![text_part("t0", "thinking")],
+        );
+        let prev_rows = rows_for_entry(&prev, false, false, &mut parse);
+        assert_eq!(top_gap_for(prev_rows.last(), &report[0]), Theme::SPACE_MD);
+
+        // The reply that follows the report is chip-spaced too, even though
+        // its entry starts a turn.
+        let reply = assistant(
+            "a2",
+            MessageStatus::Complete,
+            vec![text_part("t0", "answer")],
+        );
+        let reply_rows = rows_for_entry(&reply, false, false, &mut parse);
+        assert!(reply_rows[0].turn_start);
+        assert_eq!(
+            top_gap_for(Some(&report[0]), &reply_rows[0]),
+            Theme::SPACE_MD
+        );
+
+        // A real user bubble after the report still opens a turn.
+        let mut user = assistant("u1", MessageStatus::Complete, vec![]);
+        user.role = MessageRole::User;
+        user.status = None;
+        user.parts = vec![text_part("t0", "ok thanks")];
+        let user_rows = rows_for_entry(&user, false, false, &mut parse);
+        assert!(user_rows[0].turn_start);
+        assert_eq!(
+            top_gap_for(Some(&report[0]), &user_rows[0]),
+            Theme::SPACE_LG
+        );
+    }
+
     #[test]
     fn consecutive_tools_fold_into_groups_between_text() {
         let entry = assistant(
@@ -14677,26 +14855,11 @@ mod tests {
         assert_eq!(&text[chat_refs[0].range.clone()], format!("@chat:{id}"));
         assert!(sender_label.is_none());
 
-        // A full agent header turns the sender name into a chat pill ref.
-        let wire = zeron_proto::orchestration::agent_message(Some("Scout"), id, "look here");
-        entry.parts = vec![text_part("t0", &wire)];
-        let rows = rows_for_entry(&entry, false, false, &mut parse);
-        let RowKind::User {
-            text,
-            chat_refs,
-            sender_label,
-            ..
-        } = &rows[0].kind
-        else {
-            panic!("expected a user row");
-        };
-        assert_eq!(text.as_ref(), "Message from Scout\n\nlook here");
-        assert_eq!(chat_refs.len(), 1);
-        assert_eq!(chat_refs[0].chat_id, id);
-        assert_eq!(&text[chat_refs[0].range.clone()], "Scout");
-        assert!(sender_label.is_none());
+        // A full agent header renders as the compact report row rather than
+        // the bubble — see `agent_messages_render_as_compact_reports`.
 
-        // The legacy header carries no chat id — the name stays a bold label.
+        // The legacy header carries no chat id — the name stays a bold label
+        // on the bubble.
         let legacy = "[Message from Zeron chat Main (3f6b2a18). Reply to it with the Zeron `send_message` tool, chat 3f6b2a18.]\n\nbody";
         entry.parts = vec![text_part("t0", legacy)];
         let rows = rows_for_entry(&entry, false, false, &mut parse);
@@ -14712,6 +14875,45 @@ mod tests {
         assert!(chat_refs.is_empty());
         let label = sender_label.clone().unwrap();
         assert_eq!(&text[label], "Main");
+
+        // An ordinary prompt keeps the bubble untouched.
+        entry.parts = vec![text_part("t0", "just talk to me")];
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        assert!(matches!(rows[0].kind, RowKind::User { .. }));
+    }
+
+    /// A child's attributed message (the header carries the sender's chat id)
+    /// renders as the compact report card: the row still opens the parent's
+    /// turn, but the body is what expands and copies, and the sender id is the
+    /// row's chat reference. The legacy header and ordinary prompts keep the
+    /// user bubble.
+    #[test]
+    fn agent_messages_render_as_compact_reports_not_bubbles() {
+        let id = "3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
+        let mut entry = assistant("u5", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.created_at = 1_700_000_000_000;
+        let wire = zeron_proto::orchestration::agent_message(Some("Scout"), id, "the report body");
+        entry.parts = vec![text_part("t0", &wire)];
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let [row] = &rows[..] else {
+            panic!("an agent message is one row, got {}", rows.len());
+        };
+        let RowKind::AgentMessage {
+            sender_chat_id,
+            sender_label,
+            body,
+        } = &row.kind
+        else {
+            panic!("expected the compact report row");
+        };
+        assert_eq!(sender_chat_id.as_ref(), id);
+        assert_eq!(sender_label.as_ref(), "Scout");
+        assert_eq!(body.as_ref(), "the report body");
+        assert_eq!(row.copy_text.as_deref(), Some("the report body"));
+        assert_eq!(row.timestamp, Some(1_700_000_000_000));
+        assert!(row.turn_start, "the report entry still starts a turn");
     }
 
     #[test]
@@ -15738,6 +15940,49 @@ mod tests {
                     "a late-arriving chat row must heal the pill"
                 );
                 assert_eq!(resolved.title.as_ref(), "gamma");
+            });
+        });
+    }
+
+    /// The report card references its sender so the card's live title follows
+    /// the sender's row, exactly like a child-update card's child.
+    #[gpui::test]
+    fn agent_message_rows_reference_their_sender(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+            let sender = "chat-sender";
+            state.update(cx, |state, _| {
+                state.apply_chats(vec![child_chat(sender, Some("Scout"), 10)]);
+            });
+            transcript.update(cx, |this, cx| {
+                this.rows = vec![Row {
+                    id: "m1".into(),
+                    version: 0,
+                    turn_start: true,
+                    kind: RowKind::AgentMessage {
+                        sender_chat_id: sender.into(),
+                        sender_label: "3f6b2a18".into(),
+                        body: "the report".into(),
+                    },
+                    entry_id: "m1".into(),
+                    timestamp: None,
+                    copy_text: None,
+                    compact_fold: None,
+                }];
+                this.refresh_chat_refs(cx);
+                assert!(
+                    this.chat_refs.contains(sender),
+                    "the sender joins the referenced-chat set"
+                );
+                let ui = this.chat_ui(cx);
+                let resolved = (ui.resolve)(sender);
+                assert!(resolved.known);
+                assert_eq!(resolved.title.as_ref(), "Scout");
             });
         });
     }

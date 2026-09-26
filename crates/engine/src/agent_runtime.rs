@@ -52,14 +52,25 @@ pub fn prepare(data_dir: &Path) -> AgentRuntime {
     }
 }
 
+/// The extra paragraph an agent-spawned child's instructions carry: its final
+/// reply IS the report (the settle notification delivers it to the parent),
+/// so `zeron chat tell` is reserved for blockers.
+fn child_report_instructions(parent_chat_id: &str) -> String {
+    format!(
+        "You are a child chat spawned by @chat:{parent_chat_id}. When your work is done, end your turn with your final report as your reply: Zeron delivers it to your parent automatically. Do not use `zeron chat tell` to report progress or results to your parent; use it only when you are blocked and need a decision from your parent before you can continue."
+    )
+}
+
 /// The `AgentContext` stamped on a chat run; `None` without a serving port —
 /// a context that points at nothing would send the agent's `zeron` calls
-/// into the void.
+/// into the void. `parent_chat_id` is set for agent-spawned children, whose
+/// instructions then name the parent and say the final reply is the report.
 pub fn context(
     runtime: &AgentRuntime,
     port: u16,
     device_id: &str,
     chat_id: &str,
+    parent_chat_id: Option<&str>,
 ) -> zeron_proto::AgentContext {
     let env = [
         ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
@@ -72,10 +83,20 @@ pub fn context(
     ]
     .into_iter()
     .collect();
+    // The child paragraph rides between the base instructions and the skills
+    // listing (appended later by `instructions_with_skills`).
+    let instructions = match parent_chat_id.filter(|parent| !parent.is_empty()) {
+        Some(parent) => format!(
+            "{}\n\n{}",
+            zeron_guide::instructions(),
+            child_report_instructions(parent)
+        ),
+        None => zeron_guide::instructions().to_owned(),
+    };
     zeron_proto::AgentContext {
         env,
         cli_dir: runtime.cli_dir.to_string_lossy().into_owned(),
-        instructions: zeron_guide::instructions().to_owned(),
+        instructions,
         skill_bundle: runtime
             .skill_bundle
             .as_ref()
@@ -254,7 +275,7 @@ mod tests {
     fn context_carries_the_chat_env_and_instructions() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = prepare(dir.path());
-        let ctx = context(&runtime, 27702, "dev-1", "chat-9");
+        let ctx = context(&runtime, 27702, "dev-1", "chat-9", None);
         assert_eq!(ctx.env["ZERON_CHAT_ID"], "chat-9");
         assert_eq!(ctx.env["ZERON_DEVICE_ID"], "dev-1");
         assert_eq!(ctx.env["ZERON_IPC_PORT"], "27702");
@@ -264,5 +285,40 @@ mod tests {
         );
         assert_eq!(ctx.instructions, zeron_guide::instructions());
         assert!(ctx.prompt_prefix().starts_with("<system_instructions>"));
+    }
+
+    #[test]
+    fn child_context_names_the_parent_between_the_base_and_skills_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = prepare(dir.path());
+        let parent = "3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
+        let ctx = context(&runtime, 27702, "dev-1", "chat-9", Some(parent));
+        assert!(
+            ctx.instructions.starts_with(zeron_guide::instructions()),
+            "the base instructions stay verbatim at the front"
+        );
+        assert!(
+            ctx.instructions
+                .contains(&format!("You are a child chat spawned by @chat:{parent}."))
+        );
+        assert!(
+            ctx.instructions.contains(
+                "Do not use `zeron chat tell` to report progress or results to your parent"
+            )
+        );
+        let with_skills = ctx.instructions_with_skills();
+        let child_at = with_skills.find("You are a child chat spawned by").unwrap();
+        let skills_at = with_skills.find("Skills available in this chat").unwrap();
+        assert!(child_at < skills_at, "the skills paragraph comes last");
+    }
+
+    #[test]
+    fn top_level_context_keeps_the_plain_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = prepare(dir.path());
+        for none in [None, Some("")] {
+            let ctx = context(&runtime, 27702, "dev-1", "chat-9", none);
+            assert_eq!(ctx.instructions, zeron_guide::instructions());
+        }
     }
 }
