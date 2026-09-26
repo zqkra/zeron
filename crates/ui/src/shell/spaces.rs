@@ -1894,6 +1894,111 @@ mod pinned_session_tests {
         }
     }
 
+    /// Redraw after a test mutated the shell's settings or tree state.
+    fn redraw(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+    }
+
+    /// Collapse the parent's subtree and redraw, so the corner count is
+    /// actually in play.
+    fn collapse_parent(shell: &gpui::Entity<super::Shell>, cx: &mut gpui::VisualTestContext) {
+        shell.update(cx, |shell, cx| {
+            shell.sidebar_collapsed_trees.insert("parent".into(), true);
+            cx.notify();
+        });
+        redraw(cx);
+    }
+
+    /// Hold Ctrl in the compact sidebar: every row's hint replaces the
+    /// trailing time column on one line — the fixed 30px column used to wrap
+    /// "Ctrl+2" over two lines on indented children — and a collapsed
+    /// parent's subagent count stands down while the hint is up.
+    #[gpui::test]
+    fn compact_jump_hints_never_wrap_or_share_the_corner(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, cx) = tree_sidebar(cx, dir.path(), true, true);
+        for (row_sel, hint_sel) in [
+            ("chat-parent", "chat-time-parent"),
+            ("chat-child-new", "chat-time-child-new"),
+            ("chat-child-old", "chat-time-child-old"),
+        ] {
+            let row = cx.debug_bounds(row_sel).unwrap();
+            let hint = cx
+                .debug_bounds(hint_sel)
+                .unwrap_or_else(|| panic!("missing hint on {row_sel}"));
+            assert!(
+                hint.size.height < px(20.0),
+                "hint wraps on {row_sel}: {hint:?}"
+            );
+            assert!(
+                hint.left() >= row.left() && hint.right() <= row.right(),
+                "hint leaves the row on {row_sel}: {hint:?} vs {row:?}"
+            );
+        }
+        // Collapsed, the count and the hint would both claim the corner —
+        // the hint wins for as long as Ctrl is down.
+        collapse_parent(&shell, cx);
+        assert!(
+            cx.debug_bounds("chat-time-parent").is_some(),
+            "the collapsed parent keeps its hint"
+        );
+        assert!(
+            cx.debug_bounds("chat-tree-count-parent").is_none(),
+            "the collapsed parent's count shares the corner with its hint"
+        );
+        // And with Ctrl released the count comes straight back.
+        shell.update(cx, |shell, cx| shell.set_jump_hints(false, cx));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("chat-tree-count-parent").is_some(),
+            "the collapsed parent lost its count without a hint"
+        );
+    }
+
+    /// Hold Ctrl in the regular sidebar: the corner chip replaces the
+    /// collapsed parent's subagent count instead of crowding it, and stays
+    /// inside its row at every depth.
+    #[gpui::test]
+    fn regular_jump_hints_replace_the_collapsed_parent_count(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, cx) = tree_sidebar(cx, dir.path(), false, true);
+        for (row_sel, chip_sel) in [
+            ("chat-parent", "chat-jump-parent"),
+            ("chat-child-new", "chat-jump-child-new"),
+            ("chat-child-old", "chat-jump-child-old"),
+        ] {
+            let row = cx.debug_bounds(row_sel).unwrap();
+            let chip = cx
+                .debug_bounds(chip_sel)
+                .unwrap_or_else(|| panic!("missing chip on {row_sel}"));
+            assert!(
+                chip.size.height <= px(16.0),
+                "chip grows on {row_sel}: {chip:?}"
+            );
+            assert!(
+                chip.left() >= row.left() && chip.right() <= row.right(),
+                "chip leaves the row on {row_sel}: {chip:?} vs {row:?}"
+            );
+        }
+        collapse_parent(&shell, cx);
+        assert!(
+            cx.debug_bounds("chat-jump-parent").is_some(),
+            "the collapsed parent keeps its chip"
+        );
+        assert!(
+            cx.debug_bounds("chat-tree-count-parent").is_none(),
+            "the collapsed parent's count shares the corner with its chip"
+        );
+        shell.update(cx, |shell, cx| shell.set_jump_hints(false, cx));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("chat-tree-count-parent").is_some(),
+            "the collapsed parent lost its count without a hint"
+        );
+    }
 }
 
 pub(super) fn pinned_drag_scroll_step(

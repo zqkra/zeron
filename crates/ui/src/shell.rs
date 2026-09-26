@@ -6836,7 +6836,13 @@ impl Shell {
             }
         });
         let compact_jump_label = compact.then(|| jump_label.clone()).flatten();
-        let jump_chip_shown = jump_label.is_some() && !compact;
+        // The hint owns its corner outright while it is up: the non-compact
+        // chip replaces the status/time (and a collapsed parent's subagent
+        // count), the compact hint replaces the trailing time column. A row
+        // wearing a shortcut advertises one thing; another control beside it
+        // is a misclick waiting to happen.
+        let jump_shown = jump_label.is_some();
+        let jump_chip_shown = jump_shown && !compact;
         let corner_body: AnyElement = if let Some(label) = jump_label.filter(|_| !compact) {
             // The jump hint replaces the status/time corner while the modifier
             // is held, cut to the sidebar PR badge's exact cloth
@@ -6847,6 +6853,10 @@ impl Shell {
             {
                 let tone = theme.text_muted;
                 div()
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("chat-jump-{id}")
+                    })
                     .h(px(16.0))
                     .flex_none()
                     .flex()
@@ -6859,6 +6869,7 @@ impl Shell {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(tone.opacity(0.85))
                     .font_family(theme.font_mono.clone())
+                    .whitespace_nowrap()
                     .child(label)
                     .into_any_element()
             }
@@ -7255,7 +7266,11 @@ impl Shell {
                     })
                     .when(
                         if compact {
-                            remote || row_hovered || tree_affordance
+                            // The compact hint lives in the trailing slot; the
+                            // corner stands down while it is up so the time,
+                            // remote badge, archive control and a collapsed
+                            // parent's subagent count never crowd it.
+                            !jump_shown && (remote || row_hovered || tree_affordance)
                         } else {
                             !show_label
                         },
@@ -7294,8 +7309,15 @@ impl Shell {
                                     let id = id.clone();
                                     move || format!("chat-time-{id}")
                                 })
-                                .w(px(30.0))
+                                // The 30px column fits a relative timestamp
+                                // but not a "Ctrl+1" combo. While a hint is up
+                                // the column takes its full intrinsic width and
+                                // the title (the row's only flexible slot)
+                                // truncates to make room — a shortcut must
+                                // never wrap or clip, however deep the indent.
+                                .when(compact_jump_label.is_none(), |el| el.w(px(30.0)))
                                 .flex_none()
+                                .whitespace_nowrap()
                                 .text_right()
                                 .text_size(crate::typography::ui_rems(11.0))
                                 .text_color(subline)
