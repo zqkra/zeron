@@ -1814,6 +1814,104 @@ struct ActiveChatRow {
     group: Option<(String, String)>,
 }
 
+/// One level of the sidebar's agent-spawned chat tree: a `spawned_by_agent`
+/// chat plus its own subtree. Nesting is capped and side chats/forks never
+/// appear — they stay reachable through the composer activity menu.
+pub(super) struct AgentSubtree {
+    pub chat: zeron_proto::Chat,
+    /// Working descendants, depth-bounded — the collapsed row's count and
+    /// the default-open signal.
+    pub running: usize,
+    /// Open unless the user collapsed this parent; defaults to open while a
+    /// descendant is running.
+    pub open: bool,
+    pub children: Vec<AgentSubtree>,
+}
+
+/// Deepest nesting the sidebar draws (deeper descendants flatten to nothing —
+/// the chat itself stays reachable by id/palette).
+pub(super) const SIDEBAR_TREE_DEPTH: usize = 4;
+
+/// `spawned_by_agent` children of `parent`, non-archived, newest first.
+fn agent_children<'a>(state: &'a AppState, parent_id: &str) -> Vec<&'a zeron_proto::Chat> {
+    let mut children: Vec<_> = state
+        .chats
+        .iter()
+        .filter(|chat| {
+            chat.spawned_by_agent
+                && !chat.archived
+                && chat.parent_chat_id.as_deref() == Some(parent_id)
+        })
+        .collect();
+    children.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    children
+}
+
+fn agent_subtree(
+    state: &AppState,
+    chat: &zeron_proto::Chat,
+    collapsed: &std::collections::HashMap<String, bool>,
+    depth: usize,
+    now: chrono::DateTime<Utc>,
+) -> AgentSubtree {
+    let children: Vec<AgentSubtree> = if depth < SIDEBAR_TREE_DEPTH {
+        agent_children(state, &chat.id)
+            .into_iter()
+            .map(|child| agent_subtree(state, child, collapsed, depth + 1, now))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // `running` counts this node plus every Working descendant — a parent's
+    // corner number is just the sum of its children's `running`.
+    let running =
+        usize::from(state.display_status_for(chat, now) == zeron_proto::ChatIndicator::Working)
+            + children.iter().map(|child| child.running).sum::<usize>();
+    let open = collapsed
+        .get(&chat.id)
+        .map(|collapsed| !collapsed)
+        .unwrap_or(running > 0);
+    AgentSubtree {
+        chat: chat.clone(),
+        running,
+        open,
+        children,
+    }
+}
+
+/// The chat-row corner affordance a parent carries: the disclosure
+/// chevron over its subtree plus the running count while collapsed.
+pub(super) struct SidebarTreeRow {
+    pub children: Option<SidebarTreeChildren>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SidebarTreeChildren {
+    pub open: bool,
+    pub running: usize,
+    /// The expanded block's full height — the disclosure tween's endpoint.
+    pub body_height: f32,
+}
+
+/// Height the children block occupies THIS frame: the disclosure tween's
+/// current value while animating, else its resting target.
+fn sidebar_tree_body_height(
+    motion: &std::collections::HashMap<String, SidebarDisclosureMotion>,
+    key: &str,
+    open: bool,
+    full: f32,
+) -> f32 {
+    motion
+        .get(key)
+        .filter(|motion| motion.animating())
+        .map(|motion| motion.current())
+        .unwrap_or(if open { full } else { 0.0 })
+}
+
 pub(super) fn compare_sidebar_chats(
     sort: SidebarSort,
     left: &zeron_proto::Chat,
@@ -4151,7 +4249,58 @@ impl Shell {
             let pins: HashSet<&str> = pinned_order.iter().map(String::as_str).collect();
             visible.retain(|id| !pins.contains(id.as_str()));
         }
-        visible
+        // Expanded agent children sit directly under their parent so
+        // jump slots and session cycling visit the drawn tree order.
+        let mut with_children = Vec::with_capacity(visible.len());
+        for id in visible {
+            self.push_sidebar_child_ids(&id, 0, &mut with_children, cx);
+        }
+        with_children
+    }
+
+    /// `id` first, then its expanded `spawned_by_agent` subtree in drawn
+    /// (newest-first) order. Collapsed subtrees contribute nothing — the
+    /// order is exactly what's on screen.
+    fn push_sidebar_child_ids(
+        &self,
+        id: &str,
+        depth: usize,
+        out: &mut Vec<String>,
+        cx: &Context<Self>,
+    ) {
+        out.push(id.to_owned());
+        if depth >= SIDEBAR_TREE_DEPTH {
+            return;
+        }
+        let state = self.state.read(cx);
+        let children = agent_children(state, id);
+        if children.is_empty() {
+            return;
+        }
+        let running = children
+            .iter()
+            .map(|child| {
+                agent_subtree(
+                    state,
+                    child,
+                    &self.sidebar_collapsed_trees,
+                    depth + 1,
+                    Utc::now(),
+                )
+                .running
+            })
+            .sum::<usize>();
+        let open = self
+            .sidebar_collapsed_trees
+            .get(id)
+            .map(|collapsed| !collapsed)
+            .unwrap_or(running > 0);
+        if !open {
+            return;
+        }
+        for child in children {
+            self.push_sidebar_child_ids(&child.id, depth + 1, out, cx);
+        }
     }
 
     /// Shared metadata and visibility settings for active and archived sessions.
@@ -4207,6 +4356,189 @@ impl Shell {
             change_request,
             group,
         }
+    }
+
+    /// One child row, plus the disclosure tween endpoint for its nested
+    /// block (the children's full height — the chevron's `to`).
+    #[allow(clippy::too_many_arguments)]
+    fn render_agent_child(
+        &self,
+        node: &AgentSubtree,
+        parent_branch: Option<&str>,
+        nested_body_height: f32,
+        selected: Option<&str>,
+        visible_slots: &std::collections::HashMap<String, usize>,
+        jump_hints: bool,
+        keymap: &KeymapConfig,
+        now: chrono::DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> (f32, AnyElement) {
+        let state = self.state.read(cx);
+        let status = state.display_status_for(&node.chat, now);
+        let row = self.sidebar_chat_data(status, node.chat.clone(), state);
+        // The branch line names the child's OWN worktree — drop it when it
+        // just repeats the parent's checkout.
+        let branch = row
+            .branch
+            .filter(|branch| Some(branch.as_str()) != parent_branch);
+        let height = sidebar_row_height(
+            self.settings.sidebar_compact,
+            self.settings.sidebar_show_project_label,
+            branch.is_some(),
+            row.change_request.is_some(),
+        );
+        let jump_label: Option<SharedString> =
+            if jump_hints && let Some(slot) = visible_slots.get(&node.chat.id).copied() {
+                let combo = keymap.get(ShortcutId::JumpSession(slot));
+                (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
+            } else {
+                None
+            };
+        let tree = (!node.children.is_empty()).then(|| SidebarTreeRow {
+            children: Some(SidebarTreeChildren {
+                open: node.open,
+                // The corner counts running DESCENDANTS, not this row.
+                running: node.running - usize::from(status == ChatIndicator::Working),
+                body_height: nested_body_height,
+            }),
+        });
+        let element = self.render_chat_row(
+            node.chat.id.clone(),
+            transcript::single_line(
+                &node
+                    .chat
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "New session".into()),
+            )
+            .into(),
+            format_time_ago(
+                node.chat.last_message_at.unwrap_or(node.chat.created_at),
+                now,
+            )
+            .into(),
+            row.folder.into(),
+            branch.map(SharedString::from),
+            row.change_request,
+            self.settings
+                .sidebar_show_harness
+                .then(|| node.chat.config.as_ref().map(|c| c.harness))
+                .flatten(),
+            row.status,
+            selected == Some(node.chat.id.as_str()),
+            false,
+            false,
+            None,
+            jump_label,
+            tree,
+            None,
+            theme,
+            cx,
+        );
+        (height, element)
+    }
+
+    /// A node's nested children block: the guide gutter (the transcript
+    /// rail's 12px step + 1px `ink(0.08)` recipe) then the child rows, each
+    /// with its own collapsible subtree. The returned height is the block's
+    /// FULL (expanded) height — the disclosure body animates the reveal.
+    #[allow(clippy::too_many_arguments)]
+    fn render_agent_children(
+        &self,
+        nodes: &[AgentSubtree],
+        parent_branch: Option<&str>,
+        selected: Option<&str>,
+        visible_slots: &std::collections::HashMap<String, usize>,
+        jump_hints: bool,
+        keymap: &KeymapConfig,
+        now: chrono::DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> (f32, AnyElement) {
+        let mut height = SIDEBAR_DISCLOSURE_BODY_INSET;
+        let mut column = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+            .gap(px(SIDEBAR_LIST_GAP));
+        for node in nodes {
+            // A nested block's "differs from parent" compares against the
+            // child's own checkout, not the top-level row's.
+            let child_branch = {
+                let state = self.state.read(cx);
+                crate::change_requests::conversation_branch(&node.chat, &state.spaces)
+                    .map(str::trim)
+                    .filter(|branch| !branch.is_empty())
+                    .map(str::to_string)
+            };
+            let (nested_full, nested) = if node.children.is_empty() {
+                (0.0, None)
+            } else {
+                let (full, block) = self.render_agent_children(
+                    &node.children,
+                    child_branch.as_deref(),
+                    selected,
+                    visible_slots,
+                    jump_hints,
+                    keymap,
+                    now,
+                    theme,
+                    cx,
+                );
+                (full, Some(block))
+            };
+            let (row_height, row) = self.render_agent_child(
+                node,
+                parent_branch,
+                nested_full,
+                selected,
+                visible_slots,
+                jump_hints,
+                keymap,
+                now,
+                theme,
+                cx,
+            );
+            let mut slot = div().w_full().flex_col().child(row);
+            let mut slot_height = row_height;
+            if let Some(block) = nested {
+                let key = format!("chat-tree:{}", node.chat.id);
+                slot_height += SIDEBAR_LIST_GAP
+                    + sidebar_tree_body_height(
+                        &self.sidebar_disclosure_motion,
+                        &key,
+                        node.open,
+                        nested_full,
+                    );
+                slot = slot.child(self.render_sidebar_disclosure_body(
+                    &key,
+                    node.open,
+                    nested_full,
+                    block,
+                ));
+            }
+            height += slot_height;
+            column = column.child(slot);
+        }
+        let block = div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .child(
+                div()
+                    .w(px(12.0))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(div().w(px(1.0)).h_full().bg(crate::theme::ink(0.08))),
+            )
+            .child(div().flex_1().min_w_0().child(column))
+            .into_any_element();
+        (height, block)
     }
 
     pub(super) fn render_active_rows(
@@ -4511,6 +4843,40 @@ impl Shell {
                     .filter(|drag| drag.payload.chat_id == chat.id)
                     .map_or(0.0, |drag| drag.collapsed_height);
                 let slot_height = height - removed;
+                // Agent-spawned tree: `spawned_by_agent` children nest under
+                // their parent (side chats/forks never do). The chevron lives
+                // in the row's corner; the subtree block rides below the slot.
+                let subtree: Vec<AgentSubtree> = {
+                    let state = self.state.read(cx);
+                    agent_children(state, &chat.id)
+                        .into_iter()
+                        .map(|child| {
+                            agent_subtree(state, child, &self.sidebar_collapsed_trees, 1, now)
+                        })
+                        .collect()
+                };
+                let running = subtree.iter().map(|node| node.running).sum::<usize>();
+                let tree_open = self
+                    .sidebar_collapsed_trees
+                    .get(&chat.id)
+                    .map(|collapsed| !collapsed)
+                    .unwrap_or(running > 0);
+                let (tree_full, children_block) = if subtree.is_empty() {
+                    (0.0, None)
+                } else {
+                    let (full, block) = self.render_agent_children(
+                        &subtree,
+                        branch.as_deref(),
+                        selected.as_deref(),
+                        &visible_slots,
+                        jump_hints,
+                        &keymap,
+                        now,
+                        theme,
+                        cx,
+                    );
+                    (full, Some(block))
+                };
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
@@ -4528,6 +4894,13 @@ impl Shell {
                     is_moving,
                     if is_moving { None } else { drag },
                     jump_label,
+                    children_block.is_some().then(|| SidebarTreeRow {
+                        children: Some(SidebarTreeChildren {
+                            open: tree_open,
+                            running,
+                            body_height: tree_full,
+                        }),
+                    }),
                     None,
                     theme,
                     cx,
@@ -4594,6 +4967,32 @@ impl Shell {
                         },
                     ))
                     .into_any_element();
+                // The subtree block sits INSIDE the row's entry so it never
+                // disturbs the slot ordering/drag math above; its animated
+                // height still counts toward the group body.
+                let (element, slot_height) = match children_block {
+                    Some(block) => {
+                        let key = format!("chat-tree:{}", chat.id);
+                        let body_height = sidebar_tree_body_height(
+                            &self.sidebar_disclosure_motion,
+                            &key,
+                            tree_open,
+                            tree_full,
+                        );
+                        (
+                            div()
+                                .w_full()
+                                .flex_col()
+                                .child(element)
+                                .child(self.render_sidebar_disclosure_body(
+                                    &key, tree_open, tree_full, block,
+                                ))
+                                .into_any_element(),
+                            slot_height + body_height,
+                        )
+                    }
+                    None => (element, slot_height),
+                };
                 rendered_rows.push((format!("c:{}", chat.id), slot_height, element));
             }
 
@@ -4988,6 +5387,7 @@ impl Shell {
                         is_selected,
                         true,
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -6513,10 +6913,14 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone as _, Utc};
+    use chrono::{TimeDelta, TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use super::{
+        agent_children, agent_subtree, compare_sidebar_chats, promote_local_device_group,
+        sidebar_tree_body_height,
+    };
     use crate::settings::SidebarSort;
+    use crate::state::AppState;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
@@ -6544,6 +6948,130 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
         }
+    }
+
+    fn agent_chat(id: &str, parent: &str, created_s: i64) -> zeron_proto::Chat {
+        let mut chat = chat(id);
+        chat.parent_chat_id = Some(parent.into());
+        chat.spawned_by_agent = true;
+        chat.created_at = Utc.timestamp_opt(5, 0).unwrap() + TimeDelta::seconds(created_s);
+        chat
+    }
+
+    fn working_session(id: &str) -> zeron_proto::Session {
+        zeron_proto::Session {
+            last_completed_turn: None,
+            chat_id: id.into(),
+            device_id: "device".into(),
+            status: zeron_proto::SessionStatus::Working,
+            started_at: Some(Utc::now()),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn agent_children_only_include_live_spawned_kids_newest_first() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        let mut side = chat("side");
+        side.parent_chat_id = Some("p".into());
+        let mut retired = agent_chat("retired", "p", 30);
+        retired.archived = true;
+        state.apply_chats(vec![
+            agent_chat("older", "p", 10),
+            agent_chat("newer", "p", 20),
+            side,
+            retired,
+            agent_chat("orphan", "other", 40),
+        ]);
+        let _ = now;
+
+        let ids: Vec<&str> = agent_children(&state, "p")
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["newer", "older"]);
+    }
+
+    #[test]
+    fn agent_subtree_nests_recursively_and_counts_running_descendants() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.apply_chats(vec![
+            agent_chat("child", "p", 10),
+            agent_chat("grand", "child", 20),
+        ]);
+        state.sessions = vec![working_session("grand")];
+        let collapsed = std::collections::HashMap::new();
+        let child = state
+            .chats
+            .iter()
+            .find(|c| c.id == "child")
+            .unwrap()
+            .clone();
+        let node = agent_subtree(&state, &child, &collapsed, 1, now);
+        // The idle child stays open because a descendant is running.
+        assert!(node.open);
+        assert_eq!(node.running, 1);
+        assert_eq!(node.children.len(), 1);
+        assert_eq!(node.children[0].chat.id, "grand");
+    }
+
+    #[test]
+    fn agent_subtree_defaults_closed_when_idle_and_honors_override() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.apply_chats(vec![agent_chat("idle", "p", 10)]);
+        let collapsed = std::collections::HashMap::new();
+        let chat = state.chats.iter().find(|c| c.id == "idle").unwrap().clone();
+        let node = agent_subtree(&state, &chat, &collapsed, 1, now);
+        assert!(!node.open);
+
+        // A running child defaults open; explicit collapse wins either way.
+        state.sessions = vec![working_session("idle")];
+        let node = agent_subtree(&state, &chat, &collapsed, 1, now);
+        assert!(node.open);
+        let collapsed = std::collections::HashMap::from([("idle".to_string(), true)]);
+        let node = agent_subtree(&state, &chat, &collapsed, 1, now);
+        assert!(!node.open);
+        let collapsed = std::collections::HashMap::from([("idle".to_string(), false)]);
+        state.sessions.clear();
+        let node = agent_subtree(&state, &chat, &collapsed, 1, now);
+        assert!(node.open);
+    }
+
+    #[test]
+    fn agent_subtree_stops_below_depth_four() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.apply_chats(vec![
+            agent_chat("d1", "p", 10),
+            agent_chat("d2", "d1", 20),
+            agent_chat("d3", "d2", 30),
+            agent_chat("d4", "d3", 40),
+            agent_chat("d5", "d4", 50),
+        ]);
+        let collapsed = std::collections::HashMap::from([
+            ("d1".to_string(), false),
+            ("d2".to_string(), false),
+            ("d3".to_string(), false),
+            ("d4".to_string(), false),
+        ]);
+        let chat = state.chats.iter().find(|c| c.id == "d1").unwrap().clone();
+        let mut node = agent_subtree(&state, &chat, &collapsed, 1, now);
+        for (depth, expected) in [(2, "d2"), (3, "d3"), (4, "d4")] {
+            assert_eq!(node.children.len(), 1, "depth {depth}");
+            node = node.children.pop().unwrap();
+            assert_eq!(node.chat.id, expected);
+        }
+        assert!(node.children.is_empty(), "d5 must not render below depth 4");
+    }
+
+    #[test]
+    fn sidebar_tree_body_height_rests_without_motion() {
+        let motion = std::collections::HashMap::new();
+        assert_eq!(sidebar_tree_body_height(&motion, "k", true, 64.0), 64.0);
+        assert_eq!(sidebar_tree_body_height(&motion, "k", false, 64.0), 0.0);
     }
 
     #[test]

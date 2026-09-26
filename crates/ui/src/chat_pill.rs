@@ -17,7 +17,7 @@ use crate::theme::Theme;
 /// A chat resolved for display. `known == false` means the id has no registry
 /// row — the chip renders the placeholder rather than guessing.
 #[derive(Debug, Clone)]
-pub(crate) struct ChatRef {
+pub struct ChatRef {
     pub chat_id: String,
     pub title: SharedString,
     pub harness: Option<HarnessId>,
@@ -43,14 +43,21 @@ impl ChatRef {
                 indicator: state.display_status_for(chat, Utc::now()),
                 known: true,
             },
-            None => ChatRef {
-                chat_id: chat_id.to_owned(),
-                title: "Unavailable chat".into(),
-                harness: None,
-                model: None,
-                indicator: ChatIndicator::Idle,
-                known: false,
-            },
+            None => Self::unavailable(chat_id),
+        }
+    }
+
+    /// The unknown-chat chip: muted "Unavailable chat", never opens anything.
+    /// Split from [`Self::resolve`] so snapshot resolvers can degrade ids that
+    /// were never fingerprinted (e.g. a pill id absent from `chat_refs`).
+    pub(crate) fn unavailable(chat_id: &str) -> ChatRef {
+        ChatRef {
+            chat_id: chat_id.to_owned(),
+            title: "Unavailable chat".into(),
+            harness: None,
+            model: None,
+            indicator: ChatIndicator::Idle,
+            known: false,
         }
     }
 
