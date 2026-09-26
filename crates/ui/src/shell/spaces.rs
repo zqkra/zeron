@@ -1820,11 +1820,10 @@ struct ActiveChatRow {
 /// appear — they stay reachable through the composer activity menu.
 pub(super) struct AgentSubtree {
     pub chat: zeron_proto::Chat,
-    /// Working descendants, depth-bounded — the collapsed row's count and
-    /// the default-open signal.
+    /// Working descendants, depth-bounded — the collapsed row's count.
     pub running: usize,
-    /// Open unless the user collapsed this parent; defaults to open while a
-    /// descendant is running.
+    /// Open unless the user collapsed this parent: a tree with children
+    /// stays expanded when idle — settled children must not vanish.
     pub open: bool,
     pub children: Vec<AgentSubtree>,
 }
@@ -1872,7 +1871,7 @@ fn agent_subtree(
     let open = collapsed
         .get(&chat.id)
         .map(|collapsed| !collapsed)
-        .unwrap_or(running > 0);
+        .unwrap_or(!children.is_empty());
     AgentSubtree {
         chat: chat.clone(),
         running,
@@ -4275,24 +4274,13 @@ impl Shell {
         if children.is_empty() {
             return;
         }
-        let running = children
-            .iter()
-            .map(|child| {
-                agent_subtree(
-                    state,
-                    child,
-                    &self.sidebar_collapsed_trees,
-                    depth + 1,
-                    Utc::now(),
-                )
-                .running
-            })
-            .sum::<usize>();
+        // Parents default open — settled children stay reachable; only an
+        // explicit user collapse closes a tree.
         let open = self
             .sidebar_collapsed_trees
             .get(id)
             .map(|collapsed| !collapsed)
-            .unwrap_or(running > 0);
+            .unwrap_or(true);
         if !open {
             return;
         }
@@ -4858,7 +4846,7 @@ impl Shell {
                     .sidebar_collapsed_trees
                     .get(&chat.id)
                     .map(|collapsed| !collapsed)
-                    .unwrap_or(running > 0);
+                    .unwrap_or(!subtree.is_empty());
                 let (tree_full, children_block) = if subtree.is_empty() {
                     (0.0, None)
                 } else {
@@ -7048,9 +7036,7 @@ mod tests {
             state.prepare_runtime_replacement(cx);
             assert!(state.chats.is_empty());
             assert!(agent_children(state, "p").is_empty());
-            assert!(
-                crate::chat_activity::child_chat_rows(state, "p", true, Utc::now()).is_empty()
-            );
+            assert!(crate::chat_activity::child_chat_rows(state, "p", true, Utc::now()).is_empty());
         });
     }
 
@@ -7079,23 +7065,32 @@ mod tests {
     }
 
     #[test]
-    fn agent_subtree_defaults_closed_when_idle_and_honors_override() {
+    fn agent_subtree_defaults_open_with_children_and_honors_override() {
         let now = Utc::now();
         let mut state = AppState::new();
-        state.apply_chats(vec![agent_chat("idle", "p", 10)]);
+        state.apply_chats(vec![
+            agent_chat("parent", "p", 10),
+            agent_chat("child", "parent", 20),
+        ]);
         let collapsed = std::collections::HashMap::new();
-        let chat = state.chats.iter().find(|c| c.id == "idle").unwrap().clone();
-        let node = agent_subtree(&state, &chat, &collapsed, 1, now);
-        assert!(!node.open);
-
-        // A running child defaults open; explicit collapse wins either way.
-        state.sessions = vec![working_session("idle")];
+        let chat = state
+            .chats
+            .iter()
+            .find(|c| c.id == "parent")
+            .unwrap()
+            .clone();
+        // Settled children keep their parent expanded — the tree must not
+        // close once its last child finishes.
         let node = agent_subtree(&state, &chat, &collapsed, 1, now);
         assert!(node.open);
-        let collapsed = std::collections::HashMap::from([("idle".to_string(), true)]);
+
+        // Explicit collapse still hides them, even while one runs; an
+        // explicit expand re-shows them once settled.
+        state.sessions = vec![working_session("child")];
+        let collapsed = std::collections::HashMap::from([("parent".to_string(), true)]);
         let node = agent_subtree(&state, &chat, &collapsed, 1, now);
         assert!(!node.open);
-        let collapsed = std::collections::HashMap::from([("idle".to_string(), false)]);
+        let collapsed = std::collections::HashMap::from([("parent".to_string(), false)]);
         state.sessions.clear();
         let node = agent_subtree(&state, &chat, &collapsed, 1, now);
         assert!(node.open);

@@ -541,6 +541,10 @@ pub struct ZeronChatCommand {
     /// Display label the caller asked for: `--title`, else the inline
     /// `--prompt` text (`--prompt-file` paths are NOT titles — skipped).
     pub label: Option<String>,
+    /// The `--title` value alone — the spawned chat carries it verbatim, so
+    /// a spawn chip whose output never persisted can still find its child by
+    /// name (`label` may hold prompt text instead, which never matches).
+    pub title: Option<String>,
     /// The `--harness` value, when given — the spawn chip shows its brand
     /// mark even before the child chat resolves.
     pub harness: Option<String>,
@@ -723,11 +727,13 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
         Some("spawn") => ZeronChatVerb::Spawn,
         Some("tell") => ZeronChatVerb::Tell,
         Some("wait") => ZeronChatVerb::Wait,
-        Some("output") => ZeronChatVerb::Output,
+        // `read` is the CLI's documented alias of `output` — same chip.
+        Some("output") | Some("read") => ZeronChatVerb::Output,
         _ => return None,
     };
     let mut targets = Vec::new();
     let mut label = None;
+    let mut title = None;
     let mut harness = None;
     let mut model = None;
     let mut ix = at + 3;
@@ -749,7 +755,15 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
                         .inspect(|_| ix += 1)
                 });
                 match flag {
-                    "--title" | "--prompt" => {
+                    "--title" => {
+                        if title.is_none() {
+                            title = value.clone();
+                        }
+                        if label.is_none() {
+                            label = value;
+                        }
+                    }
+                    "--prompt" => {
                         if label.is_none() {
                             label = value;
                         }
@@ -778,6 +792,7 @@ fn zeron_chat_command_words(words: &[String]) -> Option<ZeronChatCommand> {
         verb,
         targets,
         label,
+        title,
         harness,
         model,
     })
@@ -960,6 +975,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: Some("scan the repo".into()),
+                title: None,
                 harness: Some("claude-code".into()),
                 model: None
             })
@@ -970,6 +986,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: None,
+                title: None,
                 harness: None,
                 model: Some("opus".into())
             })
@@ -980,6 +997,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: Some("hi".into()),
+                title: None,
                 harness: None,
                 model: None
             })
@@ -990,6 +1008,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1000,6 +1019,40 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Output,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
+                title: None,
+                harness: None,
+                model: None
+            })
+        );
+        // `read` is `output`'s alias — the same chip; `log`/`transcript`/
+        // `history`/`show`/`list` stay ordinary commands.
+        assert_eq!(
+            cmd("zeron chat read 3f6b2a18"),
+            Some(ZeronChatCommand {
+                verb: ZeronChatVerb::Output,
+                targets: vec!["3f6b2a18".into()],
+                label: None,
+                title: None,
+                harness: None,
+                model: None
+            })
+        );
+        for alias in ["log", "transcript", "history", "show", "list"] {
+            assert_eq!(
+                cmd(&format!("zeron chat {alias} 3f6b2a18")),
+                None,
+                "{alias}"
+            );
+        }
+        // `--title` is remembered apart from the label fallback so a spawn
+        // chip can find its child chat by name later.
+        assert_eq!(
+            cmd("zeron chat spawn --title \"Audit the parser\" --prompt go"),
+            Some(ZeronChatCommand {
+                verb: ZeronChatVerb::Spawn,
+                targets: vec![],
+                label: Some("Audit the parser".into()),
+                title: Some("Audit the parser".into()),
                 harness: None,
                 model: None
             })
@@ -1014,6 +1067,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["main".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1024,6 +1078,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Wait,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1034,6 +1089,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Wait,
                 targets: vec!["a".into(), "b".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1044,6 +1100,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Output,
                 targets: vec!["My title".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1055,6 +1112,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Spawn,
                 targets: vec![],
                 label: Some("go".into()),
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1071,6 +1129,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["3f6b2a18".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1081,6 +1140,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Wait,
                 targets: vec!["a".into(), "b".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1091,6 +1151,7 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec![CHILD.into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
@@ -1102,10 +1163,47 @@ mod zeron_chat_command_tests {
                 verb: ZeronChatVerb::Tell,
                 targets: vec!["self".into()],
                 label: None,
+                title: None,
                 harness: None,
                 model: None
             })
         );
+    }
+
+    #[test]
+    fn read_aliases_to_output() {
+        // The CLI's `read` is the same verb as `output`: the transcript must
+        // render it as the Read chip, not a generic exec row.
+        assert_eq!(
+            cmd(&format!("zeron chat read {CHILD}")),
+            Some(ZeronChatCommand {
+                verb: ZeronChatVerb::Output,
+                targets: vec![CHILD.into()],
+                label: None,
+                title: None,
+                harness: None,
+                model: None
+            })
+        );
+        assert_eq!(
+            cmd("zeron chat read 'My title' --tail 20"),
+            Some(ZeronChatCommand {
+                verb: ZeronChatVerb::Output,
+                targets: vec!["My title".into()],
+                label: None,
+                title: None,
+                harness: None,
+                model: None
+            })
+        );
+        // The near-miss verbs stay ordinary commands.
+        for verb in ["log", "transcript", "history", "show", "list"] {
+            assert_eq!(
+                cmd(&format!("zeron chat {verb} {CHILD}")),
+                None,
+                "verb {verb} must not classify"
+            );
+        }
     }
 
     #[test]
