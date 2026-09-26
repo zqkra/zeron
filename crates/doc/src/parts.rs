@@ -292,11 +292,7 @@ impl MessagePart {
                 child_title,
                 excerpt,
                 ..
-            } => {
-                child_chat_id.len()
-                    + child_title.len()
-                    + excerpt.as_ref().map_or(0, String::len)
-            }
+            } => child_chat_id.len() + child_title.len() + excerpt.as_ref().map_or(0, String::len),
         }
     }
 }
