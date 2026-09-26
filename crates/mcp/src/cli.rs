@@ -205,6 +205,33 @@ async fn resolve(tools: &Tools, key: &str) -> CliResult<Chat> {
         .map_err(|e| Failure::error(e.to_string()))
 }
 
+/// `zeron chat <something-else>`: the catch-all lands here with the
+/// subcommand name in `args[0]`. Replay it against a bare table of the real
+/// subcommands (names and aliases) so the printed error — including the
+/// "a similar subcommand exists" tip — is clap's own wording rather than a
+/// hand-copy that would drift from it.
+fn unknown_subcommand(args: &[String]) -> i32 {
+    let real = <ChatCommand as Subcommand>::augment_subcommands(clap::Command::new("chat"));
+    let mut table = clap::Command::new("zeron chat").subcommand_required(true);
+    for sub in real.get_subcommands() {
+        table = table.subcommand(sub.clone());
+    }
+    let replay = std::iter::once("zeron chat").chain(args.iter().map(String::as_str));
+    match table.try_get_matches_from(replay) {
+        Err(error) => {
+            eprint!("{}", error.render());
+            eprintln!("hint: run `zeron chat --help` or `zeron guide chats`");
+            2
+        }
+        // A captured name is by definition not a real subcommand; this arm
+        // exists only so a surprise parse success cannot report ok.
+        Ok(_) => emit(
+            Err::<Report, _>(Failure::error("unrecognized chat subcommand")),
+            false,
+        ),
+    }
+}
+
 /// `90s`, `20m`, `1h`, or bare seconds.
 fn parse_duration(raw: &str) -> Result<Duration, String> {
     let raw = raw.trim();
@@ -428,10 +455,12 @@ pub struct SpawnArgs {
     /// Harness id (see `zeron harness list`). Defaults to the parent's.
     #[arg(long)]
     harness: Option<String>,
-    /// Model id the harness offers (see `zeron model list`). Defaults to the parent's.
+    /// Model id the harness offers (see `zeron model list`). Defaults to the
+    /// parent's on the same harness, else the harness default.
     #[arg(long)]
     model: Option<String>,
-    /// Reasoning level the model supports. Defaults to the parent's.
+    /// Reasoning level the model supports. Defaults to the parent's on the
+    /// same harness.
     #[arg(long)]
     reasoning: Option<String>,
     /// Sidebar title; otherwise the engine titles it from the first exchange.
@@ -593,17 +622,19 @@ pub struct ForkArgs {
 
 #[derive(Subcommand)]
 pub enum ChatCommand {
-    /// Spawn a child chat with a prompt (D7 defaults: inherit the parent).
+    /// Spawn a child chat with a prompt (defaults inherit the parent).
     Spawn(SpawnArgs),
     /// Send a message to a chat (attributed to this chat when run inside one).
     Tell(TellArgs),
     /// Block until chats settle; exit code is the outcome.
     Wait(WaitArgs),
     /// Print the last assistant reply of the latest settled turn.
+    #[command(alias = "read")]
     Output(ChatArg),
     /// Print a chat's summary: status, harness/model, cwd/branch, children.
     Show(ChatArg),
     /// Print the transcript (newest window).
+    #[command(alias = "transcript", alias = "history")]
     Log(LogArgs),
     /// List chats.
     List(ListArgs),
@@ -615,6 +646,10 @@ pub enum ChatCommand {
     Archive(ArchiveArgs),
     /// Copy a chat's settled history into a new chat.
     Fork(ForkArgs),
+    /// Anything unrecognized lands here (name first) so it can be reported
+    /// with a suggestion instead of a bare parse error.
+    #[command(external_subcommand)]
+    Unknown(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -687,6 +722,7 @@ pub async fn run_chat(command: ChatCommand, ipc_port: u16) -> i32 {
             let json = a.json.json;
             emit(fork(&tools, a).await, json)
         }
+        ChatCommand::Unknown(args) => unknown_subcommand(&args),
     }
 }
 
@@ -2049,5 +2085,38 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, ["chatId", "outcome", "reply", "title", "turnKey"]);
+    }
+
+    #[test]
+    fn forgiving_aliases_parse_and_unknown_names_are_caught() {
+        let parse = |argv: &[&str]| {
+            let matches =
+                <ChatCommand as Subcommand>::augment_subcommands(clap::Command::new("chat"))
+                    .try_get_matches_from(argv.iter().copied())
+                    .unwrap();
+            <ChatCommand as clap::FromArgMatches>::from_arg_matches(&matches).unwrap()
+        };
+        assert!(matches!(
+            parse(&["chat", "read", "c-1"]),
+            ChatCommand::Output(_)
+        ));
+        assert!(matches!(
+            parse(&["chat", "output", "c-1"]),
+            ChatCommand::Output(_)
+        ));
+        assert!(matches!(
+            parse(&["chat", "transcript", "c-1"]),
+            ChatCommand::Log(_)
+        ));
+        assert!(matches!(
+            parse(&["chat", "history", "c-1"]),
+            ChatCommand::Log(_)
+        ));
+        // Anything else is caught so `run_chat` can print the suggestion.
+        match parse(&["chat", "reed", "c-1"]) {
+            ChatCommand::Unknown(args) => assert_eq!(args[0], "reed"),
+            _ => panic!("expected the catch-all"),
+        }
+        assert_eq!(unknown_subcommand(&["reed".into()]), 2);
     }
 }
