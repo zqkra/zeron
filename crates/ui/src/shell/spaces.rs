@@ -206,6 +206,8 @@ mod pinned_session_tests {
     };
     use std::collections::HashSet;
 
+    use gpui::px;
+
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
@@ -1781,6 +1783,117 @@ mod pinned_session_tests {
         ));
         assert!(!pinned_drag_snapshot_is_valid("a", &snapshot, &ids(&["a"])));
     }
+
+    /// A chat another chat spawned, so the sidebar draws it inside its
+    /// parent's disclosure tree.
+    fn tree_chat(id: &str, parent: Option<&str>, created_s: i64) -> zeron_proto::Chat {
+        let mut chat = pin_test_chat(id);
+        chat.created_at = chrono::Utc::now() + chrono::Duration::seconds(created_s);
+        if let Some(parent) = parent {
+            chat.parent_chat_id = Some(parent.into());
+            chat.spawned_by_agent = true;
+        }
+        chat
+    }
+
+    struct TreeSidebarHost(gpui::Entity<super::Shell>);
+
+    impl gpui::Render for TreeSidebarHost {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use super::*;
+            self.0.update(cx, |shell, cx| {
+                div()
+                    .w(px(280.0))
+                    .h(px(800.0))
+                    .child(shell.render_chat_sidebar(&Theme::default(), cx))
+            })
+        }
+    }
+
+    /// Sidebar host showing one parent with two spawned children in the
+    /// requested density, optionally with the jump hints held.
+    fn tree_sidebar<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        path: &std::path::Path,
+        compact: bool,
+        jump_hints: bool,
+    ) -> (gpui::Entity<super::Shell>, &'a mut gpui::VisualTestContext) {
+        use super::*;
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            TreeSidebarHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let mut shell = Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: path.into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                );
+                shell.settings.sidebar_compact = compact;
+                shell.settings.sidebar_show_project_label = false;
+                shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.chats = vec![
+                        tree_chat("parent", None, 0),
+                        tree_chat("child-new", Some("parent"), 20),
+                        tree_chat("child-old", Some("parent"), 10),
+                    ];
+                    state.refresh_children_index();
+                });
+                shell.set_jump_hints(jump_hints, cx);
+                shell
+            }))
+        });
+        (host.read_with(cx, |host, _| host.0.clone()), cx)
+    }
+
+    /// The tree's disclosure body must contain every painted child row at
+    /// rest: its height recipe and the rendered rows have to agree, or the
+    /// frame's clip shaves the last row's rounded hover wash. The sessions
+    /// section owns an outer frame around the same rows, so it is checked too.
+    #[gpui::test]
+    fn tree_disclosure_rest_height_covers_the_last_child_row(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_shell, cx) = tree_sidebar(cx, dir.path(), true, false);
+        let last = cx.debug_bounds("chat-child-old").unwrap();
+        for key in [
+            "sidebar-disclosure-chat-tree:parent",
+            "sidebar-disclosure-sessions",
+        ] {
+            let frame = cx
+                .debug_bounds(key)
+                .unwrap_or_else(|| panic!("missing {key}"));
+            assert!(
+                frame.bottom() >= last.bottom(),
+                "{key} clips the last child row: frame {frame:?}, row {last:?}"
+            );
+        }
+    }
+
 }
 
 pub(super) fn pinned_drag_scroll_step(
@@ -2253,7 +2366,18 @@ impl Shell {
         content: AnyElement,
     ) -> AnyElement {
         let target = if open { full_height } else { 0.0 };
-        let frame = div().w_full().flex_none().overflow_hidden().child(content);
+        let frame = div()
+            // Tests measure the resting frame against the rows it paints —
+            // the disclosure body is otherwise selector-free and the clip it
+            // owns is invisible in element bounds.
+            .debug_selector({
+                let key = key.to_owned();
+                move || format!("sidebar-disclosure-{key}")
+            })
+            .w_full()
+            .flex_none()
+            .overflow_hidden()
+            .child(content);
         let Some(tween) = self
             .sidebar_disclosure_motion
             .get(key)
@@ -4507,13 +4631,14 @@ impl Shell {
             let mut slot_height = row_height;
             if let Some(block) = nested {
                 let key = format!("chat-tree:{}", node.chat.id);
-                slot_height += SIDEBAR_LIST_GAP
-                    + sidebar_tree_body_height(
-                        &self.sidebar_disclosure_motion,
-                        &key,
-                        node.open,
-                        nested_full,
-                    );
+                // The nested block rides directly under its row — the slot
+                // paints no gap between them, so none is counted.
+                slot_height += sidebar_tree_body_height(
+                    &self.sidebar_disclosure_motion,
+                    &key,
+                    node.open,
+                    nested_full,
+                );
                 slot = slot.child(self.render_sidebar_disclosure_body(
                     &key,
                     node.open,
@@ -4524,6 +4649,10 @@ impl Shell {
             height += slot_height;
             column = column.child(slot);
         }
+        // The column's own `gap` paints between sibling slots; count it too
+        // or the fixed-height disclosure frame comes up short and clips the
+        // last row's hover wash.
+        height += SIDEBAR_LIST_GAP * nodes.len().saturating_sub(1) as f32;
         let block = div()
             .w_full()
             .flex_none()
