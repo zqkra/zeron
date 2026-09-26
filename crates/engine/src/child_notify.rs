@@ -51,6 +51,12 @@ const RETRY_BACKOFF: [Duration; 3] = [
 ];
 const RETRY_CAP: Duration = Duration::from_secs(300);
 
+/// Belt re-check cadences for parked flushes: the watch wake is primary
+/// (the row the flush waits on changes), the timer only covers a missed or
+/// never-emitted event. Both fire solely while notifications are pending.
+const BUSY_RECHECK: Duration = Duration::from_secs(30);
+const NOT_LOCAL_RECHECK: Duration = Duration::from_secs(60);
+
 /// The prompt budget for a completed child's last reply.
 const EXCERPT_PROMPT_LIMIT: usize = 4000;
 /// The card's excerpt budget (the part, not the prompt).
@@ -227,6 +233,9 @@ struct NotifyState {
     deferred: HashMap<String, Defer>,
     /// Parents with a scheduled flush (debounce window or retry backoff).
     due: HashMap<String, Instant>,
+    /// Ledger write passes executed — a heartbeat storm must leave this at
+    /// the number of real settle transitions, not the number of wakes.
+    claim_passes: u32,
 }
 
 impl NotifyState {
@@ -383,6 +392,7 @@ fn detect(
             },
         )
         .collect();
+    state.claim_passes += 1;
     match store.claim_child_notifications(&specs) {
         Ok(claimed) => {
             for (claimed, (_, _, parent_id)) in claimed.iter().zip(fresh.iter()) {
@@ -440,14 +450,21 @@ async fn flush_due(
             }
         };
         let Some(parent) = parent else {
-            // Row not visible yet; the chats watch wakes us when it lands.
-            state.deferred.insert(parent_id, Defer::ParentRow);
+            // Row not visible yet; the chats watch wakes us when it lands,
+            // the belt re-checks in case no event ever comes.
+            state.deferred.insert(parent_id.clone(), Defer::ParentRow);
+            state
+                .due
+                .insert(parent_id, Instant::now() + NOT_LOCAL_RECHECK);
             continue;
         };
         if parent.device_id != device_id {
             // Not ours to notify; rows stay pending for whoever hosts it.
             // If the chat migrates here its row changes and the watch wakes.
-            state.deferred.insert(parent_id, Defer::ParentRow);
+            state.deferred.insert(parent_id.clone(), Defer::ParentRow);
+            state
+                .due
+                .insert(parent_id, Instant::now() + NOT_LOCAL_RECHECK);
             continue;
         }
         if parent.archived {
@@ -473,8 +490,11 @@ async fn flush_due(
                     )
                 });
         if in_flight {
-            // Parked on the parent's turn; its session row change wakes us.
-            state.deferred.insert(parent_id, Defer::InFlight);
+            // Parked on the parent's turn: its session row change wakes us
+            // immediately, and the 30s belt caps the cost at one re-check
+            // per interval while it stays busy.
+            state.deferred.insert(parent_id.clone(), Defer::InFlight);
+            state.due.insert(parent_id, Instant::now() + BUSY_RECHECK);
             continue;
         }
         let pending = match store.pending_child_notifications(&parent_id) {
@@ -788,4 +808,72 @@ fn combined_prompt(lines: &[PromptLine]) -> String {
         }
     };
     format!("[Zeron system]\n\n{body}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat(id: &str, device_id: &str) -> Chat {
+        Chat {
+            id: id.to_string(),
+            device_id: device_id.to_string(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+            parent_chat_id: None,
+            spawned_by_agent: false,
+        }
+    }
+
+    /// A heartbeat bumps `updated_at` alone; the fingerprint skip must keep
+    /// an already-claimed settle from ever reaching the ledger again.
+    #[test]
+    fn heartbeat_repeats_of_a_settled_row_write_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        let mut state = NotifyState::default();
+        let mut child = chat("child", "dev");
+        child.parent_chat_id = Some("parent".into());
+        child.spawned_by_agent = true;
+        let chats = vec![chat("parent", "dev"), child];
+
+        let started_at = chrono::DateTime::from_timestamp_millis(1_000);
+        for ms in 0..100 {
+            let row = Session {
+                last_completed_turn: None,
+                chat_id: "child".to_string(),
+                device_id: "dev".to_string(),
+                status: SessionStatus::Errored,
+                started_at,
+                updated_at: chrono::DateTime::from_timestamp_millis(ms).unwrap(),
+            };
+            detect(
+                std::slice::from_ref(&row),
+                &chats,
+                &store,
+                "dev",
+                &mut state,
+            );
+        }
+
+        assert_eq!(state.claim_passes, 1);
+        let rows = store.child_notifications_for("child").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].parent_chat_id, "parent");
+        assert_eq!(rows[0].outcome.as_deref(), Some("errored"));
+        assert!(state.due.contains_key("parent"));
+    }
 }
