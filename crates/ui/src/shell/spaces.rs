@@ -1880,8 +1880,9 @@ fn agent_subtree(
     }
 }
 
-/// The chat-row corner affordance a parent carries: the disclosure
-/// chevron over its subtree plus the running count while collapsed.
+/// The chat-row affordance a parent carries: a disclosure chevron in the
+/// row's leading status slot plus the running count in the corner while
+/// collapsed.
 pub(super) struct SidebarTreeRow {
     pub children: Option<SidebarTreeChildren>,
 }
@@ -2284,10 +2285,21 @@ impl Shell {
         open: bool,
         theme: &Theme,
     ) -> AnyElement {
+        self.sidebar_disclosure_chevron_colored(key, open, theme.text_muted.opacity(0.5))
+    }
+
+    /// The same chevron + rotation motion tinted by the caller — the chat
+    /// row's leading-slot disclosure blends muted → text on its own hover.
+    pub(super) fn sidebar_disclosure_chevron_colored(
+        &self,
+        key: &str,
+        open: bool,
+        color: gpui::Hsla,
+    ) -> AnyElement {
         let resting_reveal = if open { 1.0 } else { 0.0 };
         let chevron = icon(icons::ALT_ARROW_RIGHT)
             .size(px(12.0))
-            .text_color(theme.text_muted.opacity(0.5));
+            .text_color(color);
         if let Some(tween) = self
             .sidebar_disclosure_motion
             .get(key)
@@ -2472,6 +2484,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.chat_status_hover = None;
+        self.chat_corner_hover = None;
         self.cancel_pinned_session_drag(cx);
         self.sidebar_session_return = None;
         self.pinned_session_drag_generation = self.pinned_session_drag_generation.wrapping_add(1);
@@ -2600,6 +2613,7 @@ impl Shell {
 
     pub(super) fn cancel_sidebar_session_transfer(&mut self, cx: &mut Context<Self>) {
         self.chat_status_hover = None;
+        self.chat_corner_hover = None;
         self.cancel_pinned_session_drag(cx);
         if let Some(mut transfer) = self.sidebar_session_transfer.take() {
             transfer.preview = None;
@@ -2716,6 +2730,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.chat_status_hover = None;
+        self.chat_corner_hover = None;
         let matches_drag = self.sidebar_session_transfer.as_ref().is_some_and(|drag| {
             drag.payload.chat_id == payload.chat_id
                 && drag.payload.profile_key == payload.profile_key

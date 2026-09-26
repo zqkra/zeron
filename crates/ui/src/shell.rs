@@ -1839,6 +1839,11 @@ pub struct Shell {
         std::cell::RefCell<std::collections::HashMap<String, Entity<project_icon::ProjectIcon>>>,
     /// Hovered row whose status is replaced by the archive control.
     chat_status_hover: Option<String>,
+    /// Parent row whose CORNER is hovered — only on the corner itself does
+    /// the Archive control appear (the disclosure chevron took the leading
+    /// status slot; a corner that flips under the pointer archived whole
+    /// subtrees).
+    chat_corner_hover: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// In-flight reorder for the pinned section only.
@@ -2301,6 +2306,7 @@ impl Shell {
             sidebar_pinned_heights: Vec::new(),
             project_icons: Default::default(),
             chat_status_hover: None,
+            chat_corner_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
@@ -6640,8 +6646,8 @@ impl Shell {
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
         // Orchestration-tree affordance for a row that has
-        // `spawned_by_agent` children — the disclosure chevron plus the
-        // collapsed running count, drawn in the corner ahead of the status.
+        // `spawned_by_agent` children — the disclosure chevron in the
+        // leading status slot plus the collapsed running count in the corner.
         tree: Option<spaces::SidebarTreeRow>,
         search_query: Option<&str>,
         theme: &Theme,
@@ -6673,8 +6679,23 @@ impl Shell {
             });
         let project_icon = (search_query.is_none() && self.settings.sidebar_show_project_icon)
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
-        let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
-        let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
+        let row_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
+        // A parent with agent children keeps its disclosure in the LEADING
+        // status slot; the corner's Archive swap is then gated on the
+        // corner's OWN hover so aiming at the chevron can never meet a
+        // control that archives the whole subtree. Rows without children
+        // keep the row-hover swap exactly as it ships today.
+        let tree_children = tree
+            .as_ref()
+            .and_then(|tree| tree.children.as_ref())
+            .copied();
+        let archive_hovered = !preview
+            && if tree_children.is_some() {
+                self.chat_corner_hover.as_deref() == Some(row_id.as_str())
+            } else {
+                row_hovered
+            };
+        let archived_muted = archived && search_query.is_none() && !selected && !row_hovered;
         let project_icon = project_icon.map(|icon| {
             div()
                 .flex_none()
@@ -6718,42 +6739,101 @@ impl Shell {
         let shows_metadata = branch.is_some() || change_request.is_some();
         let queued = queued && !undelivered;
         let working = status == zeron_proto::ChatIndicator::Working && !queued && !undelivered;
-        let compact_status = compact.then(|| {
-            let glyph = if working {
-                loaders::mini_glyph_spinner(
-                    format!("{row_id}-working"),
-                    2.0,
-                    theme.glyph,
-                    self.sidebar_pane.entity_id(),
-                    cx,
-                )
-                .into_any_element()
-            } else if status == zeron_proto::ChatIndicator::Completed && !queued && !undelivered {
-                icon(icons::CHECK)
-                    .size(px(11.0))
-                    .text_color(status_color)
-                    .into_any_element()
-            } else {
-                div()
-                    .size(px(6.0))
-                    .rounded_full()
-                    .bg(status_color)
-                    .into_any_element()
-            };
-            div()
-                .id(SharedString::from(format!("{row_id}-status")))
-                .debug_selector({
-                    let id = id.clone();
-                    move || format!("chat-status-{id}")
-                })
-                .size(px(13.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .aria_label(status_label.unwrap_or("Idle"))
-                .child(glyph)
-                .into_any_element()
+        // The leading status slot: every compact row carries one, and a
+        // parent row carries it in every density so the disclosure chevron
+        // always has "the status slot" to swap into while the row is
+        // hovered. The chevron is the sidebar's own element and rotation
+        // motion; its footprint never changes, so the swap can't move the
+        // title, and stop_propagation keeps the click from selecting the
+        // chat or reaching the corner's Archive.
+        let leading_status = (compact || tree_children.is_some()).then(|| {
+            let slot = div().flex_none().flex().items_center().justify_center();
+            match tree_children.filter(|_| row_hovered) {
+                Some(children) => {
+                    let motion_key = format!("chat-tree:{id}");
+                    let open = children.open;
+                    let body_height = children.body_height;
+                    let toggle_id = id.clone();
+                    let chev_hover = format!("{row_id}-tree-chev");
+                    let chevron = self.sidebar_disclosure_chevron_colored(
+                        &motion_key,
+                        open,
+                        motion::hover_blend(&chev_hover, theme.text_muted, theme.text),
+                    );
+                    slot.id(SharedString::from(format!("{row_id}-tree-toggle")))
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("chat-tree-toggle-{id}")
+                        })
+                        // Painted slot stays 13px; negative side margins
+                        // stretch the hit target to 20px without touching
+                        // the title's position.
+                        .w(px(20.0))
+                        .ml(px(-3.5))
+                        .mr(px(-3.5))
+                        .h(px(17.0))
+                        .cursor_pointer()
+                        .aria_label(if open {
+                            "Collapse subagents"
+                        } else {
+                            "Expand subagents"
+                        })
+                        .tooltip(crate::settings::widgets::text_tooltip(if open {
+                            "Collapse subagents"
+                        } else {
+                            "Expand subagents"
+                        }))
+                        .on_hover(motion::hover_listener(chev_hover))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_sidebar_disclosure_motion(
+                                &motion_key,
+                                if open { body_height } else { 0.0 },
+                                if open { 0.0 } else { body_height },
+                            );
+                            this.sidebar_collapsed_trees.insert(toggle_id.clone(), open);
+                            cx.notify();
+                        }))
+                        .child(chevron)
+                        .into_any_element()
+                }
+                None => {
+                    let glyph = if working {
+                        loaders::mini_glyph_spinner(
+                            format!("{row_id}-working"),
+                            2.0,
+                            theme.glyph,
+                            self.sidebar_pane.entity_id(),
+                            cx,
+                        )
+                        .into_any_element()
+                    } else if status == zeron_proto::ChatIndicator::Completed
+                        && !queued
+                        && !undelivered
+                    {
+                        icon(icons::CHECK)
+                            .size(px(11.0))
+                            .text_color(status_color)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(status_color)
+                            .into_any_element()
+                    };
+                    slot.id(SharedString::from(format!("{row_id}-status")))
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("chat-status-{id}")
+                        })
+                        .size(px(13.0))
+                        .aria_label(status_label.unwrap_or("Idle"))
+                        .child(glyph)
+                        .into_any_element()
+                }
+            }
         });
         let compact_jump_label = compact.then(|| jump_label.clone()).flatten();
         let jump_chip_shown = jump_label.is_some() && !compact;
@@ -6782,8 +6862,12 @@ impl Shell {
                     .child(label)
                     .into_any_element()
             }
-        } else if corner_hovered {
+        } else if archive_hovered {
             div()
+                .debug_selector({
+                    let id = id.clone();
+                    move || format!("chat-archive-{id}")
+                })
                 .flex()
                 .flex_row()
                 .items_center()
@@ -6883,91 +6967,46 @@ impl Shell {
                     .into_any_element(),
             }
         };
-        // A parent with agent children leads its corner with the subtree
-        // disclosure (the sidebar's own chevron + motion) — and, while
-        // collapsed, the BOT glyph and running-child count. Row hover still
-        // swaps the whole corner to Archive like any other row.
+        // A COLLAPSED parent carries the BOT glyph and running-child count
+        // in its corner, ahead of the status/time — the disclosure chevron
+        // itself lives in the leading status slot. The count steps aside
+        // only while the corner itself offers Archive or the jump hint
+        // takes the corner outright.
         // Compact rows mount their corner only for remote/hover — a parent
         // must keep the affordance on the same terms.
-        let tree_affordance = tree
-            .as_ref()
-            .and_then(|tree| tree.children.as_ref())
-            .is_some();
-        let corner_body = match tree
-            .as_ref()
-            .and_then(|tree| tree.children.as_ref())
-            .filter(|_| !corner_hovered && !jump_chip_shown)
+        let tree_affordance = tree_children.is_some();
+        let corner_body = match tree_children
+            .filter(|children| !children.open && !archive_hovered && !jump_chip_shown)
         {
             Some(children) => {
-                let motion_key = format!("chat-tree:{id}");
-                let open = children.open;
-                let body_height = children.body_height;
-                let toggle_id = id.clone();
-                let chevron_key = motion_key.clone();
-                let chevron = div()
-                    .id(SharedString::from(format!("{row_id}-tree-toggle")))
+                let mut affordance = div()
                     .debug_selector({
                         let id = id.clone();
-                        move || format!("chat-tree-toggle-{id}")
+                        move || format!("chat-tree-count-{id}")
                     })
-                    .size(px(14.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .aria_label(if open {
-                        "Collapse agent sessions"
-                    } else {
-                        "Expand agent sessions"
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.begin_sidebar_disclosure_motion(
-                            &motion_key,
-                            if open { body_height } else { 0.0 },
-                            if open { 0.0 } else { body_height },
-                        );
-                        this.sidebar_collapsed_trees.insert(toggle_id.clone(), open);
-                        cx.notify();
-                    }))
-                    .child(self.sidebar_disclosure_chevron(&chevron_key, open, theme));
-                let mut affordance = div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
-                    .child(chevron);
-                if !open {
-                    affordance = affordance
-                        .child(
-                            icon(icons::BOT)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(theme.text_muted.opacity(0.8)),
-                        )
-                        .when(children.running > 0, |el| {
-                            el.child(
-                                div()
-                                    .text_size(crate::typography::ui_rems(10.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(spaces::status_dot_color(
-                                        zeron_proto::ChatIndicator::Working,
-                                        theme,
-                                    ))
-                                    .child(SharedString::from(format!("{}", children.running))),
-                            )
-                        });
-                }
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(affordance)
-                    .child(corner_body)
-                    .into_any_element()
+                    .child(
+                        icon(icons::BOT)
+                            .size(px(11.0))
+                            .flex_none()
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    );
+                affordance = affordance.when(children.running > 0, |el| {
+                    el.child(
+                        div()
+                            .text_size(crate::typography::ui_rems(10.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(spaces::status_dot_color(
+                                zeron_proto::ChatIndicator::Working,
+                                theme,
+                            ))
+                            .child(SharedString::from(format!("{}", children.running))),
+                    )
+                });
+                affordance.child(corner_body).into_any_element()
             }
             None => corner_body,
         };
@@ -6978,9 +7017,14 @@ impl Shell {
         // stays the selector.
         let corner: AnyElement = {
             let archive_id = id.clone();
+            let corner_id = row_id.clone();
             div()
                 .id(SharedString::from(format!("{row_id}-corner")))
-                .aria_label(if corner_hovered {
+                .debug_selector({
+                    let id = id.clone();
+                    move || format!("chat-corner-{id}")
+                })
+                .aria_label(if archive_hovered {
                     if archived { "Unarchive" } else { "Archive" }
                 } else {
                     if compact {
@@ -6993,8 +7037,9 @@ impl Shell {
                         status_label.unwrap_or("Idle")
                     }
                 })
-                // `min_w` so the agent-tree affordance can widen the corner —
-                // for ordinary rows the content is ≤18px either way.
+                // `min_w` so the collapsed parent's running count can widen
+                // the corner — for ordinary rows the content is ≤18px either
+                // way.
                 .when(compact, |el| el.min_w(px(18.0)).justify_center())
                 .flex_none()
                 // Pin the corner to line 1's text height so the archive pill
@@ -7009,7 +7054,23 @@ impl Shell {
                 .flex()
                 .items_center()
                 .when(!preview, |el| el.cursor_pointer())
-                .when(corner_hovered, |el| {
+                // A parent's Archive arms only under the corner itself —
+                // tracked apart from the row hover that reveals the
+                // leading-slot chevron.
+                .when(!preview && tree_children.is_some(), |el| {
+                    el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            if this.chat_corner_hover.as_deref() != Some(corner_id.as_str()) {
+                                this.chat_corner_hover = Some(corner_id.clone());
+                                cx.notify();
+                            }
+                        } else if this.chat_corner_hover.as_deref() == Some(corner_id.as_str()) {
+                            this.chat_corner_hover = None;
+                            cx.notify();
+                        }
+                    }))
+                })
+                .when(archive_hovered, |el| {
                     el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -7157,7 +7218,7 @@ impl Shell {
                     } else {
                         SIDEBAR_ACTIVE_HARNESS_TITLE_GAP
                     }))
-                    .children(compact_status)
+                    .children(leading_status)
                     .when_some(
                         harness.map(crate::pickers::harness_brand_icon),
                         |el, (path, tint)| {
@@ -7194,7 +7255,7 @@ impl Shell {
                     })
                     .when(
                         if compact {
-                            remote || corner_hovered || tree_affordance
+                            remote || row_hovered || tree_affordance
                         } else {
                             !show_label
                         },
@@ -15593,5 +15654,188 @@ mod settings_modal_regressions {
             assert_eq!(shell.route, Route::Chat);
             assert_eq!(shell.settings.settings_section, SettingsSection::Devices);
         });
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tree_row_regressions {
+    use super::*;
+    use gpui::{AppContext, TestAppContext, VisualTestContext};
+
+    // Render one sidebar chat row against a real Shell so the disclosure,
+    // corner and hover wiring are the production elements, not a fixture.
+    struct RowHost {
+        shell: Entity<Shell>,
+        _data_dir: tempfile::TempDir,
+    }
+
+    impl Render for RowHost {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.shell.update(cx, |shell, cx| {
+                let theme = Theme::of(cx).clone();
+                // Mirror the production open rule: parents start expanded,
+                // only an explicit collapse flips the remembered bit.
+                let open = !shell
+                    .sidebar_collapsed_trees
+                    .get("parent")
+                    .copied()
+                    .unwrap_or(false);
+                div().size_full().p(px(20.0)).child(shell.render_chat_row(
+                    "parent".into(),
+                    "Parent".into(),
+                    "5m".into(),
+                    "home @ fedora".into(),
+                    None,
+                    None,
+                    None,
+                    zeron_proto::ChatIndicator::Idle,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    Some(spaces::SidebarTreeRow {
+                        children: Some(spaces::SidebarTreeChildren {
+                            open,
+                            running: 2,
+                            body_height: 60.0,
+                        }),
+                    }),
+                    None,
+                    &theme,
+                    cx,
+                ))
+            })
+        }
+    }
+
+    fn setup(cx: &mut TestAppContext) -> (Entity<Shell>, &mut VisualTestContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            let shell = cx.new(|cx| {
+                let state = cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.local_device_id = Some("local".into());
+                    state.selected_chat = Some("other".into());
+                    state.chats = serde_json::from_value(serde_json::json!([
+                        { "id": "parent", "deviceId": "local", "archived": false,
+                          "createdAt": Utc::now() },
+                        { "id": "other", "deviceId": "local", "archived": false,
+                          "createdAt": Utc::now() }
+                    ]))
+                    .unwrap();
+                    state
+                });
+                Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                )
+            });
+            RowHost {
+                shell,
+                _data_dir: dir,
+            }
+        });
+        let shell = host.read_with(cx, |host, _| host.shell.clone());
+        cx.update(|window, cx| window.draw(cx).clear());
+        (shell, cx)
+    }
+
+    #[gpui::test]
+    fn parent_row_disclosure_lives_in_leading_slot(cx: &mut TestAppContext) {
+        let (_shell, cx) = setup(cx);
+        // Rest: the status slot paints, no disclosure, expanded parent
+        // carries no count.
+        assert!(cx.debug_bounds("chat-status-parent").is_some());
+        assert!(cx.debug_bounds("chat-tree-toggle-parent").is_none());
+        assert!(cx.debug_bounds("chat-tree-count-parent").is_none());
+        // Hover the row body — the chevron mounts in the leading slot.
+        let row = cx.debug_bounds("chat-parent").unwrap();
+        cx.simulate_mouse_move(
+            gpui::point(row.left() + px(60.0), row.center().y),
+            None,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| window.draw(cx).clear());
+        let toggle = cx
+            .debug_bounds("chat-tree-toggle-parent")
+            .expect("hovered parent mounts the disclosure chevron");
+        let corner = cx.debug_bounds("chat-corner-parent").unwrap();
+        assert!(toggle.center().x < row.center().x, "chevron is not leading");
+        assert!(
+            !corner.contains(&toggle.center()),
+            "the corner must not hold the disclosure element"
+        );
+        assert!(cx.debug_bounds("chat-status-parent").is_none());
+        // The corner is untouched by row hover: no Archive — and pointing
+        // at the chevron still never meets Archive (the original bug).
+        assert!(cx.debug_bounds("chat-archive-parent").is_none());
+        cx.simulate_mouse_move(toggle.center(), None, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("chat-archive-parent").is_none());
+    }
+
+    #[gpui::test]
+    fn leading_chevron_toggles_collapse_without_selecting(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let row = cx.debug_bounds("chat-parent").unwrap();
+        cx.simulate_mouse_move(
+            gpui::point(row.left() + px(60.0), row.center().y),
+            None,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| window.draw(cx).clear());
+        let toggle = cx.debug_bounds("chat-tree-toggle-parent").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.sidebar_collapsed_trees.get("parent"), Some(&true));
+            assert_eq!(
+                shell.state.read(cx).selected_chat.as_deref(),
+                Some("other"),
+                "the disclosure click reached the row's select handler"
+            );
+        });
+        // Collapsed + row still hovered: BOT + running count ride the
+        // corner; the chevron stays leading.
+        assert!(cx.debug_bounds("chat-tree-count-parent").is_some());
+        // Corner hover arms Archive only under the corner itself.
+        let corner = cx.debug_bounds("chat-corner-parent").unwrap();
+        cx.simulate_mouse_move(corner.center(), None, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("chat-archive-parent").is_some());
+    }
+
+    #[gpui::test]
+    fn collapsed_parent_keeps_count_until_corner_hover(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        shell.update(cx, |shell, cx| {
+            shell.sidebar_collapsed_trees.insert("parent".into(), true);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        // Not hovered: status dot leads, BOT + count ride the corner.
+        assert!(cx.debug_bounds("chat-status-parent").is_some());
+        assert!(cx.debug_bounds("chat-tree-count-parent").is_some());
+        assert!(cx.debug_bounds("chat-archive-parent").is_none());
+        let corner = cx.debug_bounds("chat-corner-parent").unwrap();
+        cx.simulate_mouse_move(corner.center(), None, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("chat-archive-parent").is_some());
+        assert!(cx.debug_bounds("chat-tree-count-parent").is_none());
     }
 }
