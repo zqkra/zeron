@@ -751,6 +751,10 @@ impl Render for ChatActivity {
                     .items_center()
                     .justify_center()
                     .text_size(crate::typography::ui_rems(10.0))
+                    // The badge is 16px tall: a line box of the same height
+                    // centers the digits instead of inheriting the footer's
+                    // taller line and sitting off-center in the pill.
+                    .line_height(px(16.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(count.to_string()),
             );
