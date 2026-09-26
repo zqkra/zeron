@@ -1,4 +1,4 @@
-//! Durable parent notifications (spec D9): an agent-spawned child's settle
+//! Durable parent notifications: an agent-spawned child's settle
 //! lands on its parent as a ChildUpdate card + one agent-only prompt, exactly
 //! once — across a busy parent, coalesced siblings, acks, archiving, and
 //! engine restarts.

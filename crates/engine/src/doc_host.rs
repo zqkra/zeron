@@ -5645,7 +5645,7 @@ impl DocHost {
         self.inner.store.clone()
     }
 
-    /// Child-notifier delivery (spec D9): append each `role: System`
+    /// Child-notifier delivery: append each `role: System`
     /// ChildUpdate card — idempotent by its `child:<childId>:<turnKey>` entry
     /// id — then push ONE combined agent-only prompt through the steer path.
     ///

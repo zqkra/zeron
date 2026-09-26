@@ -1,4 +1,4 @@
-//! Durable parent notifications (spec D9): when an agent-spawned child chat
+//! Durable parent notifications: when an agent-spawned child chat
 //! settles — completes, errors, is interrupted, or parks on a question — the
 //! engine hosting its PARENT writes a `role: System` ChildUpdate card into
 //! the parent's doc and delivers one combined agent-only prompt, exactly

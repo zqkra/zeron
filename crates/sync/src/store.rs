@@ -869,7 +869,7 @@ pub struct ChildNotificationClaim<'a> {
     pub outcome: &'a str,
 }
 
-/// One row of the child-notification ledger (spec D9): a settle transition
+/// One row of the child-notification ledger: a settle transition
 /// detected on an agent-spawned child, owed to its parent chat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildNotification {

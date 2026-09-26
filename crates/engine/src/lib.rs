@@ -320,7 +320,7 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
-        // Parent notifications for agent-spawned children (spec D9): the
+        // Parent notifications for agent-spawned children: the
         // loop rides the doc host's worker tracker, so `shutdown_workers`
         // retires it with everything else.
         child_notify::start(

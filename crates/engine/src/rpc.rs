@@ -1145,7 +1145,7 @@ impl EngineRpc {
                 .map(drop),
             MutateParams::SetChatArchived { chat_id, archived } => {
                 // Archive cascades to descendants (children first); unarchive
-                // touches only the named chat — spec D11.
+                // touches only the named chat.
                 if archived {
                     self.workspace
                         .archive_chat_tree(&chat_id)

@@ -1108,7 +1108,7 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
     }
 
-    /// Archive cascade (spec D11): archiving a chat archives its whole
+    /// Archive cascade: archiving a chat archives its whole
     /// descendant tree — children before parents, any device (the rows are
     /// LWW; each device's registry applies them). No unarchive cascade; the
     /// caller routes `archived=false` to [`Self::set_chat_archived`]
