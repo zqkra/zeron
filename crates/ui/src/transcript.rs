@@ -1197,10 +1197,62 @@ pub enum RowKind {
         sender_chat_id: SharedString,
         /// The header's label, the title fallback while the sender is unknown.
         sender_label: SharedString,
-        /// The message body, expanded behind the card's chevron and copied by
-        /// the entry's hover action.
-        body: SharedString,
+        /// The message body, expanded behind the card's chevron and rendered
+        /// as Markdown; the entry's hover action still copies the raw body.
+        body: Arc<ReportBody>,
     },
+}
+
+/// One report card's expandable body: the excerpt capped at
+/// [`EXCERPT_MAX_LINES`] source lines and parsed once with the entry's
+/// Markdown parser, the counted tail, and the chat whose checkout the body's
+/// file links open against — a child works in its own worktree, so the files
+/// its report names are not under the parent's root.
+#[derive(Clone)]
+pub struct ReportBody {
+    tree: Arc<BlockTree>,
+    /// The capped source, kept for diff keys and expansion height.
+    text: SharedString,
+    /// Source lines the cap dropped, counted for the "… N more lines" tail.
+    truncated_by: usize,
+    source_chat_id: SharedString,
+}
+
+impl ReportBody {
+    /// Cap `text` the way the plain-text excerpt always did and parse the
+    /// result once — never on the render path.
+    fn capped(
+        text: &str,
+        source_chat_id: &SharedString,
+        parse: &mut dyn FnMut(&str, &str) -> Arc<BlockTree>,
+        key: &str,
+    ) -> Self {
+        let mut lines = text.lines();
+        let capped = lines
+            .by_ref()
+            .take(EXCERPT_MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            tree: parse(key, &capped),
+            text: capped.into(),
+            truncated_by: lines.count(),
+            source_chat_id: source_chat_id.clone(),
+        }
+    }
+
+    /// The expanded card's height: the capped body at the Markdown line
+    /// pitch, the gaps between its blocks, and the counted tail row.
+    fn height(&self) -> f32 {
+        self.text_height() + usize::from(self.truncated_by > 0) as f32 * OUTPUT_LINE_HEIGHT
+    }
+
+    /// The Markdown area's own budget, without the counted tail row.
+    fn text_height(&self) -> f32 {
+        let lines = self.text.lines().count();
+        let gaps = self.tree.blocks.len().saturating_sub(1);
+        (lines + gaps) as f32 * render::MD_LINE_HEIGHT + OUTPUT_BODY_PAD
+    }
 }
 
 /// One child-chat update inside a [`RowKind::ChildUpdates`] row.
@@ -1213,7 +1265,7 @@ pub struct ChildUpdateItem {
     pub child_chat_id: SharedString,
     pub child_title: SharedString,
     pub outcome: ChildOutcome,
-    pub excerpt: Option<SharedString>,
+    pub body: Option<Arc<ReportBody>>,
 }
 
 /// Row identity for a child-update card: hash everything the card paints
@@ -1229,8 +1281,10 @@ fn child_updates_version(items: &[ChildUpdateItem]) -> u64 {
         acc.extend_from_slice(item.child_title.as_bytes());
         acc.push(0);
         acc.push(item.outcome as u8);
-        if let Some(excerpt) = &item.excerpt {
-            acc.extend_from_slice(excerpt.as_bytes());
+        if let Some(body) = &item.body {
+            acc.extend_from_slice(body.text.as_bytes());
+            acc.push(0);
+            acc.extend_from_slice(&(body.truncated_by as u32).to_le_bytes());
         }
         acc.push(0);
     }
@@ -1538,23 +1592,30 @@ pub fn rows_for_entry(
         if let Some(sender) = zeron_proto::orchestration::parse_agent_message(&body)
             && let Some(sender_chat_id) = sender.sender_chat_id
         {
-            let body = sender.body.to_owned();
-            let mut stamp = Vec::with_capacity(sender_chat_id.len() + body.len() + 1);
+            let raw_body = sender.body.to_owned();
+            let sender_chat_id: SharedString = sender_chat_id.to_owned().into();
+            let report = ReportBody::capped(
+                &raw_body,
+                &sender_chat_id,
+                parse,
+                &format!("{}#agent-body", entry.id),
+            );
+            let mut stamp = Vec::with_capacity(sender_chat_id.len() + raw_body.len() + 1);
             stamp.extend_from_slice(sender_chat_id.as_bytes());
             stamp.push(0);
-            stamp.extend_from_slice(body.as_bytes());
+            stamp.extend_from_slice(raw_body.as_bytes());
             return vec![Row {
                 id: entry.id.clone().into(),
                 version: (fnv1a(&stamp) << 1) | pending as u64,
                 turn_start: true,
                 kind: RowKind::AgentMessage {
-                    sender_chat_id: sender_chat_id.to_owned().into(),
+                    sender_chat_id,
                     sender_label: sender.sender_label.to_owned().into(),
-                    body: body.clone().into(),
+                    body: Arc::new(report),
                 },
                 entry_id,
                 timestamp: Some(entry.created_at),
-                copy_text: (!body.trim().is_empty()).then(|| SharedString::from(body)),
+                copy_text: (!raw_body.trim().is_empty()).then(|| SharedString::from(raw_body)),
                 compact_fold: None,
             }];
         }
@@ -1923,12 +1984,21 @@ pub fn rows_for_entry(
                         outcome,
                         excerpt,
                     } => {
+                        let child_chat_id: SharedString = child_chat_id.clone().into();
+                        let body = excerpt.as_deref().map(|excerpt| {
+                            Arc::new(ReportBody::capped(
+                                excerpt,
+                                &child_chat_id,
+                                parse,
+                                &format!("{part_id}#excerpt"),
+                            ))
+                        });
                         let item = ChildUpdateItem {
                             part_id: part_id.clone().into(),
-                            child_chat_id: child_chat_id.clone().into(),
+                            child_chat_id,
                             child_title: single_line(child_title).into(),
                             outcome: *outcome,
-                            excerpt: excerpt.clone().map(SharedString::from),
+                            body,
                         };
                         let version = child_updates_version(std::slice::from_ref(&item));
                         rows.push(Row {
@@ -7223,13 +7293,21 @@ impl Transcript {
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
             RowKind::ChildUpdates { items } => {
-                self.render_child_updates(&row.id, items, &theme, cx)
+                self.render_child_updates(&row.id, items, &theme, window, cx)
             }
             RowKind::AgentMessage {
                 sender_chat_id,
                 sender_label,
                 body,
-            } => self.render_agent_message(&row.id, sender_chat_id, sender_label, body, &theme, cx),
+            } => self.render_agent_message(
+                &row.id,
+                sender_chat_id,
+                sender_label,
+                body,
+                &theme,
+                window,
+                cx,
+            ),
         };
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -8428,10 +8506,11 @@ impl Transcript {
         row_id: &SharedString,
         items: &Arc<Vec<ChildUpdateItem>>,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if items.len() == 1 {
-            return self.child_update_card(row_id, 0, &items[0], theme, cx);
+            return self.child_update_card(row_id, 0, &items[0], theme, window, cx);
         }
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(false);
@@ -8531,7 +8610,7 @@ impl Transcript {
                 items
                     .iter()
                     .enumerate()
-                    .map(|(ix, item)| self.child_update_card(row_id, ix, item, theme, cx)),
+                    .map(|(ix, item)| self.child_update_card(row_id, ix, item, theme, window, cx)),
             ),
         );
         let view = cx.entity_id();
@@ -8566,6 +8645,7 @@ impl Transcript {
         ix: usize,
         item: &ChildUpdateItem,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let chat = {
@@ -8596,9 +8676,10 @@ impl Transcript {
             SharedString::from(format!("{row_id}#c{ix}")),
             &tool,
             &content,
-            excerpt_detail(item),
+            excerpt_body(item),
             item.child_chat_id.clone(),
             theme,
+            window,
             cx,
         )
     }
@@ -8608,13 +8689,15 @@ impl Transcript {
     /// the arrow opens it — with the message body behind the same hover
     /// chevron, so a report reads like the settle notification instead of a
     /// user bubble.
+    #[allow(clippy::too_many_arguments)] // render seam, not a public API
     fn render_agent_message(
         &mut self,
         row_id: &SharedString,
         sender_chat_id: &SharedString,
         sender_label: &SharedString,
-        body: &SharedString,
+        body: &Arc<ReportBody>,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let chat = {
@@ -8639,32 +8722,98 @@ impl Transcript {
             SharedString::from(format!("{row_id}#m")),
             &tool,
             &content,
-            (!body.is_empty()).then(|| body_excerpt(body)),
+            Some(body.clone()),
             sender_chat_id.clone(),
             theme,
+            window,
             cx,
         )
     }
 
+    /// The workspace-link handler bound to `source_chat_id`: a report body's
+    /// file links open against the reporting chat's checkout, exactly as if
+    /// they were clicked in that chat's own transcript.
+    fn link_ui_for(&self, source_chat_id: &SharedString) -> Option<render::LinkUi> {
+        self.workspace_link.clone().map(|mut link| {
+            link.source_session = Some(source_chat_id.to_string());
+            link
+        })
+    }
+
+    /// The checkout a chat's files live in, from the registry row.
+    fn chat_cwd(&self, chat_id: &SharedString, cx: &gpui::App) -> Option<SharedString> {
+        self.state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id.as_ref())
+            .and_then(|chat| chat.cwd.clone())
+            .map(SharedString::from)
+    }
+
+    /// The render options a report body renders under: the transcript's
+    /// link handler re-sourced to the reporting chat, and that chat's
+    /// checkout for file-icon resolution.
+    fn report_body_options(
+        &mut self,
+        fold_key: &SharedString,
+        source_chat_id: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> RenderOptions {
+        let mut opts = RenderOptions::settled(SharedString::from(format!("{fold_key}#body")));
+        opts.link = self.link_ui_for(source_chat_id);
+        opts.chats = (!self.chat_refs.is_empty()).then(|| self.chat_ui(cx));
+        opts.workspace_root = self.chat_cwd(source_chat_id, cx);
+        opts
+    }
+
+    /// A report body as rendered Markdown: the transcript's own renderer, so
+    /// links, file icons and inline styling match assistant text. The body's
+    /// links resolve and open against the reporting chat, and the file-icon
+    /// treatment uses that chat's root.
+    fn report_body_markdown(
+        &mut self,
+        fold_key: &SharedString,
+        body: &ReportBody,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let opts = self.report_body_options(fold_key, &body.source_chat_id, cx);
+        // The excerpt voice: muted foreground, same as the plain-text body
+        // it replaces, through the ordinary Markdown run colours.
+        let mut body_theme = theme.clone();
+        body_theme.text = theme.text_muted;
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(render::MD_BLOCK_GAP))
+            .children(body.tree.blocks.iter().enumerate().map(|(ix, top)| {
+                render::render_block(&top.block, ix, ix, &opts, &body_theme, window, None)
+            }))
+            .into_any_element()
+    }
+
     /// The compact report card shared by child-update and agent-message rows:
     /// the whole card opens `target_chat_id`'s chat (the spawn chip's
-    /// contract) and an optional detail expands behind a hover-revealed
-    /// chevron, exactly like a rail chip's output block.
+    /// contract) and an optional body expands behind a hover-revealed
+    /// chevron, exactly like a rail chip's output block. The body renders as
+    /// Markdown whose links belong to the reporting chat.
     #[allow(clippy::too_many_arguments)] // render seam, not a public API
     fn report_card(
         &mut self,
         fold_key: SharedString,
         tool: &ToolItem,
         content: &ChipContent,
-        detail: Option<ToolDetail>,
+        body: Option<Arc<ReportBody>>,
         target_chat_id: SharedString,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let detail_h = detail
-            .as_ref()
-            .map(|detail| detail_height(detail) - DETAIL_SEPARATOR)
-            .unwrap_or(0.0);
+        let body_h = body.as_ref().map_or(0.0, |body| body.height());
         let fold = self.folds.get(&fold_key).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(false);
         let now = Instant::now();
@@ -8677,15 +8826,15 @@ impl Transcript {
             if t < 1.0 {
                 animating = true;
             }
-            motion::lerp(fold.from, if open { detail_h } else { 0.0 }, t)
+            motion::lerp(fold.from, if open { body_h } else { 0.0 }, t)
         } else if open {
-            detail_h
+            body_h
         } else {
             0.0
         };
         let toggle = fold_key.clone();
         // The whole card opens the target chat (the spawn chip's contract);
-        // the detail's chevron appears on hover, like a rail chip's.
+        // the body's chevron appears on hover, like a rail chip's.
         let header = div()
             .group("tool-header")
             .id(fold_key.clone())
@@ -8718,7 +8867,7 @@ impl Transcript {
                 cx.entity_id(),
                 cx,
             )))
-            .when(detail.is_some(), |row| {
+            .when(body.is_some(), |row| {
                 row.child(
                     div()
                         .id(SharedString::from(format!("{fold_key}-tog")))
@@ -8734,7 +8883,7 @@ impl Transcript {
                             cx.stop_propagation();
                             let entry = this.folds.entry(toggle.clone()).or_default();
                             let was_open = entry.open.unwrap_or(false);
-                            entry.from = if was_open { detail_h } else { 0.0 };
+                            entry.from = if was_open { body_h } else { 0.0 };
                             entry.open = Some(!was_open);
                             entry.epoch += 1;
                             entry.toggled_at = Some(Instant::now());
@@ -8769,8 +8918,11 @@ impl Transcript {
             );
         let mut card = div().w_full().flex_none().flex().flex_col().child(header);
         if current > 0.0
-            && let Some(detail) = &detail
+            && let Some(body) = &body
         {
+            // The Markdown area keeps the old excerpt's line budget; the
+            // counted tail row stays outside its clip so it is always read.
+            let content = self.report_body_markdown(&fold_key, body, theme, window, cx);
             card = card.child(
                 div()
                     .w_full()
@@ -8778,7 +8930,25 @@ impl Transcript {
                     .flex_none()
                     .overflow_hidden()
                     .h(px(current))
-                    .child(detail_body(detail, None, theme)),
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .max_h(px(body.text_height()))
+                                    .child(content),
+                            )
+                            .when(body.truncated_by > 0, |column| {
+                                column.child(more_lines_row(body.truncated_by, theme))
+                            }),
+                    ),
             );
         }
         let view = cx.entity_id();
@@ -8822,35 +8992,16 @@ fn report_tool(part_id: SharedString, failed: bool) -> ToolItem {
     }
 }
 
-/// The excerpt's expanded height: capped at [`EXCERPT_MAX_LINES`] lines of
-/// the detail row pitch plus its vertical padding.
+/// The line cap every expanded report body keeps — the same budget the
+/// plain-text excerpt enforced, now spent on rendered Markdown lines.
 const EXCERPT_MAX_LINES: usize = 8;
 
-/// The excerpt as a chip output block — the same lines cap and counted tail
-/// every expanded chip gets, so [`detail_height`] answers the card's open
-/// height exactly.
-fn excerpt_detail(item: &ChildUpdateItem) -> Option<ToolDetail> {
-    item.excerpt.as_ref().map(|excerpt| body_excerpt(excerpt))
-}
-
-/// A report body as a chip output block: the same line cap and counted tail
-/// the child-update excerpt uses.
-fn body_excerpt(body: &str) -> ToolDetail {
-    ToolDetail::Output {
-        truncated_by: body.lines().skip(EXCERPT_MAX_LINES).count(),
-        lines: body
-            .lines()
-            .take(EXCERPT_MAX_LINES)
-            .map(|line| SharedString::from(line.to_string()))
-            .collect(),
-    }
+fn excerpt_body(item: &ChildUpdateItem) -> Option<Arc<ReportBody>> {
+    item.body.clone()
 }
 
 fn excerpt_height(item: &ChildUpdateItem) -> f32 {
-    excerpt_detail(item)
-        .as_ref()
-        .map(|detail| detail_height(detail) - DETAIL_SEPARATOR)
-        .unwrap_or(0.0)
+    excerpt_body(item).map_or(0.0, |body| body.height())
 }
 
 /// The settle word a `zeron chat wait` printed, lifted from the captured
@@ -14910,10 +15061,63 @@ mod tests {
         };
         assert_eq!(sender_chat_id.as_ref(), id);
         assert_eq!(sender_label.as_ref(), "Scout");
-        assert_eq!(body.as_ref(), "the report body");
+        assert_eq!(body.text.as_ref(), "the report body");
+        assert_eq!(body.source_chat_id.as_ref(), id);
         assert_eq!(row.copy_text.as_deref(), Some("the report body"));
         assert_eq!(row.timestamp, Some(1_700_000_000_000));
         assert!(row.turn_start, "the report entry still starts a turn");
+    }
+
+    /// A report body is Markdown rendered for the reporting chat: its file
+    /// link parses into a link run, the source line cap still applies, and
+    /// the render options that shape it name the child as the link source
+    /// and its checkout as the file-icon root.
+    #[test]
+    fn report_bodies_carry_markdown_links_for_the_reporting_chat() {
+        let id = "3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
+        let mut entry = assistant("u6", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        let wire = zeron_proto::orchestration::agent_message(
+            Some("Scout"),
+            id,
+            "Wrote [script.sh](scripts/run.sh).",
+        );
+        entry.parts = vec![text_part("t0", &wire)];
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let RowKind::AgentMessage { body, .. } = &rows[0].kind else {
+            panic!("expected the compact report row");
+        };
+        assert_eq!(body.source_chat_id.as_ref(), id);
+        let links: Vec<&str> = body
+            .tree
+            .blocks
+            .iter()
+            .flat_map(|top| match &top.block {
+                Block::Paragraph { runs } => runs
+                    .iter()
+                    .filter_map(|run| run.style.link.as_deref())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(links, vec!["scripts/run.sh"]);
+        assert_eq!(body.truncated_by, 0);
+
+        // The cap still bounds a long report and counts the dropped tail.
+        let long = (1..=EXCERPT_MAX_LINES + 3)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wire = zeron_proto::orchestration::agent_message(Some("Scout"), id, &long);
+        entry.parts = vec![text_part("t0", &wire)];
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        let RowKind::AgentMessage { body, .. } = &rows[0].kind else {
+            panic!("expected the compact report row");
+        };
+        assert_eq!(body.text.lines().count(), EXCERPT_MAX_LINES);
+        assert_eq!(body.truncated_by, 3);
+        assert_eq!(rows[0].copy_text.as_deref(), Some(long.as_str()));
     }
 
     #[test]
@@ -15967,7 +16171,12 @@ mod tests {
                     kind: RowKind::AgentMessage {
                         sender_chat_id: sender.into(),
                         sender_label: "3f6b2a18".into(),
-                        body: "the report".into(),
+                        body: Arc::new(ReportBody::capped(
+                            "the report",
+                            &sender.into(),
+                            &mut parse,
+                            "m1#agent-body",
+                        )),
                     },
                     entry_id: "m1".into(),
                     timestamp: None,
@@ -15983,6 +16192,44 @@ mod tests {
                 let resolved = (ui.resolve)(sender);
                 assert!(resolved.known);
                 assert_eq!(resolved.title.as_ref(), "Scout");
+            });
+        });
+    }
+
+    /// A report body's render options name the reporting child as the link
+    /// source and its checkout as the file-icon root, so a link in the body
+    /// opens the file the child actually wrote.
+    #[gpui::test]
+    fn report_body_links_are_sourced_from_the_reporting_chat(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+            let sender: SharedString = "chat-sender".into();
+            state.update(cx, |state, _| {
+                let mut child = child_chat(sender.as_ref(), Some("Scout"), 10);
+                child.cwd = Some("/work/child".into());
+                state.apply_chats(vec![child]);
+            });
+            transcript.update(cx, |this, cx| {
+                this.set_workspace_link_handler(crate::markdown::render::LinkUi {
+                    source_session: None,
+                    handler: std::rc::Rc::new(|_, _, _| {
+                        crate::markdown::render::LinkOutcome::Rejected
+                    }),
+                });
+                let opts = this.report_body_options(&"row#c0".into(), &sender, cx);
+                assert_eq!(
+                    opts.link
+                        .expect("link handler bound")
+                        .source_session
+                        .as_deref(),
+                    Some(sender.as_ref())
+                );
+                assert_eq!(opts.workspace_root.as_deref(), Some("/work/child"));
             });
         });
     }

@@ -57,7 +57,10 @@ use crate::state::{
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
-use crate::workspace_links::resolve_workspace_file_link;
+
+/// How deep agent-spawned chats may nest. File-link resolution and the
+/// report-link guard never walk further than a spawn could ever reach.
+const MAX_SPAWN_DEPTH: usize = 4;
 
 mod actions_ui;
 #[cfg(test)]
@@ -3263,7 +3266,13 @@ impl Shell {
         let from_main = !self.active_chat.is_empty()
             && source == self.active_chat
             && self.state.read(cx).selected_chat.as_deref() == Some(self.active_chat.as_str());
-        if !from_main && !self.side_chat_open_here(&source, cx) {
+        // A report card or an attributed message names the child chat whose
+        // work produced it; that chat is on screen inside this transcript
+        // even when it has no right-pane tab of its own.
+        if !from_main
+            && !self.side_chat_open_here(&source, cx)
+            && !self.agent_descendant_on_screen(&source, cx)
+        {
             return LinkOutcome::Rejected;
         };
         if activation.target.navigation.is_err() {
@@ -3378,10 +3387,23 @@ impl Shell {
         if chat_id == self.active_chat {
             return Some((chat_id.to_owned(), self.state.clone()));
         }
-        self.side_chats
+        if let Some(side) = self
+            .side_chats
             .values()
             .find(|side| side.state.read(cx).selected_chat.as_deref() == Some(chat_id))
-            .map(|side| (chat_id.to_owned(), side.state.clone()))
+        {
+            return Some((chat_id.to_owned(), side.state.clone()));
+        }
+        // Agent-spawned children are not right-pane side chats, but they are
+        // registry rows in this state — a report's file links open in the
+        // child's own checkout, resolved by chat id exactly like a side
+        // chat's would be.
+        self.state
+            .read(cx)
+            .chats
+            .iter()
+            .any(|chat| chat.id == chat_id)
+            .then(|| (chat_id.to_owned(), self.state.clone()))
     }
 
     /// Open or focus the editor for `path` owned by `owner` (chat id + the
@@ -3503,6 +3525,10 @@ impl Shell {
 
     /// Open a transcript's file link in the linking chat's own checkout: a
     /// side chat's link resolves against, and edits, the side chat's files.
+    /// When that checkout cannot own the target, agent-spawned descendants
+    /// get the next word (each child works in its own worktree), then the
+    /// parent chat — the first known root that owns the path wins, and the
+    /// file opens in that chat's context.
     fn open_workspace_file_link(
         &mut self,
         chat_id: &str,
@@ -3510,20 +3536,16 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(owner) = self.link_owner(chat_id, cx) else {
+        let roots: Vec<(String, String)> = self
+            .file_link_candidates(chat_id, cx)
+            .into_iter()
+            .filter_map(|candidate| self.chat_cwd(&candidate, cx).map(|root| (candidate, root)))
+            .collect();
+        let root_refs: Vec<&str> = roots.iter().map(|(_, root)| root.as_str()).collect();
+        let Some((ix, link)) = crate::workspace_links::first_root_owning(target, root_refs) else {
             return false;
         };
-        let Some(root) = owner
-            .1
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == chat_id)
-            .and_then(|chat| chat.cwd.clone())
-        else {
-            return false;
-        };
-        let Some(link) = resolve_workspace_file_link(target, &root) else {
+        let Some(owner) = self.link_owner(&roots[ix].0, cx) else {
             return false;
         };
 
@@ -3542,6 +3564,98 @@ impl Shell {
             cx,
         );
         true
+    }
+
+    /// The checkout a link may resolve against, in order: the linking chat,
+    /// its agent-spawned descendants (the spawn nesting limit bounds the
+    /// walk), then the parent chat.
+    fn file_link_candidates(&self, chat_id: &str, cx: &App) -> Vec<String> {
+        let state = self.state.read(cx);
+        let mut candidates = vec![chat_id.to_owned()];
+        let mut frontier = vec![chat_id.to_owned()];
+        for _ in 0..MAX_SPAWN_DEPTH {
+            let mut next = Vec::new();
+            for parent in frontier {
+                let Some(children) = state.children_by_parent.agents.get(&parent) else {
+                    continue;
+                };
+                for &ix in children {
+                    let Some(child) = state.chats.get(ix) else {
+                        continue;
+                    };
+                    if !candidates.contains(&child.id) {
+                        candidates.push(child.id.clone());
+                    }
+                    next.push(child.id.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        if let Some(parent) = state
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.parent_chat_id.clone())
+            && !candidates.contains(&parent)
+        {
+            candidates.push(parent);
+        }
+        candidates
+    }
+
+    /// The checkout a chat's files live in, from the state that owns it: a
+    /// side chat resolves through its own state, everyone else through the
+    /// main one.
+    fn chat_cwd(&self, chat_id: &str, cx: &App) -> Option<String> {
+        let owner = self
+            .link_owner(chat_id, cx)
+            .map(|(_, state)| state)
+            .unwrap_or_else(|| self.state.clone());
+        owner
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.cwd.clone())
+    }
+
+    /// Whether `chat_id` is an agent-spawned descendant of a chat this panel
+    /// shows: a report card's or attributed message's child belongs to the
+    /// transcript even though it is not a side-chat tab itself. The main
+    /// chat and every open side chat root the walk.
+    fn agent_descendant_on_screen(&self, chat_id: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        let mut frontier: Vec<String> = state.selected_chat.iter().cloned().collect();
+        frontier.extend(
+            self.side_chats
+                .values()
+                .filter_map(|side| side.state.read(cx).selected_chat.clone()),
+        );
+        for _ in 0..MAX_SPAWN_DEPTH {
+            let mut next = Vec::new();
+            for parent in frontier {
+                let Some(children) = state.children_by_parent.agents.get(&parent) else {
+                    continue;
+                };
+                for &ix in children {
+                    let Some(child) = state.chats.get(ix) else {
+                        continue;
+                    };
+                    if child.id == chat_id {
+                        return true;
+                    }
+                    next.push(child.id.clone());
+                }
+            }
+            if next.is_empty() {
+                return false;
+            }
+            frontier = next;
+        }
+        false
     }
 
     fn rename_file_surface(
@@ -12485,7 +12599,10 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
-    fn chat_with_path(cwd: Option<&str>, source: Option<(&str, &str)>) -> zeron_proto::Chat {
+    pub(super) fn chat_with_path(
+        cwd: Option<&str>,
+        source: Option<(&str, &str)>,
+    ) -> zeron_proto::Chat {
         zeron_proto::Chat {
             id: "chat".into(),
             device_id: "remote-device".into(),
@@ -14578,6 +14695,86 @@ mod exit_regressions {
             .unwrap();
         cx.run_until_parked();
         assert!(weak.upgrade().is_none());
+    }
+
+    /// A file link inside a report resolves against the reporting child's
+    /// worktree: the child has no right-pane tab, yet its link opens the file
+    /// in the child's checkout. A session the panel does not show still
+    /// cannot reach any file context.
+    #[gpui::test]
+    fn report_links_open_files_in_the_reporting_childs_checkout(cx: &mut TestAppContext) {
+        use crate::markdown::render::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
+        let dir = tempfile::tempdir().unwrap();
+        let child_dir = dir.path().join("child-worktree");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(child_dir.join("script.md"), "hi\n").unwrap();
+        let parent_root = dir.path().join("parent-repo");
+        std::fs::create_dir_all(&parent_root).unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                let mut parent =
+                    super::tests::chat_with_path(Some(&parent_root.to_string_lossy()), None);
+                parent.id = "parent".into();
+                let mut child =
+                    super::tests::chat_with_path(Some(&child_dir.to_string_lossy()), None);
+                child.id = "child".into();
+                child.parent_chat_id = Some("parent".into());
+                child.spawned_by_agent = true;
+                shell.active_chat = "parent".into();
+                shell.state.update(cx, |state, _| {
+                    state.apply_chats(vec![parent, child]);
+                    state.selected_chat = Some("parent".into());
+                });
+
+                // The report names a file that exists only in the child's
+                // own worktree.
+                let mut activation = LinkActivation {
+                    target: LinkTarget::new("script.md", "script.md"),
+                    action: LinkAction::Primary,
+                    source_session: Some("child".into()),
+                };
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Internal
+                );
+                let id = shell.file_surface_seq;
+                let surface = shell.file_surfaces.get(&id).cloned().expect("file surface");
+                assert_eq!(surface.read(cx).chat_id(), "child");
+                assert_eq!(
+                    shell.file_surface_paths.get(&id).map(String::as_str),
+                    Some("script.md")
+                );
+
+                // A session the panel does not show stays rejected.
+                activation.source_session = Some("stranger".into());
+                assert_eq!(
+                    shell.activate_session_link(&activation, window, cx),
+                    LinkOutcome::Rejected
+                );
+            })
+            .unwrap();
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
