@@ -620,6 +620,24 @@ impl SessionDoc {
         Err(DocError::Schema(format!("command {command_id} not found")))
     }
 
+    /// Cheap existence check by entry id — scans only each message's `id`
+    /// scalar, never materializing the transcript. For dedupe-before-append
+    /// call sites that run on every notification flush.
+    pub fn has_message(&self, message_id: &str) -> bool {
+        let messages = self.doc.get_list("messages");
+        (0..messages.len()).any(|i| {
+            matches!(
+                messages.get(i),
+                Some(loro::ValueOrContainer::Container(loro::Container::Map(map)))
+                    if matches!(
+                        map.get("id"),
+                        Some(loro::ValueOrContainer::Value(LoroValue::String(s)))
+                            if s.as_str() == message_id
+                    )
+            )
+        })
+    }
+
     /// Stamp a terminal status on an existing message entry by id (recovery:
     /// abandoned `streaming` entries from a dead run are stamped `aborted`).
     /// Returns `false` when no entry with that id exists.
@@ -1506,14 +1524,16 @@ mod tests {
         .unwrap();
         assert_eq!(doc.read_entries().unwrap()[0].parts, vec![part]);
         // The doc field names are the additive contract.
-        let json = serde_json::to_value(to_doc_part(&MessagePart::ChildUpdate {
-            id: "i".into(),
-            child_chat_id: "c".into(),
-            child_title: "t".into(),
-            outcome: zeron_proto::orchestration::ChildOutcome::NeedsInput,
-            excerpt: None,
-        })
-        .unwrap())
+        let json = serde_json::to_value(
+            to_doc_part(&MessagePart::ChildUpdate {
+                id: "i".into(),
+                child_chat_id: "c".into(),
+                child_title: "t".into(),
+                outcome: zeron_proto::orchestration::ChildOutcome::NeedsInput,
+                excerpt: None,
+            })
+            .unwrap(),
+        )
         .unwrap();
         assert_eq!(json["kind"], "childUpdate");
         assert_eq!(json["childChatId"], "c");

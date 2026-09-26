@@ -51,12 +51,6 @@ const RETRY_BACKOFF: [Duration; 3] = [
 ];
 const RETRY_CAP: Duration = Duration::from_secs(300);
 
-/// Re-check cadence for a parent that is not currently ours to notify
-/// (missing row, or hosted on another device). Pending rows wait for the
-/// chat rows to make the parent local — this is only the belt to that
-/// suspenders.
-const NOT_LOCAL_RECHECK: Duration = Duration::from_secs(60);
-
 /// The prompt budget for a completed child's last reply.
 const EXCERPT_PROMPT_LIMIT: usize = 4000;
 /// The card's excerpt budget (the part, not the prompt).
@@ -91,31 +85,24 @@ pub(crate) fn start(
         let doc_host = host;
         let mut sessions_rx = workspace.merged_sessions_watch(sessions.watch_sessions());
         let mut chats_rx = workspace.watch_chats();
-        let mut last_seen: HashMap<String, Session> = HashMap::new();
-        let mut due: HashMap<String, Instant> = HashMap::new();
+        let mut state = NotifyState::default();
         let mut attempts: HashMap<String, u32> = HashMap::new();
-        let mut awaiting: HashMap<String, ChildUpdate> = HashMap::new();
         // Restart re-arm: rows still pending from before this boot flush on
         // the same debounce as a fresh claim.
         for parent in store
             .pending_child_notification_parents()
             .unwrap_or_default()
         {
-            due.insert(parent, Instant::now() + FLUSH_DEBOUNCE);
+            state.due.insert(parent, Instant::now() + FLUSH_DEBOUNCE);
         }
         loop {
-            let session_rows = sessions_rx.borrow_and_update().clone();
-            let chat_rows = chats_rx.borrow_and_update().clone();
-
-            detect(
-                &session_rows,
-                &chat_rows,
-                &store,
-                &device_id,
-                &mut last_seen,
-                &mut awaiting,
-                &mut due,
-            );
+            // Read guards live only for the sync `detect` pass — holding a
+            // watch borrow across `flush_due`'s awaits would stall publishers.
+            {
+                let session_rows = sessions_rx.borrow_and_update();
+                let chat_rows = chats_rx.borrow_and_update();
+                detect(&session_rows, &chat_rows, &store, &device_id, &mut state);
+            }
             flush_due(
                 &FlushCtx {
                     doc_host: &doc_host,
@@ -123,13 +110,13 @@ pub(crate) fn start(
                     sessions: &sessions,
                     store: &store,
                     device_id: &device_id,
-                    session_rows: &session_rows,
+                    sessions_rx: &sessions_rx,
                 },
-                &mut due,
+                &mut state,
                 &mut attempts,
             )
             .await;
-            let next = due.values().min().copied();
+            let next = state.due.values().min().copied();
             let wait = async move {
                 match next {
                     Some(at) => tokio::time::sleep_until(at).await,
@@ -145,100 +132,267 @@ pub(crate) fn start(
     });
 }
 
-/// Diff the merged session rows against the last observation; claim every
-/// detected settle for eligible children and schedule the parent's flush.
-/// `awaiting` holds updates that fired while the child's eligibility was not
-/// yet decidable (chat row or parent row not yet synced) — they claim on a
-/// later wake instead of re-detecting.
+/// The fields `child_update` reads from the PREVIOUS row, kept as a
+/// fingerprint: an unchanged session costs a struct compare — no clone, no
+/// allocation — and classification (`child_update`) runs only for rows that
+/// actually changed.
+#[derive(Clone, PartialEq)]
+struct Seen {
+    status: SessionStatus,
+    last_completed_turn: Option<String>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Seen {
+    fn of(session: &Session) -> Self {
+        Self {
+            status: session.status,
+            last_completed_turn: session.last_completed_turn.clone(),
+            started_at: session.started_at,
+        }
+    }
+
+    /// Field-wise compare without building a fingerprint — unchanged rows
+    /// (the common case) cost zero allocations.
+    fn matches(&self, session: &Session) -> bool {
+        self.status == session.status
+            && self.last_completed_turn == session.last_completed_turn
+            && self.started_at == session.started_at
+    }
+
+    /// `child_update` reads only status/marker/started_at from `prev`, so the
+    /// row can be rebuilt losslessly for the diff call. Runs only on rows
+    /// that already changed.
+    fn as_session(&self, chat_id: &str) -> Session {
+        Session {
+            last_completed_turn: self.last_completed_turn.clone(),
+            chat_id: chat_id.to_string(),
+            device_id: String::new(),
+            status: self.status,
+            started_at: self.started_at,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// The fields the notifier reads from each chat row, kept as a fingerprint:
+/// unchanged rows cost a compare; eligibility and deferral re-checks run
+/// only for rows that actually changed.
+#[derive(PartialEq)]
+struct ChatSeen {
+    spawned_by_agent: bool,
+    parent_chat_id: Option<String>,
+    device_id: String,
+    /// Not consulted for eligibility — tracked so archiving a deferred
+    /// parent still wakes the flush to drop its pending rows.
+    archived: bool,
+}
+
+impl ChatSeen {
+    fn of(chat: &Chat) -> Self {
+        Self {
+            spawned_by_agent: chat.spawned_by_agent,
+            parent_chat_id: chat.parent_chat_id.clone(),
+            device_id: chat.device_id.clone(),
+            archived: chat.archived,
+        }
+    }
+
+    fn matches(&self, chat: &Chat) -> bool {
+        self.spawned_by_agent == chat.spawned_by_agent
+            && self.parent_chat_id == chat.parent_chat_id
+            && self.device_id == chat.device_id
+            && self.archived == chat.archived
+    }
+}
+
+/// Why a parent's flush is parked. Re-armed only by a change to the row the
+/// flush was waiting on — no timers tick for deferred parents.
+enum Defer {
+    /// Parent turn in flight; wake when its session row changes.
+    InFlight,
+    /// Parent chat row missing or hosted elsewhere; wake when it changes.
+    ParentRow,
+}
+
+/// Per-wake fingerprints and parked work. Everything here is O(known rows)
+/// memory and O(changed rows) work.
+#[derive(Default)]
+struct NotifyState {
+    sessions: HashMap<String, Seen>,
+    chats: HashMap<String, ChatSeen>,
+    /// Settle updates that fired before the child's chat row was visible.
+    awaiting: HashMap<String, ChildUpdate>,
+    /// Parents whose flush is parked on a specific row change.
+    deferred: HashMap<String, Defer>,
+    /// Parents with a scheduled flush (debounce window or retry backoff).
+    due: HashMap<String, Instant>,
+}
+
+impl NotifyState {
+    fn arm(&mut self, parent: &str, at: Instant) {
+        self.deferred.remove(parent);
+        self.due.insert(parent.to_string(), at);
+    }
+}
+
+/// Diff the merged session/chat rows against the fingerprint maps; claim
+/// every detected settle for eligible children and schedule the parent's
+/// flush. Per event: O(rows) cheap fingerprint compares, transition
+/// classification and eligibility checks only for rows that actually
+/// changed, then ONE batched ledger write.
 fn detect(
     sessions: &[Session],
     chats: &[Chat],
     store: &DocsStore,
     device_id: &str,
-    last_seen: &mut HashMap<String, Session>,
-    awaiting: &mut HashMap<String, ChildUpdate>,
-    due: &mut HashMap<String, Instant>,
+    state: &mut NotifyState,
 ) {
-    let chats_by_id: HashMap<&str, &Chat> = chats.iter().map(|c| (c.id.as_str(), c)).collect();
-    let present: HashSet<&str> = sessions.iter().map(|s| s.chat_id.as_str()).collect();
-    last_seen.retain(|id, _| present.contains(id.as_str()));
+    // Chat-row fingerprint diff first: awaiting children and deferred
+    // parents re-check only when the row they wait on changed.
+    let mut changed_chats: HashSet<&str> = HashSet::new();
+    {
+        let present: HashSet<&str> = chats.iter().map(|c| c.id.as_str()).collect();
+        state.chats.retain(|id, _| present.contains(id.as_str()));
+        for chat in chats {
+            if state.chats.get(&chat.id).is_some_and(|s| s.matches(chat)) {
+                continue;
+            }
+            changed_chats.insert(chat.id.as_str());
+            state.chats.insert(chat.id.clone(), ChatSeen::of(chat));
+        }
+    }
 
-    let eligible = |child_id: &str| -> Option<String> {
-        let child = chats_by_id.get(child_id)?;
+    let eligible = |state: &NotifyState, child_id: &str| -> Option<String> {
+        let child = state.chats.get(child_id)?;
         if !child.spawned_by_agent {
             return None;
         }
         let parent_id = child.parent_chat_id.as_deref()?;
-        let parent = chats_by_id.get(parent_id)?;
+        let parent = state.chats.get(parent_id)?;
         (parent.device_id == device_id).then(|| parent_id.to_string())
     };
 
-    // First: retry updates parked on rows that were not visible yet.
-    let parked: Vec<(String, ChildUpdate)> = awaiting
+    let mut wake: Vec<String> = Vec::new();
+    for (parent, why) in &state.deferred {
+        match why {
+            Defer::ParentRow if changed_chats.contains(parent.as_str()) => {
+                wake.push(parent.clone());
+            }
+            _ => {}
+        }
+    }
+    for parent in wake {
+        state.deferred.remove(&parent);
+        state.due.insert(parent, Instant::now());
+    }
+
+    // (child, update, parent) triples to claim in one transaction.
+    let mut fresh: Vec<(String, ChildUpdate, String)> = Vec::new();
+
+    // Retry updates parked on children whose chat row just landed.
+    if !state.awaiting.is_empty() {
+        let parked: Vec<(String, ChildUpdate)> = state
+            .awaiting
+            .iter()
+            .filter(|(id, _)| changed_chats.contains(id.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (child_id, update) in parked {
+            match eligible(state, &child_id) {
+                Some(parent_id) => {
+                    state.awaiting.remove(&child_id);
+                    fresh.push((child_id, update, parent_id));
+                }
+                // Once the child exists and is plainly not ours to report
+                // (non-agent child, remote parent), stop re-checking it.
+                None if state.chats.contains_key(&child_id) => {
+                    state.awaiting.remove(&child_id);
+                }
+                None => {}
+            }
+        }
+    }
+
+    let mut changed_sessions: HashSet<&str> = HashSet::new();
+    {
+        let present: HashSet<&str> = sessions.iter().map(|s| s.chat_id.as_str()).collect();
+        state.sessions.retain(|id, _| present.contains(id.as_str()));
+        for next in sessions {
+            if state
+                .sessions
+                .get(&next.chat_id)
+                .is_some_and(|s| s.matches(next))
+            {
+                continue; // unchanged row — nothing could transition
+            }
+            changed_sessions.insert(next.chat_id.as_str());
+            let fingerprint = Seen::of(next);
+            let prev = state
+                .sessions
+                .insert(next.chat_id.clone(), fingerprint)
+                .map(|s| s.as_session(&next.chat_id));
+            let Some(update) = child_update(prev.as_ref(), next) else {
+                continue;
+            };
+            match eligible(state, &next.chat_id) {
+                Some(parent_id) => fresh.push((next.chat_id.clone(), update, parent_id)),
+                // Park it when the chat row isn't here yet: spawn and settle
+                // routinely race the registry row landing.
+                None if !state.chats.contains_key(&next.chat_id) => {
+                    state.awaiting.insert(next.chat_id.clone(), update);
+                }
+                None => {}
+            }
+        }
+    }
+
+    // Parents parked on a live turn wake when its session row changed — or
+    // vanished entirely (a removed row means the turn is over either way).
+    let inflight_wake: Vec<String> = state
+        .deferred
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .filter(|(parent, why)| {
+            matches!(why, Defer::InFlight)
+                && (changed_sessions.contains(parent.as_str())
+                    || !sessions.iter().any(|s| s.chat_id == **parent))
+        })
+        .map(|(parent, _)| parent.clone())
         .collect();
-    for (child_id, update) in parked {
-        match eligible(&child_id) {
-            Some(parent_id) => {
-                awaiting.remove(&child_id);
-                claim(store, &child_id, &update, &parent_id, due);
-            }
-            // Once the child exists and is plainly not ours to report
-            // (non-agent child, remote parent), stop re-checking it.
-            None if chats_by_id.contains_key(child_id.as_str()) => {
-                awaiting.remove(&child_id);
-            }
-            None => {}
-        }
+    for parent in inflight_wake {
+        state.deferred.remove(&parent);
+        state.due.insert(parent, Instant::now());
     }
 
-    for next in sessions {
-        let prev = last_seen.get(&next.chat_id);
-        let Some(update) = child_update(prev, next) else {
-            last_seen.insert(next.chat_id.clone(), next.clone());
-            continue;
-        };
-        last_seen.insert(next.chat_id.clone(), next.clone());
-        match eligible(&next.chat_id) {
-            Some(parent_id) => claim(store, &next.chat_id, &update, &parent_id, due),
-            // Park it when the chat row isn't here yet: spawn and settle
-            // routinely race the registry row landing.
-            None if !chats_by_id.contains_key(&next.chat_id.as_str()) => {
-                awaiting.insert(next.chat_id.clone(), update);
-            }
-            None => {}
-        }
+    if fresh.is_empty() {
+        return;
     }
-}
-
-/// Claim-before-send: the ledger decides whether this transition still owes
-/// the parent a notification (prior pending claim, delivered, or an ack that
-/// beat us all read as "not owed"). On a fresh claim the child's older
-/// pending keys supersede — only the newest settle per child is delivered —
-/// and the parent's flush re-arms at the trailing edge of the debounce.
-fn claim(
-    store: &DocsStore,
-    child_id: &str,
-    update: &ChildUpdate,
-    parent_id: &str,
-    due: &mut HashMap<String, Instant>,
-) {
-    match store.claim_child_notification(
-        child_id,
-        &update.key,
-        parent_id,
-        outcome_name(update.outcome),
-    ) {
-        Ok(true) => {
-            if let Err(err) = store.supersede_pending_child_notifications(child_id, &update.key) {
-                tracing::warn!(chat = %child_id, error = %err, "child-notification supersede failed");
+    // Claim-before-send, one transaction for the whole pass: the ledger
+    // decides whether each transition still owes the parent a notification
+    // (prior pending claim, delivered, or an ack that beat us all read as
+    // "not owed"), and each fresh claim supersedes the child's older pending
+    // keys — only the newest settle per child is delivered.
+    let specs: Vec<zeron_sync::ChildNotificationClaim<'_>> = fresh
+        .iter()
+        .map(
+            |(child_id, update, parent_id)| zeron_sync::ChildNotificationClaim {
+                child_chat_id: child_id,
+                turn_key: &update.key,
+                parent_chat_id: parent_id,
+                outcome: outcome_name(update.outcome),
+            },
+        )
+        .collect();
+    match store.claim_child_notifications(&specs) {
+        Ok(claimed) => {
+            for (claimed, (_, _, parent_id)) in claimed.iter().zip(fresh.iter()) {
+                if *claimed {
+                    state.arm(parent_id, Instant::now() + FLUSH_DEBOUNCE);
+                }
             }
-            due.insert(parent_id.to_string(), Instant::now() + FLUSH_DEBOUNCE);
         }
-        Ok(false) => {}
         Err(err) => {
-            tracing::warn!(chat = %child_id, error = %err, "child-notification claim failed");
+            tracing::warn!(error = %err, "child-notification claim failed");
         }
     }
 }
@@ -250,16 +404,16 @@ struct FlushCtx<'a> {
     sessions: &'a SessionsEngine,
     store: &'a DocsStore,
     device_id: &'a str,
-    session_rows: &'a [Session],
+    sessions_rx: &'a tokio::sync::watch::Receiver<Vec<Session>>,
 }
 
 /// Deliver every parent whose flush time arrived. Holds: parent missing or
-/// hosted elsewhere (recheck periodically), archived (pending rows drop —
-/// sending would unarchive it), or mid-turn (held until the session settles;
-/// the merged watch wakes us when it does).
+/// hosted elsewhere (parked until its chat row changes), archived (pending
+/// rows drop — sending would unarchive it), or mid-turn (parked until its
+/// session row changes; the merged watch wakes us when it does).
 async fn flush_due(
     ctx: &FlushCtx<'_>,
-    due: &mut HashMap<String, Instant>,
+    state: &mut NotifyState,
     attempts: &mut HashMap<String, u32>,
 ) {
     let doc_host = ctx.doc_host;
@@ -267,43 +421,49 @@ async fn flush_due(
     let sessions = ctx.sessions;
     let store = ctx.store;
     let device_id = ctx.device_id;
-    let session_rows = ctx.session_rows;
     let now = Instant::now();
-    let ready: Vec<String> = due
+    let ready: Vec<String> = state
+        .due
         .iter()
         .filter(|(_, at)| **at <= now)
         .map(|(p, _)| p.clone())
         .collect();
     for parent_id in ready {
-        due.remove(&parent_id);
+        state.due.remove(&parent_id);
         let parent = match workspace.chat(&parent_id) {
             Ok(parent) => parent,
             Err(err) => {
                 tracing::warn!(chat = %parent_id, error = %err, "child-notification parent read failed");
-                due.insert(parent_id, Instant::now() + NOT_LOCAL_RECHECK);
+                // Transient store error: timed retry while work is pending.
+                state.due.insert(parent_id, Instant::now() + RETRY_CAP);
                 continue;
             }
         };
         let Some(parent) = parent else {
-            due.insert(parent_id, Instant::now() + NOT_LOCAL_RECHECK);
+            // Row not visible yet; the chats watch wakes us when it lands.
+            state.deferred.insert(parent_id, Defer::ParentRow);
             continue;
         };
         if parent.device_id != device_id {
             // Not ours to notify; rows stay pending for whoever hosts it.
-            due.insert(parent_id, Instant::now() + NOT_LOCAL_RECHECK);
+            // If the chat migrates here its row changes and the watch wakes.
+            state.deferred.insert(parent_id, Defer::ParentRow);
             continue;
         }
         if parent.archived {
             if let Err(err) = store.drop_pending_child_notifications(&parent_id) {
                 tracing::warn!(chat = %parent_id, error = %err, "child-notification drop failed");
-                due.insert(parent_id, Instant::now() + NOT_LOCAL_RECHECK);
+                state.due.insert(parent_id, Instant::now() + RETRY_CAP);
             }
             continue;
         }
         // AwaitingInput is still a turn — the parent is owed its answer, not
-        // a steer. Idle/Errored/no session are deliverable.
+        // a steer. Idle/Errored/no session are deliverable. Borrow the watch
+        // fresh at flush time: the snapshot read at wake is already stale.
         let in_flight = sessions.turn_in_flight(&parent_id)
-            || session_rows
+            || ctx
+                .sessions_rx
+                .borrow()
                 .iter()
                 .find(|s| s.chat_id == parent_id)
                 .is_some_and(|s| {
@@ -313,14 +473,15 @@ async fn flush_due(
                     )
                 });
         if in_flight {
-            due.insert(parent_id, Instant::now() + FLUSH_DEBOUNCE);
+            // Parked on the parent's turn; its session row change wakes us.
+            state.deferred.insert(parent_id, Defer::InFlight);
             continue;
         }
         let pending = match store.pending_child_notifications(&parent_id) {
             Ok(pending) => pending,
             Err(err) => {
                 tracing::warn!(chat = %parent_id, error = %err, "child-notification read failed");
-                due.insert(parent_id, Instant::now() + RETRY_CAP);
+                state.due.insert(parent_id, Instant::now() + RETRY_CAP);
                 continue;
             }
         };
@@ -341,14 +502,15 @@ async fn flush_due(
         {
             Ok(()) => {
                 attempts.remove(&parent_id);
-                for row in &pending {
-                    if let Err(err) = store.settle_child_notification(
-                        &row.child_chat_id,
-                        &row.turn_key,
-                        "delivered",
-                    ) {
-                        tracing::warn!(chat = %parent_id, error = %err, "child-notification settle failed");
-                    }
+                // One transaction marks every delivered row the prompt
+                // carried; an ack that raced the flush wins (it already left
+                // 'pending').
+                let keys: Vec<(&str, &str)> = pending
+                    .iter()
+                    .map(|row| (row.child_chat_id.as_str(), row.turn_key.as_str()))
+                    .collect();
+                if let Err(err) = store.settle_child_notifications(&keys, "delivered") {
+                    tracing::warn!(chat = %parent_id, error = %err, "child-notification settle failed");
                 }
             }
             Err(err) => {
@@ -361,7 +523,7 @@ async fn flush_due(
                 tracing::warn!(chat = %parent_id, error = %err,
                     backoff_ms = wait.as_millis() as u64,
                     "child-notification delivery failed; retrying");
-                due.insert(parent_id, Instant::now() + wait);
+                state.due.insert(parent_id, Instant::now() + wait);
             }
         }
     }
@@ -408,11 +570,15 @@ fn cap_chars(text: &str, max: usize) -> String {
     format!("{}{}", trimmed[..cut].trim_end(), TRUNCATED_SUFFIX)
 }
 
+/// Bounded tail window for excerpt reads — a flush reads only the end of
+/// the child's doc, never the whole transcript.
+const EXCERPT_TAIL_PARTS: usize = 256;
+
 /// The child's last assistant reply: text parts of the latest settled
 /// (Complete, non-empty) assistant entry in the child's local doc.
 fn last_assistant_reply(doc_host: &DocHost, child_chat_id: &str) -> Option<String> {
     let handle = doc_host.open_local(child_chat_id).ok()?;
-    let entries = handle.doc().read_entries().ok()?;
+    let entries = handle.doc().read_opening_tail(EXCERPT_TAIL_PARTS).ok()?;
     let entry = entries.iter().rev().find(|e| {
         e.role == MessageRole::Assistant
             && e.status == Some(MessageStatus::Complete)
@@ -437,7 +603,7 @@ fn last_assistant_reply(doc_host: &DocHost, child_chat_id: &str) -> Option<Strin
 /// "needs help" prompt, read from the child's local doc.
 fn pending_input_details(doc_host: &DocHost, child_chat_id: &str) -> Option<(String, String)> {
     let handle = doc_host.open_local(child_chat_id).ok()?;
-    let entries = handle.doc().read_entries().ok()?;
+    let entries = handle.doc().read_opening_tail(EXCERPT_TAIL_PARTS).ok()?;
     let questions = entries.iter().rev().find_map(|e| {
         e.parts.iter().find_map(|p| match p {
             MessagePart::Input {

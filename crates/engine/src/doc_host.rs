@@ -5661,15 +5661,11 @@ impl DocHost {
     ) -> Result<(), EngineError> {
         let handle = self.open(parent_chat_id)?;
         {
-            let existing: HashSet<String> = handle
-                .doc()
-                .read_entries()?
-                .into_iter()
-                .map(|entry| entry.id)
-                .collect();
+            // Dedupe by id without materializing the transcript — flushes
+            // repeat, and the parent's doc can be arbitrarily long.
             let mut wrote = false;
             for card in cards {
-                if existing.contains(&card.id) {
+                if handle.doc().has_message(&card.id) {
                     continue;
                 }
                 handle.doc().push_message(card)?;

@@ -627,6 +627,72 @@ impl DocsStore {
         })
     }
 
+    /// Batched claim for a detect pass: every `INSERT OR IGNORE` plus each
+    /// claimed child's pending-key supersede lands in ONE transaction, so a
+    /// burst of sibling settles costs one SQLite write round-trip. Returns
+    /// per-claim "newly claimed" flags in input order.
+    pub fn claim_child_notifications(
+        &self,
+        claims: &[ChildNotificationClaim<'_>],
+    ) -> Result<Vec<bool>, StoreError> {
+        store_blocking(|| {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            let mut claimed = Vec::with_capacity(claims.len());
+            for claim in claims {
+                let inserted = tx.execute(
+                    "INSERT OR IGNORE INTO child_notifications
+                         (child_chat_id, turn_key, parent_chat_id, outcome, state, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                    params![
+                        claim.child_chat_id,
+                        claim.turn_key,
+                        claim.parent_chat_id,
+                        claim.outcome,
+                        now_ms()
+                    ],
+                )? > 0;
+                claimed.push(inserted);
+                if inserted {
+                    // Newest pending wins: older unclaimed-by-the-parent keys
+                    // for this child are folded into this update.
+                    tx.execute(
+                        "UPDATE child_notifications SET state='superseded'
+                         WHERE child_chat_id=?1 AND turn_key!=?2 AND state='pending'",
+                        params![claim.child_chat_id, claim.turn_key],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(claimed)
+        })
+    }
+
+    /// Batched terminal transition for a flush: one transaction settles every
+    /// delivered (or dropped) row the prompt carried. `delivered` stamps
+    /// `delivered_at`; rows already in another terminal state (an ack that
+    /// beat the flush) are left alone.
+    pub fn settle_child_notifications(
+        &self,
+        keys: &[(&str, &str)],
+        state: &str,
+    ) -> Result<(), StoreError> {
+        store_blocking(|| {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            for (child_chat_id, turn_key) in keys {
+                tx.execute(
+                    "UPDATE child_notifications
+                     SET state=?3, delivered_at = CASE WHEN ?3='delivered' THEN ?4 ELSE delivered_at END
+                     WHERE child_chat_id=?1 AND turn_key=?2 AND state='pending'",
+                    params![child_chat_id, turn_key, state, now_ms()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Coalescing rule: per child only the NEWEST pending update is owed to
     /// the parent — every other still-pending key for the child supersedes.
     pub fn supersede_pending_child_notifications(
@@ -793,6 +859,14 @@ impl DocsStore {
         // connection itself is still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// One claim in a batched [`DocsStore::claim_child_notifications`] pass.
+pub struct ChildNotificationClaim<'a> {
+    pub child_chat_id: &'a str,
+    pub turn_key: &'a str,
+    pub parent_chat_id: &'a str,
+    pub outcome: &'a str,
 }
 
 /// One row of the child-notification ledger (spec D9): a settle transition
