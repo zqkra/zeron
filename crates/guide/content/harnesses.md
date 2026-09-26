@@ -19,7 +19,9 @@ the error names candidate ids — run `model list` and pick one.
 
 A spawned chat inherits its parent's harness, model, reasoning level and
 sandbox unless you pass `--harness`, `--model`, `--reasoning` on
-`zeron chat spawn`. Sandbox can only be lowered from the parent's, never
+`zeron chat spawn`. Model, reasoning and model options inherit only when
+the harness stays the same — with `--harness` they come from the new
+harness's defaults. Sandbox can only be lowered from the parent's, never
 raised. Chats spawned outside a parent default to the workspace default
 harness.
 

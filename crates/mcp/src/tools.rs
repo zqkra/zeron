@@ -173,8 +173,8 @@ fn catalog() -> Vec<ToolDef> {
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
                     "no_parent": { "type": "boolean", "default": false, "description": "Spawn a top-level chat even when called from inside a chat." },
                     "harness": { "type": "string", "description": "Harness id (see list_harnesses). Defaults to the parent's, else claude-code when available." },
-                    "model": { "type": "string", "description": "Model id from list_models. Defaults to the parent's, else the harness default." },
-                    "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max). Defaults to the parent's." },
+                    "model": { "type": "string", "description": "Model id from list_models. Defaults to the parent's when the harness is unchanged, else the harness default." },
+                    "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max). Defaults to the parent's when the harness is unchanged." },
                     "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "description": "Defaults to the parent's (or workspace-write); may only be lowered below it." },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
@@ -815,16 +815,38 @@ impl Tools {
                 _ => default_harness(&harnesses)?,
             },
         };
-        // Agents pass shorthand ("haiku", "sonnet") as readily as full ids:
-        // resolve exact id → unique case-insensitive substring of the id or
-        // label → ambiguous tokens and unknowns error naming the catalog.
+        // Model, reasoning and model options are harness-local: they
+        // follow the parent only while the child stays on the same
+        // harness. A cross-harness spawn starts from the target's
+        // fresh-chat defaults — the picker's first catalog row — because a
+        // parent's model id means nothing to another harness (the engine
+        // fails such a run outright).
+        let same_harness = parent_config.as_ref().is_some_and(|c| c.harness == harness);
+        // One catalog read feeds the shorthand resolver, the default pick
+        // and the reasoning-support check; an unreadable catalog degrades
+        // to pass-through rather than failing the spawn.
+        let catalog = self.zeron.models(harness).await.unwrap_or_default();
         let model = match args.model.as_deref() {
-            Some(raw) => Some(resolve_model(&self.zeron, harness, raw).await?),
-            None => parent_config.as_ref().and_then(|c| c.model.clone()),
+            // Agents pass shorthand ("haiku", "sonnet") as readily as full
+            // ids: resolve exact id → unique case-insensitive substring of
+            // the id or label → ambiguous tokens and unknowns error naming
+            // the catalog.
+            Some(raw) => Some(resolve_model_in(&catalog, harness, raw)?),
+            None if same_harness => parent_config.as_ref().and_then(|c| c.model.clone()),
+            None => catalog.first().map(|m| m.id.clone()),
         };
         let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
-            Some(raw) => Some(parse_enum("reasoning level", raw).map_err(ChatError::failed)?),
-            None => parent_config.as_ref().and_then(|c| c.reasoning),
+            Some(raw) => {
+                let level: ReasoningLevel =
+                    parse_enum("reasoning level", raw).map_err(ChatError::failed)?;
+                if same_harness || reasoning_supported(&catalog, model.as_deref(), level) {
+                    Some(level)
+                } else {
+                    None
+                }
+            }
+            None if same_harness => parent_config.as_ref().and_then(|c| c.reasoning),
+            None => None,
         };
         let parent_sandbox = parent_config
             .as_ref()
@@ -847,7 +869,11 @@ impl Tools {
             harness,
             model: model.clone(),
             reasoning,
-            model_options: Default::default(),
+            model_options: if same_harness {
+                parent_config.map(|c| c.model_options).unwrap_or_default()
+            } else {
+                Default::default()
+            },
             sandbox,
         };
 
@@ -1457,16 +1483,25 @@ fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
 /// Resolve an agent-typed model name against the harness catalog: exact id
 /// wins, else a single case-insensitive substring match on id or label.
 /// Several matches is ambiguous; zero means the name is not offered — the
-/// error names up to five candidate ids either way. When the catalog cannot
-/// be read the token passes through untouched (the engine will report it).
-async fn resolve_model(zeron: &Zeron, harness: HarnessId, raw: &str) -> Result<String, ChatError> {
-    let Ok(models) = zeron.models(harness).await else {
-        return Ok(raw.to_owned());
-    };
+/// error names up to five candidate ids either way. An empty catalog (the
+/// harness lists nothing, or the read failed) passes the token through
+/// untouched and the engine reports it.
+fn resolve_model_in(models: &[Model], harness: HarnessId, raw: &str) -> Result<String, ChatError> {
     if models.is_empty() || models.iter().any(|m| m.id == raw) {
         return Ok(raw.to_owned());
     }
-    pick_model(&models, harness, raw)
+    pick_model(models, harness, raw)
+}
+
+/// Whether the resolved model's catalog row advertises `level`. A model
+/// with no row cannot be checked — an explicit pick stands and the harness
+/// reports it — but a listed row with a shorter ladder drops the level
+/// rather than sending it to a model that rejects it.
+fn reasoning_supported(catalog: &[Model], model: Option<&str>, level: ReasoningLevel) -> bool {
+    match model.and_then(|id| catalog.iter().find(|m| m.id == id)) {
+        Some(row) => row.reasoning_levels.contains(&level),
+        None => true,
+    }
 }
 
 /// Shorthand matching over the catalog: a unique substring hit on id or label
@@ -1547,7 +1582,8 @@ mod tests {
                     {
                         "id": "chat-alpha-1", "deviceId": "dev-local", "title": "Alpha",
                         "archived": false, "spaceId": "space-1",
-                        "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "sandbox": "workspace-write" },
+                        "config": { "harness": "claude-code", "model": "opus", "reasoning": "high",
+                                    "modelOptions": { "thinking": "on" }, "sandbox": "workspace-write" },
                         "createdAt": "2026-09-01T00:00:00Z"
                     },
                     {
@@ -1562,11 +1598,20 @@ mod tests {
                     { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
                       "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true },
                     { "id": "codex", "name": "Codex", "supportsSteering": true,
-                      "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": false, "enabled": true }
+                      "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": false, "enabled": true },
+                    { "id": "devin", "name": "Devin", "supportsSteering": false,
+                      "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": true, "enabled": true }
                 ])),
-                methods::LIST_MODELS => RpcReply::Value(json!([
-                    { "id": "opus", "label": "Opus" }, { "id": "sonnet", "label": "Sonnet" }
-                ])),
+                methods::LIST_MODELS => RpcReply::Value(match params["harness"].as_str() {
+                    Some("devin") => json!([
+                        { "id": "devin-small", "label": "Devin Small", "reasoningLevels": ["low", "medium"] },
+                        { "id": "devin-big", "label": "Devin Big", "reasoningLevels": ["low", "medium", "high"] }
+                    ]),
+                    _ => json!([
+                        { "id": "opus", "label": "Opus", "reasoningLevels": ["low", "medium", "high"] },
+                        { "id": "sonnet", "label": "Sonnet", "reasoningLevels": ["low", "medium", "high"] }
+                    ]),
+                }),
                 methods::WATCH_DOC_MESSAGES => stream(json!({ "reset": [
                     { "id": "u1", "role": "user", "createdAt": 1, "deviceId": "dev-local",
                       "parts": [{ "kind": "text", "id": "t", "text": "hi" }] },
@@ -1717,23 +1762,20 @@ mod tests {
     async fn model_names_resolve_exact_alias_then_error() {
         let world = Arc::new(World::default());
         let tools = tools(world, Origin::default());
-        let m = |raw: &str| {
-            let z = tools.zeron.clone();
-            let raw = raw.to_owned();
-            async move { resolve_model(&z, HarnessId::ClaudeCode, &raw).await }
-        };
+        let catalog = tools.zeron.models(HarnessId::ClaudeCode).await.unwrap();
+        let m = |raw: &str| resolve_model_in(&catalog, HarnessId::ClaudeCode, raw);
 
         // Exact id passes through untouched.
-        assert_eq!(m("sonnet").await.unwrap(), "sonnet");
+        assert_eq!(m("sonnet").unwrap(), "sonnet");
         // A unique substring of an id or label resolves to that id.
-        assert_eq!(m("Sonn").await.unwrap(), "sonnet");
-        assert_eq!(m("opus").await.unwrap(), "opus");
+        assert_eq!(m("Sonn").unwrap(), "sonnet");
+        assert_eq!(m("opus").unwrap(), "opus");
         // Several matches is an error naming the candidates.
-        let err = m("o").await.unwrap_err().to_string();
+        let err = m("o").unwrap_err().to_string();
         assert!(err.contains("ambiguous"), "{err}");
         assert!(err.contains("opus") && err.contains("sonnet"), "{err}");
         // Zero matches is "not offered" with candidate ids to pick from.
-        let err = m("gpt-9").await.unwrap_err().to_string();
+        let err = m("gpt-9").unwrap_err().to_string();
         assert!(err.contains("not offered"), "{err}");
         assert!(err.contains("opus"), "{err}");
 
@@ -1839,6 +1881,69 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("no chat matches"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn create_chat_inherits_config_only_within_the_same_harness() {
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+
+        // Same harness: model, reasoning and model options ride along.
+        let created = tools
+            .call("create_chat", json!({ "project": "/repo/comet" }))
+            .await
+            .unwrap();
+        assert_eq!(created["harness"], "claude-code");
+        assert_eq!(created["model"], "opus");
+        assert_eq!(created["reasoning"], "high");
+        assert_eq!(
+            world.writes.lock().unwrap()[0].1["config"]["modelOptions"],
+            json!({ "thinking": "on" })
+        );
+
+        // A different harness takes that harness's defaults: the first
+        // catalog row — not the parent's "opus", which Devin would reject.
+        let created = tools
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "harness": "devin" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["harness"], "devin");
+        assert_eq!(created["model"], "devin-small");
+        assert!(created["reasoning"].is_null(), "{created}");
+        assert_eq!(
+            world.writes.lock().unwrap()[1].1["config"]["modelOptions"],
+            json!({})
+        );
+
+        // An explicit model wins; explicit reasoning survives only when the
+        // resolved model's ladder lists it.
+        let created = tools
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "harness": "devin", "model": "devin-big", "reasoning": "high" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["model"], "devin-big");
+        assert_eq!(created["reasoning"], "high");
+
+        let created = tools
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "harness": "devin", "model": "devin-big", "reasoning": "ultra" }),
+            )
+            .await
+            .unwrap();
+        assert!(created["reasoning"].is_null(), "{created}");
     }
 
     #[tokio::test]
