@@ -1840,7 +1840,12 @@ fn agent_children<'a>(state: &'a AppState, parent_id: &str) -> Vec<&'a zeron_pro
         .children_by_parent
         .agents
         .get(parent_id)
-        .map(|children| children.iter().map(|&ix| &state.chats[ix]).collect())
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|&ix| state.chats.get(ix))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -6914,6 +6919,7 @@ mod tests {
     };
     use crate::settings::SidebarSort;
     use crate::state::AppState;
+    use gpui::AppContext as _;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
@@ -7032,6 +7038,20 @@ mod tests {
             .map(|&ix| state.chats[ix].id.as_str())
             .collect();
         assert_eq!(activity, ["fresh"]);
+    }
+
+    #[gpui::test]
+    fn runtime_reset_empties_the_children_index(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.apply_chats(vec![agent_chat("kid", "p", 10)]);
+            state.prepare_runtime_replacement(cx);
+            assert!(state.chats.is_empty());
+            assert!(agent_children(state, "p").is_empty());
+            assert!(
+                crate::chat_activity::child_chat_rows(state, "p", true, Utc::now()).is_empty()
+            );
+        });
     }
 
     #[test]

@@ -1972,6 +1972,7 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
+        self.children_by_parent = ChildrenIndex::default();
         self.pending_side_chat = None;
         self.sessions.clear();
         self.sidebar_preferences = SidebarPreferencesState::default();

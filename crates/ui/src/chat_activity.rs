@@ -896,7 +896,7 @@ pub(crate) fn child_chat_rows(
         .get(chat_id)
         .into_iter()
         .flatten()
-        .map(|&ix| &state.chats[ix])
+        .filter_map(|&ix| state.chats.get(ix))
         .filter(|chat| chat.spawned_by_agent == spawned_by_agent)
         .map(|chat| {
             let activity = chat.last_message_at.unwrap_or(chat.created_at);
