@@ -74,21 +74,6 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE sync_job_clock (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL) STRICT;
     INSERT INTO sync_job_clock VALUES (1,0);",
     "ALTER TABLE chat_sync_jobs ADD COLUMN cursor TEXT NOT NULL DEFAULT '';",
-    // Agent-spawned child settle notifications: claim-before-send ledger so a
-    // transition detected on the child's session row reaches the parent
-    // exactly once, even across engine restarts. `state` flows
-    // pending -> delivered|dropped|superseded|acked (acked outranks
-    // everything: `zeron chat wait`/`output` saw the turn before we sent).
-    "CREATE TABLE child_notifications (
-        child_chat_id  TEXT NOT NULL,
-        turn_key       TEXT NOT NULL,
-        parent_chat_id TEXT NOT NULL,
-        outcome        TEXT,
-        state          TEXT NOT NULL CHECK(state IN ('pending','delivered','acked','superseded','dropped')),
-        created_at     INTEGER NOT NULL,
-        delivered_at   INTEGER,
-        PRIMARY KEY(child_chat_id, turn_key)
-    ) STRICT;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -113,6 +98,7 @@ impl DocsStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
+        ensure_child_notifications(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             failed_publications: Mutex::new(HashSet::new()),
@@ -912,6 +898,33 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Agent-spawned child settle notifications: claim-before-send ledger so a
+/// transition detected on the child's session row reaches the parent
+/// exactly once, even across engine restarts. `state` flows
+/// pending -> delivered|dropped|superseded|acked (acked outranks
+/// everything: `zeron chat wait`/`output` saw the turn before we sent).
+///
+/// Deliberately outside `MIGRATIONS`: upstream owns the numbered list and
+/// may add its own next entry, which a database that recorded this table
+/// as a numbered migration would then skip. `IF NOT EXISTS` also keeps
+/// databases that already hold the table (or a stale higher version row
+/// from an earlier build) working unchanged.
+fn ensure_child_notifications(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS child_notifications (
+            child_chat_id  TEXT NOT NULL,
+            turn_key       TEXT NOT NULL,
+            parent_chat_id TEXT NOT NULL,
+            outcome        TEXT,
+            state          TEXT NOT NULL CHECK(state IN ('pending','delivered','acked','superseded','dropped')),
+            created_at     INTEGER NOT NULL,
+            delivered_at   INTEGER,
+            PRIMARY KEY(child_chat_id, turn_key)
+        ) STRICT;",
+    )?;
+    Ok(())
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1179,6 +1192,85 @@ mod tests {
         );
         assert!(store.is_processed("cmd-1").unwrap());
         assert!(!store.mark_processed("cmd-1").unwrap());
+    }
+
+    #[test]
+    fn fresh_store_has_child_ledger_and_exactly_upstream_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        {
+            let conn = store.conn();
+            // Upstream owns the numbered list: exactly its six entries.
+            let applied: i64 = conn
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(applied, 6);
+            let ledger: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type='table' AND name='child_notifications'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ledger, 1);
+        }
+        assert!(
+            store
+                .claim_child_notification("c1", "done:t1", "p", "completed")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn stray_version_seven_keeps_ledger_working() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            // A database an earlier build migrated past upstream's list:
+            // the stray version row must be left alone — upstream's next
+            // release may claim it — while the ledger table keeps working.
+            let store = DocsStore::open(dir.path()).unwrap();
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (7, 0)",
+                    [],
+                )
+                .unwrap();
+        }
+        let store = DocsStore::open(dir.path()).unwrap();
+        {
+            let conn = store.conn();
+            let ledger: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type='table' AND name='child_notifications'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ledger, 1);
+            let version_seven: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 7",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version_seven, 1);
+        }
+        assert!(
+            store
+                .claim_child_notification("c1", "done:t1", "p", "completed")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_child_notification("c1", "done:t1", "p", "completed")
+                .unwrap()
+        );
     }
 }
 
