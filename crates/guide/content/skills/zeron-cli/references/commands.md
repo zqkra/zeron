@@ -91,5 +91,6 @@ zeron guide [chapter]
 
 ## Exit codes
 
-0 ok/completed · 1 error · 2 awaiting input · 3 errored turn ·
-4 interrupted · 5 limit reached · 124 timed out.
+0 ok/completed · 1 error — also usage errors (unknown command, bad flag) ·
+2 awaiting input · 3 errored turn · 4 interrupted · 5 limit reached ·
+124 timed out.

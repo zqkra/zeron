@@ -145,7 +145,16 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            std::process::exit(usage_exit_code(
+                error.exit_code(),
+                invoked_command(std::env::args().skip(1)).as_deref(),
+            ));
+        }
+    };
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;
@@ -331,6 +340,41 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The exit code for a clap parse failure. Help and version still exit 0.
+/// Everything else is a usage error: on the agent-facing commands (`chat`,
+/// `harness`, `model`, `guide`) that is 1 — those commands reserve 2 for
+/// "awaiting input" — while every other command keeps clap's default 2.
+fn usage_exit_code(clap_code: i32, invoked: Option<&str>) -> i32 {
+    if clap_code == 0 {
+        return 0;
+    }
+    match invoked {
+        Some("chat" | "harness" | "model" | "guide") => 1,
+        _ => clap_code,
+    }
+}
+
+/// The invoked subcommand: the first argv token (after the binary name)
+/// that is not a global flag. `--wait-for-exit <pid>` (Windows) is the only
+/// global flag carrying a separate value, so its value is skipped.
+fn invoked_command(args: impl Iterator<Item = String>) -> Option<String> {
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg.starts_with('-') {
+            if arg == "--wait-for-exit" {
+                skip_value = true;
+            }
+            continue;
+        }
+        return Some(arg);
+    }
+    None
 }
 
 #[cfg(windows)]
@@ -772,5 +816,41 @@ mod tests {
                 .as_deref(),
             Some(injected.as_path())
         );
+    }
+
+    fn argv(argv: &[&str]) -> Option<String> {
+        invoked_command(argv.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn usage_exit_code_maps_agent_commands_to_one() {
+        for invoked in ["chat", "harness", "model", "guide"] {
+            assert_eq!(usage_exit_code(2, Some(invoked)), 1, "{invoked}");
+        }
+        assert_eq!(usage_exit_code(2, Some("status")), 2);
+        assert_eq!(usage_exit_code(2, Some("headless")), 2);
+        assert_eq!(usage_exit_code(2, None), 2);
+        // Help and version keep their exit 0 on every command.
+        assert_eq!(usage_exit_code(0, Some("chat")), 0);
+        assert_eq!(usage_exit_code(0, Some("status")), 0);
+    }
+
+    #[test]
+    fn invoked_command_skips_global_flags() {
+        assert_eq!(argv(&["chat", "spawn"]).as_deref(), Some("chat"));
+        assert_eq!(
+            argv(&["--wait-for-exit", "42", "chat"]).as_deref(),
+            Some("chat")
+        );
+        assert_eq!(
+            argv(&["--wait-for-exit=42", "model"]).as_deref(),
+            Some("model")
+        );
+        assert_eq!(
+            argv(&["--verbose", "guide", "chats"]).as_deref(),
+            Some("guide")
+        );
+        assert_eq!(argv(&[]), None);
+        assert_eq!(argv(&["--help"]), None);
     }
 }

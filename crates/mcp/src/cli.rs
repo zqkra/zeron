@@ -221,7 +221,8 @@ fn unknown_subcommand(args: &[String]) -> i32 {
         Err(error) => {
             eprint!("{}", error.render());
             eprintln!("hint: run `zeron chat --help` or `zeron guide chats`");
-            2
+            // Usage errors exit 1 — 2 is reserved for "awaiting input".
+            1
         }
         // A captured name is by definition not a real subcommand; this arm
         // exists only so a surprise parse success cannot report ok.
@@ -2117,6 +2118,6 @@ mod tests {
             ChatCommand::Unknown(args) => assert_eq!(args[0], "reed"),
             _ => panic!("expected the catch-all"),
         }
-        assert_eq!(unknown_subcommand(&["reed".into()]), 2);
+        assert_eq!(unknown_subcommand(&["reed".into()]), 1);
     }
 }

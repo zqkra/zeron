@@ -9,7 +9,7 @@ with `--json` to see its fields rather than guessing names.
 | Code | Meaning |
 |------|---------|
 | 0    | ok / turn completed |
-| 1    | error (the message on stderr says what) |
+| 1    | error (the message on stderr says what) — also usage errors: unknown command, bad flag |
 | 2    | the chat is awaiting input — use `zeron chat answer` |
 | 3    | the turn errored — read `zeron chat log` or `show` for the failure |
 | 4    | the turn was interrupted |
