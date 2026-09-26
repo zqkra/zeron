@@ -656,6 +656,56 @@ pub struct UploadProgress {
 
 pub(crate) const CANVAS_PANEL_PREFIX: &str = "space-canvas:";
 
+/// Children of each chat, grouped by parent id and split by spawn origin —
+/// non-archived rows only, indices into [`AppState::chats`]. Built in one
+/// pass per [`AppState::apply_chats`] so per-row readers look up O(children)
+/// instead of scanning the whole list once per visible row.
+#[derive(Debug, Default)]
+pub(crate) struct ChildrenIndex {
+    /// `spawned_by_agent` children per parent, sidebar-tree order:
+    /// `created_at` newest first, stable by id.
+    pub agents: std::collections::HashMap<String, Vec<usize>>,
+    /// Every child per parent (agent- or user-spawned), most recent activity
+    /// first — the activity menu's child-row order.
+    pub activity: std::collections::HashMap<String, Vec<usize>>,
+}
+
+impl ChildrenIndex {
+    fn build(chats: &[Chat]) -> Self {
+        let mut index = ChildrenIndex::default();
+        for (ix, chat) in chats.iter().enumerate() {
+            let Some(parent) = chat.parent_chat_id.as_deref() else {
+                continue;
+            };
+            if chat.archived {
+                continue;
+            }
+            if chat.spawned_by_agent {
+                index.agents.entry(parent.to_owned()).or_default().push(ix);
+            }
+            index
+                .activity
+                .entry(parent.to_owned())
+                .or_default()
+                .push(ix);
+        }
+        for children in index.agents.values_mut() {
+            children.sort_by(|&a, &b| {
+                chats[b]
+                    .created_at
+                    .cmp(&chats[a].created_at)
+                    .then_with(|| chats[a].id.cmp(&chats[b].id))
+            });
+        }
+        for children in index.activity.values_mut() {
+            children.sort_by_key(|&ix| {
+                std::cmp::Reverse(chats[ix].last_message_at.unwrap_or(chats[ix].created_at))
+            });
+        }
+        index
+    }
+}
+
 /// Per-space key for new-session-canvas chrome (terminal tabs, panel flags).
 pub fn canvas_panel_key(space_id: Option<&str>) -> String {
     format!("{CANVAS_PANEL_PREFIX}{}", space_id.unwrap_or(""))
@@ -689,6 +739,11 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
+    /// Children of each chat keyed by parent id — non-archived only, split by
+    /// spawn origin. Rebuilt inside [`Self::apply_chats`] (one pass over the
+    /// list) so per-row readers like the sidebar tree and the activity menu
+    /// index straight into `chats` instead of scanning it per row.
+    pub(crate) children_by_parent: ChildrenIndex,
     /// Fork RPC may arrive ahead of its registry row on a remote device.
     pending_side_chat: Option<Chat>,
     pub sessions: Vec<Session>,
@@ -814,6 +869,7 @@ impl AppState {
             connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
+            children_by_parent: ChildrenIndex::default(),
             pending_side_chat: None,
             sessions: Vec::new(),
             sidebar_preferences: SidebarPreferencesState::default(),
@@ -1026,6 +1082,12 @@ impl AppState {
         true
     }
 
+    /// Direct `chats` writes that skip [`Self::apply_chats`] (the side-chat
+    /// mirror state, tests) must refresh the derived child index themselves.
+    pub(crate) fn refresh_children_index(&mut self) {
+        self.children_by_parent = ChildrenIndex::build(&self.chats);
+    }
+
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         if let Some(pending) = &self.pending_side_chat {
             if chats.iter().any(|chat| chat.id == pending.id) {
@@ -1036,6 +1098,7 @@ impl AppState {
         }
         sort_chats(&mut chats);
         self.chats = chats;
+        self.children_by_parent = ChildrenIndex::build(&self.chats);
         self.chats_synced = true;
         self.transcript_cache
             .retain(|cached| self.chats.iter().any(|c| c.id == cached.chat_id));
@@ -1949,6 +2012,7 @@ impl AppState {
         if !state.chats.iter().any(|c| c.id == chat.id) {
             state.chats.push(chat.clone());
         }
+        state.refresh_children_index();
         state.spaces = source.spaces.clone();
         state.devices = source.devices.clone();
         state.data_dir = source.data_dir.clone();

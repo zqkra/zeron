@@ -891,13 +891,13 @@ pub(crate) fn child_chat_rows(
     now: DateTime<Utc>,
 ) -> Vec<ChildChatRow> {
     let mut rows: Vec<ChildChatRow> = state
-        .chats
-        .iter()
-        .filter(|chat| {
-            !chat.archived
-                && chat.parent_chat_id.as_deref() == Some(chat_id)
-                && chat.spawned_by_agent == spawned_by_agent
-        })
+        .children_by_parent
+        .activity
+        .get(chat_id)
+        .into_iter()
+        .flatten()
+        .map(|&ix| &state.chats[ix])
+        .filter(|chat| chat.spawned_by_agent == spawned_by_agent)
         .map(|chat| {
             let activity = chat.last_message_at.unwrap_or(chat.created_at);
             ChildChatRow {
@@ -991,6 +991,7 @@ mod tests {
                 let mut state = AppState::new();
                 state.selected_chat = Some("main".into());
                 state.chats = vec![chat("main", None, 60), chat("child", Some("main"), 1)];
+                state.refresh_children_index();
                 state.transcript = vec![entry(vec![spawn(
                     "t1",
                     "Agent: verify",
@@ -1102,6 +1103,7 @@ mod tests {
         let state = activity.read_with(cx, |activity, _| activity.state.clone());
         state.update(cx, |state, cx| {
             state.chats.push(chat("other-child", Some("other"), 1));
+            state.refresh_children_index();
             cx.notify();
         });
         click(cx, "chat-activity-trigger");
@@ -1117,6 +1119,7 @@ mod tests {
         click(cx, "chat-activity-trigger");
         state.update(cx, |state, cx| {
             state.chats.last_mut().unwrap().archived = true;
+            state.refresh_children_index();
             cx.notify();
         });
         assert!(cx.debug_bounds("chat-activity-trigger").is_none());
@@ -1255,11 +1258,13 @@ mod tests {
     #[test]
     fn child_chat_rows_split_agent_spawns_from_side_chats() {
         let mut state = AppState::new();
-        state.apply_chats(vec![chat("main", None, 60)]);
         let mut spawned = chat("agent-child", Some("main"), 5);
         spawned.spawned_by_agent = true;
-        state.chats.push(spawned);
-        state.chats.push(chat("side", Some("main"), 3));
+        state.apply_chats(vec![
+            chat("main", None, 60),
+            spawned,
+            chat("side", Some("main"), 3),
+        ]);
         assert_eq!(
             child_chat_rows(&state, "main", true, Utc::now())
                 .iter()

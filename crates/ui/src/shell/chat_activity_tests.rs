@@ -48,6 +48,7 @@ fn setup(cx: &mut TestAppContext) -> (Entity<Shell>, &mut VisualTestContext) {
                       "createdAt": Utc::now(), "parentChatId": "parent", "title": "Side chat" }
                 ]))
                 .unwrap();
+                state.refresh_children_index();
                 state
             });
             Shell::new(

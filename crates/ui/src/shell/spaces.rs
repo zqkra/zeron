@@ -1171,6 +1171,7 @@ mod pinned_session_tests {
                     archived.id = "archived".into();
                     archived.archived = true;
                     state.chats.push(archived);
+                    state.refresh_children_index();
                 });
                 shell
             }))
@@ -1832,23 +1833,15 @@ pub(super) struct AgentSubtree {
 /// the chat itself stays reachable by id/palette).
 pub(super) const SIDEBAR_TREE_DEPTH: usize = 4;
 
-/// `spawned_by_agent` children of `parent`, non-archived, newest first.
+/// `spawned_by_agent` children of `parent`, non-archived, newest first —
+/// read off the prebuilt index, never by scanning `chats`.
 fn agent_children<'a>(state: &'a AppState, parent_id: &str) -> Vec<&'a zeron_proto::Chat> {
-    let mut children: Vec<_> = state
-        .chats
-        .iter()
-        .filter(|chat| {
-            chat.spawned_by_agent
-                && !chat.archived
-                && chat.parent_chat_id.as_deref() == Some(parent_id)
-        })
-        .collect();
-    children.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    children
+    state
+        .children_by_parent
+        .agents
+        .get(parent_id)
+        .map(|children| children.iter().map(|&ix| &state.chats[ix]).collect())
+        .unwrap_or_default()
 }
 
 fn agent_subtree(
@@ -6991,6 +6984,54 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["newer", "older"]);
+        let indexed: Vec<&str> = state
+            .children_by_parent
+            .agents
+            .get("p")
+            .into_iter()
+            .flatten()
+            .map(|&ix| state.chats[ix].id.as_str())
+            .collect();
+        assert_eq!(indexed, ids);
+    }
+
+    #[test]
+    fn children_index_refreshes_when_chats_change() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![agent_chat("kid", "p", 10)]);
+        let indexed: Vec<&str> = state
+            .children_by_parent
+            .agents
+            .get("p")
+            .into_iter()
+            .flatten()
+            .map(|&ix| state.chats[ix].id.as_str())
+            .collect();
+        assert_eq!(indexed, ["kid"]);
+
+        // Reparent it, archive one sibling, spawn another — the next
+        // apply_chats rebuilds both views of the index.
+        let mut retired = agent_chat("kid", "other", 10);
+        retired.archived = true;
+        state.apply_chats(vec![retired, agent_chat("fresh", "p", 20)]);
+
+        assert_eq!(
+            agent_children(&state, "p")
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
+        assert!(!state.children_by_parent.agents.contains_key("other"));
+        let activity: Vec<&str> = state
+            .children_by_parent
+            .activity
+            .get("p")
+            .into_iter()
+            .flatten()
+            .map(|&ix| state.chats[ix].id.as_str())
+            .collect();
+        assert_eq!(activity, ["fresh"]);
     }
 
     #[test]
