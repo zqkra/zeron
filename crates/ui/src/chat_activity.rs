@@ -731,8 +731,11 @@ impl Render for ChatActivity {
                 }
             }))
             .child(
+                // 16px like the count badge beside it: an odd size lands the
+                // glyph half a pixel off the row's center and it reads a
+                // pixel higher than the badge and the usage rings.
                 icon(icons::BOT)
-                    .size(px(15.0))
+                    .size(px(16.0))
                     .text_color(if self.is_open() {
                         theme.text
                     } else {
