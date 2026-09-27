@@ -1627,13 +1627,14 @@ pub fn rows_for_entry(
         // `@chat:` pills scan the PROJECTED text — file-mention rewrites may
         // have shifted every byte. The sender's label range is recomputed on
         // it too so a projected mention in the header can't misalign it.
-        let mut chat_refs: Vec<BubbleChatRef> = zeron_proto::orchestration::chat_mentions(&text)
-            .into_iter()
-            .map(|m| BubbleChatRef {
-                range: m.range,
-                chat_id: m.chat_id.to_string(),
-            })
-            .collect();
+        let mut chat_refs: Vec<BubbleChatRef> =
+            zeron_proto::orchestration::chat_display_mentions(&text)
+                .into_iter()
+                .map(|m| BubbleChatRef {
+                    range: m.range,
+                    chat_id: m.chat_id.to_string(),
+                })
+                .collect();
         let sender_label = sender.and_then(|sender| {
             // The synthesized header survives mention projection untouched.
             let range = text
@@ -3753,12 +3754,22 @@ impl Transcript {
             self.list.remeasure();
             cx.notify();
         }
+        // Tokens are full ids OR the `<prefix>…` short form, so resolution
+        // goes through the CLI-style target resolver (exact id → unique
+        // prefix → exact title); unknown and ambiguous tokens degrade to
+        // the muted "Unavailable chat" pill.
         let resolved: HashMap<String, crate::chat_pill::ChatRef> = {
             let state = self.state.read(cx);
             self.chat_refs
                 .iter()
                 .chain(pending.iter())
-                .map(|id| (id.clone(), crate::chat_pill::ChatRef::resolve(state, id)))
+                .map(|id| {
+                    (
+                        id.clone(),
+                        crate::chat_pill::ChatRef::resolve_target(state, id)
+                            .unwrap_or_else(|| crate::chat_pill::ChatRef::unavailable(id)),
+                    )
+                })
                 .collect()
         };
         let misses = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
@@ -3796,9 +3807,12 @@ impl Transcript {
             let open = open.clone();
             Rc::new(
                 move |chat_id: &str, _window: &mut Window, cx: &mut gpui::App| {
-                    let chat = crate::chat_pill::ChatRef::resolve(state.read(cx), chat_id);
+                    // The token may be a short prefix: resolve first, then
+                    // key and open the card by the OWNED chat's full id.
+                    let chat = crate::chat_pill::ChatRef::resolve_target(state.read(cx), chat_id)
+                        .unwrap_or_else(|| crate::chat_pill::ChatRef::unavailable(chat_id));
                     let theme = Theme::of(cx).clone();
-                    let chat_id = chat_id.to_owned();
+                    let chat_id = chat.chat_id.clone();
                     // The sole-mention card is the spawn chip's chrome — 38px
                     // slot, 30px card, hairline + ink wash — with the shared
                     // `chat_chip` (harness mark · title · status glyph) as its
@@ -16179,6 +16193,83 @@ mod tests {
                     "a late-arriving chat row must heal the pill"
                 );
                 assert_eq!(resolved.title.as_ref(), "gamma");
+            });
+        });
+    }
+
+    /// A short `@chat:<prefix>…` mention resolves like the CLI's unique-prefix
+    /// lookup: the pill lands on the owning chat's full id and live title,
+    /// copy keeps the written token, and an ambiguous or dead prefix degrades
+    /// to the muted "Unavailable chat" pill rather than guessing.
+    #[gpui::test]
+    fn short_mentions_resolve_by_unique_prefix(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+            let full = "ba6888c8-6e5b-4c9f-8c35-1c2d3e4f5a6b";
+            state.update(cx, |state, _| {
+                state.apply_chats(vec![child_chat(full, Some("Reviewer"), 10)]);
+            });
+            // One assistant paragraph and one user bubble mention the same
+            // chat by its 8-char prefix + ellipsis.
+            let reply = assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![text_part("t1", "Launched @chat:ba6888c8... to review")],
+            );
+            let mut prompt = assistant("u1", MessageStatus::Complete, vec![]);
+            prompt.role = MessageRole::User;
+            prompt.status = None;
+            prompt.parts = vec![text_part("t0", "Asked @chat:ba6888c8… to look")];
+            transcript.update(cx, |this, cx| {
+                this.rows = rows_for_entry(&reply, false, false, &mut parse);
+                this.rows
+                    .extend(rows_for_entry(&prompt, false, false, &mut parse));
+                let RowKind::User { chat_refs, .. } = &this.rows[1].kind else {
+                    panic!("expected a user row");
+                };
+                assert_eq!(chat_refs.len(), 1);
+                assert_eq!(chat_refs[0].chat_id, "ba6888c8");
+                // The bubble's stored range spans the ellipsis too.
+                assert_eq!(chat_refs[0].range, 6..23);
+                this.refresh_chat_refs(cx);
+                assert!(this.chat_refs.contains("ba6888c8"));
+                let ui = this.chat_ui(cx);
+                let resolved = (ui.resolve)("ba6888c8");
+                assert!(resolved.known, "the prefix must resolve to its chat");
+                assert_eq!(resolved.chat_id, full);
+                assert_eq!(resolved.title.as_ref(), "Reviewer");
+                // Copy yields the raw written token, ellipsis included.
+                assert_eq!(
+                    this.rows[0].copy_text.as_deref(),
+                    Some("Launched @chat:ba6888c8... to review")
+                );
+                assert_eq!(
+                    this.rows[1].copy_text.as_deref(),
+                    Some("Asked @chat:ba6888c8… to look")
+                );
+            });
+            // A second chat sharing the prefix makes it ambiguous — the pill
+            // degrades instead of guessing (apply_chats replaces the list).
+            state.update(cx, |state, cx| {
+                state.apply_chats(vec![
+                    child_chat(full, Some("Reviewer"), 10),
+                    child_chat("ba6888c8-ffff-4c9f-8c35-1c2d3e4f5a6b", Some("Other"), 20),
+                ]);
+                cx.notify();
+            });
+            transcript.update(cx, |this, cx| {
+                this.refresh_chat_refs(cx);
+                let ui = this.chat_ui(cx);
+                let resolved = (ui.resolve)("ba6888c8");
+                assert!(!resolved.known, "an ambiguous prefix must not guess");
+                assert_eq!(resolved.title.as_ref(), "Unavailable chat");
+                // A dead prefix never resolves either.
+                assert!(!(ui.resolve)("deadbeef").known);
             });
         });
     }

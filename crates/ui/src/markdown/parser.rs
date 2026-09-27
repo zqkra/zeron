@@ -581,10 +581,12 @@ fn bare_url_len(text: &str) -> usize {
     url.len()
 }
 
-/// Mark `@chat:<uuid>` mentions (zeron_proto::orchestration). Plain runs split
-/// around each mention; a code span upgrades only when its whole text is one
-/// mention; link text never matches. Fenced code never reaches here — blocks,
-/// not inline runs. Idempotent like [`autolink_runs`].
+/// Mark `@chat:` mentions for pill display (zeron_proto::orchestration's
+/// display scanner: strict full uuids plus the short `<prefix>…` form agents
+/// type). Plain runs split around each mention; a code span upgrades only
+/// when its whole text is one mention; link text never matches. Fenced code
+/// never reaches here — blocks, not inline runs. Idempotent like
+/// [`autolink_runs`].
 fn mention_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out = Vec::with_capacity(runs.len());
     for run in runs {
@@ -593,7 +595,7 @@ fn mention_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
             continue;
         }
         if run.style.code {
-            let mentions = zeron_proto::orchestration::chat_mentions(&run.text);
+            let mentions = zeron_proto::orchestration::chat_display_mentions(&run.text);
             let exact = mentions
                 .first()
                 .filter(|m| mentions.len() == 1 && m.range == (0..run.text.len()))
@@ -603,7 +605,7 @@ fn mention_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
             out.push(run);
             continue;
         }
-        let mentions = zeron_proto::orchestration::chat_mentions(&run.text);
+        let mentions = zeron_proto::orchestration::chat_display_mentions(&run.text);
         if mentions.is_empty() {
             out.push(run);
             continue;
@@ -1274,6 +1276,26 @@ mod tests {
         // Tight list items and block quotes mark mentions too.
         assert_eq!(chat_runs(&format!("- @chat:{CHAT_ID}")).len(), 1);
         assert_eq!(chat_runs(&format!("> @chat:{CHAT_ID}")).len(), 1);
+    }
+
+    #[test]
+    fn chat_mentions_upgrade_short_prefix_tokens_glued_to_an_ellipsis() {
+        // The abbreviated form agents type upgrades too; the run keeps the
+        // ellipsis so selection and copy still yield the written token.
+        assert_eq!(
+            chat_runs("Launched @chat:ba6888c8... to review"),
+            [("@chat:ba6888c8...".to_string(), "ba6888c8".to_string())]
+        );
+        // The one-char ellipsis, and a code span that IS one short mention.
+        assert_eq!(
+            chat_runs("`@chat:ba6888c8…`"),
+            [("@chat:ba6888c8…".to_string(), "ba6888c8".to_string())]
+        );
+        // A bare prefix, or an ellipsis glued to more text, stays plain —
+        // a still-streaming id can't become a pill mid-write.
+        assert!(chat_runs("see @chat:ba6888c8").is_empty());
+        assert!(chat_runs("see @chat:ba6888c8...x").is_empty());
+        assert!(chat_runs("`see @chat:ba6888c8...`").is_empty());
     }
 
     #[test]

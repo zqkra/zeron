@@ -2022,17 +2022,20 @@ fn sole_file_reference(runs: &[InlineRun], workspace_root: &str) -> Option<Strin
 }
 
 /// The paragraph is exactly one `@chat:` mention (whitespace-only runs aside).
+/// A mention run's text is the whole token, so the short form's trailing
+/// ellipsis (`...` or `…`) rides along on the resolved prefix.
 fn sole_chat_mention(runs: &[InlineRun]) -> Option<String> {
     let mut id: Option<&str> = None;
     for run in runs.iter().filter(|run| !run.text.trim().is_empty()) {
         let chat = run.style.chat.as_deref()?;
+        let full = format!(
+            "{}{}",
+            zeron_proto::orchestration::CHAT_MENTION_PREFIX,
+            chat
+        );
+        let token = run.text.trim();
         if id.is_some()
-            || run.text.trim()
-                != format!(
-                    "{}{}",
-                    zeron_proto::orchestration::CHAT_MENTION_PREFIX,
-                    chat
-                )
+            || (token != full && token != format!("{full}...") && token != format!("{full}…"))
         {
             return None;
         }

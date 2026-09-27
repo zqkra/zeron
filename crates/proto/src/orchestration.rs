@@ -219,6 +219,71 @@ pub fn chat_mentions(text: &str) -> Vec<ChatMention<'_>> {
     out
 }
 
+/// Every `@chat:` mention to upgrade to a pill in rendered prose: the strict
+/// full-uuid form AND the short form agents type — an id prefix immediately
+/// followed by an ellipsis (`...` or `…`). The short form's `chat_id` is the
+/// prefix WITHOUT the ellipsis; `range` covers the whole `@chat:…` token
+/// including the ellipsis so a pill replaces it entirely. Resolution (unique
+/// id-prefix) happens in the UI. Never used for wire or CLI-output parsing.
+pub fn chat_display_mentions(text: &str) -> Vec<ChatMention<'_>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(found) = text[at..].find(CHAT_MENTION_PREFIX) {
+        let start = at + found;
+        let id_start = start + CHAT_MENTION_PREFIX.len();
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            at = id_start;
+            continue;
+        }
+        // A strict full uuid wins at this occurrence — same shape and
+        // boundary rules as [`chat_mentions`].
+        let id_end = id_start + 36;
+        if id_end <= text.len()
+            && text.is_char_boundary(id_end)
+            && is_uuid(&text[id_start..id_end])
+            && (id_end == text.len()
+                || !matches!(bytes[id_end], b'-' | b'_') && !bytes[id_end].is_ascii_alphanumeric())
+        {
+            out.push(ChatMention {
+                range: start..id_end,
+                chat_id: &text[id_start..id_end],
+            });
+            at = id_end;
+            continue;
+        }
+        // Otherwise the short form qualifies only when the hex/dash run is
+        // at least 8 chars and is immediately followed by an ellipsis — a
+        // still-streaming uuid continues with `-` and more hex, not dots,
+        // so it never matches early. The mention's own boundary rule moves
+        // behind the ellipsis: end of text or a char that is not `-`, `_`
+        // or alphanumeric.
+        let run_end = text[id_start..]
+            .find(|c: char| !c.is_ascii_hexdigit() && c != '-')
+            .map_or(text.len(), |rel| id_start + rel);
+        if run_end - id_start >= 8 {
+            let ellipsis = ["...", "…"]
+                .iter()
+                .find_map(|dots| text[run_end..].strip_prefix(*dots).map(|_| dots.len()));
+            if let Some(elen) = ellipsis {
+                let end = run_end + elen;
+                if end == text.len()
+                    || !matches!(bytes[end], b'-' | b'_') && !bytes[end].is_ascii_alphanumeric()
+                {
+                    out.push(ChatMention {
+                        range: start..end,
+                        chat_id: &text[id_start..run_end],
+                    });
+                    at = end;
+                    continue;
+                }
+            }
+        }
+        at = id_start;
+    }
+    out
+}
+
 /// One `(childChatId, turnKey)` the parent has consumed — acked keys are
 /// never delivered again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +510,66 @@ mod tests {
         let m = chat_mentions(&both);
         assert_eq!(m.len(), 2);
         assert_eq!(m[1].chat_id, up);
+    }
+
+    #[test]
+    fn display_mentions_match_full_uuids_and_ellipsis_short_forms() {
+        let id = "3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
+        // The full form is unchanged.
+        let only = format!("@chat:{id}");
+        let m = chat_display_mentions(&only);
+        assert_eq!(
+            m,
+            [ChatMention {
+                range: 0..42,
+                chat_id: id
+            }]
+        );
+        // The short form: an 8+ char prefix glued to `...`. The range covers
+        // the ellipsis so the pill replaces it; the id does not include it.
+        let short = "Launched @chat:ba6888c8... to review";
+        let m = chat_display_mentions(short);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].chat_id, "ba6888c8");
+        assert_eq!(&short[m[0].range.clone()], "@chat:ba6888c8...");
+        // The single-char ellipsis matches too.
+        let uni = "Launched @chat:ba6888c8… to review";
+        let m = chat_display_mentions(uni);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].chat_id, "ba6888c8");
+        assert_eq!(&uni[m[0].range.clone()], "@chat:ba6888c8…");
+        // Two short mentions on one line.
+        let both = "see @chat:ba6888c8... and @chat:deadbeef…!";
+        let m = chat_display_mentions(both);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].chat_id, "ba6888c8");
+        assert_eq!(m[1].chat_id, "deadbeef");
+        // A mixed line: full uuid then short.
+        let mixed = format!("@chat:{id} vs @chat:ba6888c8...");
+        let m = chat_display_mentions(&mixed);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].chat_id, id);
+        assert_eq!(m[1].chat_id, "ba6888c8");
+    }
+
+    #[test]
+    fn display_mentions_reject_incomplete_or_unbounded_forms() {
+        let id = "3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b";
+        // A bare prefix without the ellipsis is still-streaming text, not a
+        // mention.
+        assert!(chat_display_mentions("@chat:ba6888c8").is_empty());
+        // A uuid mid-stream: longer than 8 chars, but no ellipsis either.
+        assert!(chat_display_mentions("@chat:ba6888c8-6e5b-4c9f-8c35").is_empty());
+        // Fewer than 8 chars before the ellipsis never qualifies.
+        assert!(chat_display_mentions("@chat:ba6888c...").is_empty());
+        // Glued to a preceding alphanumeric, like an email local-part.
+        assert!(chat_display_mentions("foo@chat:ba6888c8...").is_empty());
+        // An alphanumeric glued to the ellipsis breaks the boundary.
+        assert!(chat_display_mentions("@chat:ba6888c8...x").is_empty());
+        assert!(chat_display_mentions("@chat:ba6888c8…-y").is_empty());
+        // Same trailing-token rules for the full form.
+        assert!(chat_display_mentions(&format!("@chat:{id}z")).is_empty());
+        assert!(chat_display_mentions(&format!("foo@chat:{id}")).is_empty());
     }
 
     #[test]
