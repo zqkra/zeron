@@ -611,7 +611,7 @@ fn build_watchers(
         let tx = kick_tx.clone();
         let watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                if event.is_ok() {
+                if event.as_ref().is_ok_and(is_checkout_change) {
                     let _ = tx.send(());
                 }
             });
@@ -629,6 +629,14 @@ fn build_watchers(
         }
     }
     watchers
+}
+
+/// Whether a watch event can change the checkout's diff. Opens and reads are
+/// not changes — and the sync's own git runs open files under both watched
+/// roots, so kicking on them would re-sync every checkout forever. A write
+/// still arrives as a modify event before its close.
+fn is_checkout_change(event: &notify::Event) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_))
 }
 
 /// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
@@ -1868,8 +1876,30 @@ pub async fn capture_turn_diff(
 mod watch_budget_tests {
     use super::{
         CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, has_non_utf8_status_path,
-        path_batches, watch_targets,
+        is_checkout_change, path_batches, watch_targets,
     };
+
+    #[test]
+    fn reads_do_not_kick_a_sync_but_writes_do() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind, RemoveKind,
+        };
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ] {
+            assert!(!is_checkout_change(&notify::Event::new(kind)), "{kind:?}");
+        }
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Any,
+        ] {
+            assert!(is_checkout_change(&notify::Event::new(kind)), "{kind:?}");
+        }
+    }
 
     #[test]
     fn path_batches_split_on_budget_and_keep_every_path() {
