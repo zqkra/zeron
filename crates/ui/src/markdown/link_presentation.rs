@@ -607,7 +607,11 @@ mod tests {
         opts.workspace_root = Some("/repo".into());
         opts.link = Some(LinkUi {
             source_session: Some("chat".into()),
-            file_roots: Some(Rc::new(vec!["/repo".into()])),
+            file_roots: Some(Rc::new(vec![crate::workspace_links::FileLinkRoot {
+                chat: Some("chat".into()),
+                root: "/repo".into(),
+                local: true,
+            }])),
             handler: Rc::new(|_, _, _| LinkOutcome::Rejected),
         });
         let shown = with_file_link_glyphs(&flat, &opts);

@@ -138,21 +138,27 @@ pub struct LinkUi {
     /// The ordered checkouts a file link may resolve against on this surface,
     /// the linking chat's own first. `None` renders no trailing open glyph
     /// and offers no file paths — previews and web-only surfaces.
-    pub file_roots: Option<Rc<Vec<String>>>,
+    pub(crate) file_roots: Option<Rc<Vec<crate::workspace_links::FileLinkRoot>>>,
     pub handler: Rc<dyn Fn(&LinkActivation, &mut Window, &mut gpui::App) -> LinkOutcome>,
 }
 
 impl LinkUi {
     /// The workspace file `target` resolves to under this surface's roots,
     /// when the link is one at all. Drives the trailing open glyph and the
-    /// "Copy file path" item; the click path re-resolves with owners.
-    pub(crate) fn file_link(
-        &self,
-        target: &str,
-    ) -> Option<crate::workspace_links::WorkspaceFileLink> {
+    /// menu's file rows; the click path re-resolves with owners. The
+    /// absolute path comes from the resolved root joined with the link's
+    /// workspace-relative path, never from the raw link text.
+    pub(crate) fn file_link(&self, target: &str) -> Option<crate::workspace_links::FileLink> {
         let roots = self.file_roots.as_deref()?;
-        crate::workspace_links::first_root_owning(target, roots.iter().map(String::as_str))
-            .map(|(_, link)| link)
+        let (ix, link) = crate::workspace_links::first_root_owning(
+            target,
+            roots.iter().map(|root| root.root.as_str()),
+        )?;
+        let root = &roots[ix];
+        Some(crate::workspace_links::FileLink {
+            absolute: root.absolute(&link),
+            local: root.local,
+        })
     }
 }
 

@@ -3538,13 +3538,13 @@ impl Shell {
             .map(|(_, state)| state)
             .unwrap_or_else(|| self.state.clone());
         let roots = owner_state.read(cx).file_link_roots(chat_id);
-        let root_refs: Vec<&str> = roots.iter().map(|(_, root)| root.as_str()).collect();
+        let root_refs: Vec<&str> = roots.iter().map(|root| root.root.as_str()).collect();
         let Some((ix, link)) = crate::workspace_links::first_root_owning(target, root_refs) else {
             return false;
         };
         // A project root has no chat of its own; its link opens in the
         // linking chat's file context.
-        let owner_chat = roots[ix].0.as_deref().unwrap_or(chat_id);
+        let owner_chat = roots[ix].chat.as_deref().unwrap_or(chat_id);
         let Some(owner) = self.link_owner(owner_chat, cx) else {
             return false;
         };

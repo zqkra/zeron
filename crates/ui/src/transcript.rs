@@ -8752,15 +8752,12 @@ impl Transcript {
     /// The ordered checkouts a file link from `chat_id` may open against:
     /// the chat's own, its agent-spawned descendants', its parent's, then
     /// this device's project roots.
-    fn file_link_roots(&self, chat_id: &str, cx: &gpui::App) -> Rc<Vec<String>> {
-        Rc::new(
-            self.state
-                .read(cx)
-                .file_link_roots(chat_id)
-                .into_iter()
-                .map(|(_, root)| root)
-                .collect(),
-        )
+    fn file_link_roots(
+        &self,
+        chat_id: &str,
+        cx: &gpui::App,
+    ) -> Rc<Vec<crate::workspace_links::FileLinkRoot>> {
+        Rc::new(self.state.read(cx).file_link_roots(chat_id))
     }
 
     /// The checkout a chat's files live in, from the registry row.

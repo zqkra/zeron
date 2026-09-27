@@ -1,6 +1,6 @@
 //! Safe resolution of agent-authored Markdown links into workspace files.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 const FILE_MENTION_SCHEME: &str = "zeron-file:";
 
@@ -24,6 +24,34 @@ pub(crate) struct WorkspaceFileLink {
     pub path: String,
     pub line: Option<u32>,
     pub column: Option<u32>,
+}
+
+/// One checkout a file link may resolve against, in priority order: a chat's
+/// working directory (its file context opens the match) or a bare project
+/// root — project roots carry no chat, so their links open in the linking
+/// chat's file context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileLinkRoot {
+    pub chat: Option<String>,
+    pub root: String,
+    /// The owner lives on this device — the file is on this disk, so the
+    /// link menu's system-level rows (default app, file manager) apply.
+    pub local: bool,
+}
+
+impl FileLinkRoot {
+    /// The on-disk path `link` names under this root — never built from the
+    /// raw link text, always from the resolved root join.
+    pub(crate) fn absolute(&self, link: &WorkspaceFileLink) -> PathBuf {
+        Path::new(&self.root).join(&link.path)
+    }
+}
+
+/// A file link's resolved match: the absolute path on the owning device
+/// and whether that device is this one.
+pub(crate) struct FileLink {
+    pub absolute: PathBuf,
+    pub local: bool,
 }
 
 pub(crate) fn resolve_workspace_file_link(
