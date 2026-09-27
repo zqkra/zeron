@@ -34,7 +34,7 @@ pub struct LinkRanges {
 struct Interaction {
     targets: Vec<LinkTarget>,
     focus: Vec<FocusHandle>,
-    menu_focus: [FocusHandle; 4],
+    menu_focus: [FocusHandle; 5],
     menu_focus_pending: Rc<Cell<bool>>,
     menu: Rc<RefCell<Option<(usize, Point<Pixels>)>>>,
     bounds: Bounds<Pixels>,
@@ -278,6 +278,18 @@ impl Element for LinkRanges {
                 let menu_focus = state.menu_focus.clone();
                 let pending = state.menu_focus_pending.clone();
                 let initial_focus = state.menu_focus[0].clone();
+                // A file link offers one more copy action; the tab cycle
+                // visits only the rows this menu actually mounts.
+                let file_path = self
+                    .ui
+                    .as_ref()
+                    .and_then(|ui| ui.file_link(&state.targets[index].original))
+                    .map(|link| link.path);
+                let cycle: Vec<usize> = if file_path.is_some() {
+                    vec![0, 1, 2, 3, 4]
+                } else {
+                    vec![0, 1, 2, 4]
+                };
                 let mut card = crate::popover::popover_card(&theme)
                     .child(
                         gpui::canvas(
@@ -303,19 +315,19 @@ impl Element for LinkRanges {
                                 window.refresh();
                             }
                             "tab" | "down" | "up" => {
-                                let current = menu_focus
+                                let current = cycle
                                     .iter()
-                                    .position(|focus| focus.is_focused(window))
+                                    .position(|ix| menu_focus[*ix].is_focused(window))
                                     .unwrap_or(0);
                                 let backwards = event.keystroke.key == "up"
                                     || (event.keystroke.key == "tab"
                                         && event.keystroke.modifiers.shift);
                                 let next = if backwards {
-                                    (current + menu_focus.len() - 1) % menu_focus.len()
+                                    (current + cycle.len() - 1) % cycle.len()
                                 } else {
-                                    (current + 1) % menu_focus.len()
+                                    (current + 1) % cycle.len()
                                 };
-                                window.focus(&menu_focus[next], cx);
+                                window.focus(&menu_focus[cycle[next]], cx);
                             }
                             _ => return,
                         }
@@ -368,6 +380,37 @@ impl Element for LinkRanges {
                     );
                 }
                 let open_in_zeron = crate::settings::current(cx).open_web_links_in_zeron;
+                // A resolved file link copies the workspace path it opens,
+                // the same one the transcript would reveal.
+                if let Some(path) = file_path {
+                    let copy_path = path;
+                    let menu = state.menu.clone();
+                    card = card.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("{}-link-{index}-copy-path", self.id),
+                        )
+                        .id("Copy file path")
+                        .child(
+                            icons::icon(icons::COPY)
+                                .size(px(16.))
+                                .text_color(theme.text_muted),
+                        )
+                        .child("Copy file path")
+                        .track_focus(&state.menu_focus[3])
+                        .role(Role::Button)
+                        .aria_label("Copy file path")
+                        .focus_visible(|s| s.bg(crate::theme::card_selected_bg()))
+                        .on_click(move |_, window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_path.clone(),
+                            ));
+                            menu.borrow_mut().take();
+                            window.refresh();
+                        }),
+                    );
+                }
                 let menu = state.menu.clone();
                 card = card.child(popover::menu_separator()).child(
                     popover::menu_row(
@@ -384,7 +427,7 @@ impl Element for LinkRanges {
                         )
                     }))
                     .child("Open links in Zeron")
-                    .track_focus(&state.menu_focus[3])
+                    .track_focus(&state.menu_focus[4])
                     .role(Role::Button)
                     .aria_label(if open_in_zeron {
                         "Open links in Zeron, checked"
@@ -517,6 +560,7 @@ mod tests {
                     let captured = seen.clone();
                     let ui = LinkUi {
                         source_session: Some("parent".into()),
+                        file_roots: None,
                         handler: Rc::new(move |a, _, _| {
                             *captured.borrow_mut() =
                                 Some((a.target.clone(), a.action, a.source_session.clone()));
@@ -584,6 +628,7 @@ mod rendered_tests {
             let activated = self.activated.clone();
             opts.link = Some(LinkUi {
                 source_session: Some("session".into()),
+                file_roots: None,
                 handler: Rc::new(move |a, _, _| {
                     activated.borrow_mut().push(a.clone());
                     LinkOutcome::Rejected

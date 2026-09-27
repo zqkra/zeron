@@ -135,7 +135,25 @@ pub use super::links::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
 #[derive(Clone)]
 pub struct LinkUi {
     pub source_session: Option<String>,
+    /// The ordered checkouts a file link may resolve against on this surface,
+    /// the linking chat's own first. `None` renders no trailing open glyph
+    /// and offers no file paths — previews and web-only surfaces.
+    pub file_roots: Option<Rc<Vec<String>>>,
     pub handler: Rc<dyn Fn(&LinkActivation, &mut Window, &mut gpui::App) -> LinkOutcome>,
+}
+
+impl LinkUi {
+    /// The workspace file `target` resolves to under this surface's roots,
+    /// when the link is one at all. Drives the trailing open glyph and the
+    /// "Copy file path" item; the click path re-resolves with owners.
+    pub(crate) fn file_link(
+        &self,
+        target: &str,
+    ) -> Option<crate::workspace_links::WorkspaceFileLink> {
+        let roots = self.file_roots.as_deref()?;
+        crate::workspace_links::first_root_owning(target, roots.iter().map(String::as_str))
+            .map(|(_, link)| link)
+    }
 }
 
 pub fn activate_link(
@@ -812,7 +830,13 @@ fn render_table(
                     .as_ref()
                     .filter(|ui| ui.source_session.is_some())
                     .map(|_| {
-                        super::link_presentation::present(&flat, px(560.), px(MD_TEXT_SIZE), window)
+                        super::link_presentation::present(
+                            &flat,
+                            px(560.),
+                            px(MD_TEXT_SIZE),
+                            window,
+                            opts,
+                        )
                     });
                 let flat = measured.as_ref().unwrap_or(&flat);
                 // Cell sources are single-line; guard anyway (same byte count,
@@ -922,6 +946,9 @@ pub struct FlatText {
     /// Resolved pills — displayed-text coordinates. Empty unless a
     /// [`RenderOptions::chats`] resolver is wired.
     pub pills: Vec<super::chat_pills::PillSpan>,
+    /// Reserved slots after resolved file links — displayed-text
+    /// coordinates. Each slot paints the trailing open glyph.
+    pub file_glyphs: Vec<Range<usize>>,
 }
 
 /// Inline-code tint: a text-safe use of the selected accent identity.
@@ -1041,6 +1068,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         code_ranges,
         chats,
         pills: Vec::new(),
+        file_glyphs: Vec::new(),
     }
 }
 
@@ -1269,6 +1297,14 @@ pub(super) fn flat_text_presented_element(
     let child = if flat.links.is_empty() {
         child
     } else {
+        // A resolved file link's hit range covers its reserved glyph slot,
+        // so the trailing open glyph activates the link too.
+        let glyph_end = |range: &std::ops::Range<usize>| {
+            flat.file_glyphs
+                .iter()
+                .find(|slot| slot.start == range.end)
+                .map_or(range.end, |slot| slot.end)
+        };
         super::link_interaction::LinkRanges {
             id: format!(
                 "{}-{}-t{ix}",
@@ -1286,7 +1322,7 @@ pub(super) fn flat_text_presented_element(
                 .iter()
                 .map(|(range, url)| {
                     (
-                        range.clone(),
+                        range.start..glyph_end(range),
                         LinkTarget::new(
                             flat.original
                                 .as_ref()
@@ -1300,6 +1336,19 @@ pub(super) fn flat_text_presented_element(
                 })
                 .collect(),
             ui: opts.link.clone(),
+        }
+        .into_any_element()
+    };
+    // Trailing open glyphs of resolved file links paint over the shaped
+    // text, under the pill overlays and their hitboxes.
+    let child = if flat.file_glyphs.is_empty() {
+        child
+    } else {
+        super::link_presentation::FileLinkGlyphs {
+            id: format!("{}-file-glyphs-{ix}", opts.row_key).into(),
+            child,
+            layout: link_layout.clone(),
+            slots: flat.file_glyphs.clone(),
         }
         .into_any_element()
     };
@@ -3122,6 +3171,7 @@ mod tests {
                     code_ranges: Vec::new(),
                     chats: Vec::new(),
                     pills: Vec::new(),
+                    file_glyphs: Vec::new(),
                 }),
             );
             cache.code.insert(
@@ -3168,6 +3218,7 @@ mod tests {
                 code_ranges: Vec::new(),
                 chats: Vec::new(),
                 pills: Vec::new(),
+                file_glyphs: Vec::new(),
             }),
         );
         cache.sync_generation(10);

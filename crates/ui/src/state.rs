@@ -670,6 +670,10 @@ pub(crate) struct ChildrenIndex {
     pub activity: std::collections::HashMap<String, Vec<usize>>,
 }
 
+/// How deep agent-spawned chats may nest. The file-link root walk never goes
+/// further than a spawn could ever reach.
+pub(crate) const MAX_SPAWN_DEPTH: usize = 4;
+
 impl ChildrenIndex {
     fn build(chats: &[Chat]) -> Self {
         let mut index = ChildrenIndex::default();
@@ -1171,6 +1175,67 @@ impl AppState {
         if self.selected_space.is_none() && !self.no_project {
             self.selected_space = self.first_space_on_picked_device();
         }
+    }
+
+    /// The ordered checkouts a file link from `chat_id` may resolve against:
+    /// the chat's own checkout, its agent-spawned descendants' (each child
+    /// works in its own worktree), its parent's, then every project root on
+    /// this device. Project roots have no owning chat — a link that matches
+    /// one opens in the linking chat's file context.
+    pub(crate) fn file_link_roots(&self, chat_id: &str) -> Vec<(Option<String>, String)> {
+        let mut roots: Vec<(Option<String>, String)> = Vec::new();
+        let mut push = |chat: Option<&str>, root: Option<&str>| {
+            let Some(root) = root.filter(|root| !root.is_empty()) else {
+                return;
+            };
+            if roots.iter().any(|(_, existing)| existing == root) {
+                return;
+            }
+            roots.push((chat.map(str::to_owned), root.to_owned()));
+        };
+        let cwd_of = |id: &str| {
+            self.chats
+                .iter()
+                .find(|chat| chat.id == id)
+                .and_then(|chat| chat.cwd.as_deref())
+        };
+        push(Some(chat_id), cwd_of(chat_id));
+        let mut frontier = vec![chat_id.to_owned()];
+        for _ in 0..MAX_SPAWN_DEPTH {
+            let mut next = Vec::new();
+            for parent in frontier {
+                let Some(children) = self.children_by_parent.agents.get(&parent) else {
+                    continue;
+                };
+                for &ix in children {
+                    let Some(child) = self.chats.get(ix) else {
+                        continue;
+                    };
+                    push(Some(&child.id), child.cwd.as_deref());
+                    next.push(child.id.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        if let Some(parent) = self
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.parent_chat_id.clone())
+        {
+            push(Some(&parent), cwd_of(&parent));
+        }
+        for space in self.spaces.iter().filter(|space| {
+            self.local_device_id
+                .as_deref()
+                .is_none_or(|local| space.device_id == local)
+        }) {
+            push(None, Some(space.path.as_str()));
+        }
+        roots
     }
 
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
@@ -4191,6 +4256,52 @@ mod tests {
         // No spaces at all: selection clears.
         state.apply_spaces(vec![]);
         assert_eq!(state.selected_space, None);
+    }
+
+    #[test]
+    fn file_link_roots_order_chat_children_parent_then_projects() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("dev".into());
+        let mut parent = chat("parent", 0, None);
+        parent.cwd = Some("/repo".into());
+        let mut child = chat("child", 1, None);
+        child.cwd = Some("/worktrees/child".into());
+        child.parent_chat_id = Some("parent".into());
+        child.spawned_by_agent = true;
+        let mut grandchild = chat("grand", 2, None);
+        grandchild.cwd = Some("/worktrees/grand".into());
+        grandchild.parent_chat_id = Some("child".into());
+        grandchild.spawned_by_agent = true;
+        state.apply_chats(vec![parent, child, grandchild]);
+        state.apply_spaces(vec![
+            space("local", "dev", "/projects/zeron", 0),
+            space("remote", "other", "/remote/only", 1),
+        ]);
+
+        let roots = state.file_link_roots("child");
+        assert_eq!(
+            roots,
+            vec![
+                (Some("child".into()), "/worktrees/child".into()),
+                (Some("grand".into()), "/worktrees/grand".into()),
+                (Some("parent".into()), "/repo".into()),
+                (None, "/projects/zeron".into()),
+            ],
+            "own checkout, agent children, parent, then this device's projects"
+        );
+
+        // An absolute path outside every known root never resolves.
+        let root_refs: Vec<&str> = roots.iter().map(|(_, root)| root.as_str()).collect();
+        assert_eq!(
+            crate::workspace_links::first_root_owning("/elsewhere/x.md", root_refs.clone()),
+            None
+        );
+        // A path under an agent child's worktree resolves to that root.
+        assert_eq!(
+            crate::workspace_links::first_root_owning("/worktrees/grand/src/lib.rs", root_refs)
+                .map(|(ix, link)| (roots[ix].0.clone(), link.path)),
+            Some((Some("grand".into()), "src/lib.rs".into()))
+        );
     }
 
     #[test]

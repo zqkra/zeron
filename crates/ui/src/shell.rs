@@ -51,16 +51,12 @@ use crate::settings::{
     platform_combo, sidebar_pin_profile_key,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
-    format_time_ago, org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator,
+    MAX_SPAWN_DEPTH, OrgRow, format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
-
-/// How deep agent-spawned chats may nest. File-link resolution and the
-/// report-link guard never walk further than a spawn could ever reach.
-const MAX_SPAWN_DEPTH: usize = 4;
 
 mod actions_ui;
 #[cfg(test)]
@@ -3228,6 +3224,7 @@ impl Shell {
         let shell = cx.weak_entity();
         crate::markdown::render::LinkUi {
             source_session,
+            file_roots: None,
             handler: std::rc::Rc::new(move |activation, window, cx| {
                 shell
                     .update(cx, |shell, cx| {
@@ -3527,8 +3524,8 @@ impl Shell {
     /// side chat's link resolves against, and edits, the side chat's files.
     /// When that checkout cannot own the target, agent-spawned descendants
     /// get the next word (each child works in its own worktree), then the
-    /// parent chat — the first known root that owns the path wins, and the
-    /// file opens in that chat's context.
+    /// parent chat, then this device's project roots — the first known root
+    /// that owns the path wins, and the file opens in that chat's context.
     fn open_workspace_file_link(
         &mut self,
         chat_id: &str,
@@ -3536,16 +3533,19 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let roots: Vec<(String, String)> = self
-            .file_link_candidates(chat_id, cx)
-            .into_iter()
-            .filter_map(|candidate| self.chat_cwd(&candidate, cx).map(|root| (candidate, root)))
-            .collect();
+        let owner_state = self
+            .link_owner(chat_id, cx)
+            .map(|(_, state)| state)
+            .unwrap_or_else(|| self.state.clone());
+        let roots = owner_state.read(cx).file_link_roots(chat_id);
         let root_refs: Vec<&str> = roots.iter().map(|(_, root)| root.as_str()).collect();
         let Some((ix, link)) = crate::workspace_links::first_root_owning(target, root_refs) else {
             return false;
         };
-        let Some(owner) = self.link_owner(&roots[ix].0, cx) else {
+        // A project root has no chat of its own; its link opens in the
+        // linking chat's file context.
+        let owner_chat = roots[ix].0.as_deref().unwrap_or(chat_id);
+        let Some(owner) = self.link_owner(owner_chat, cx) else {
             return false;
         };
 
@@ -3564,62 +3564,6 @@ impl Shell {
             cx,
         );
         true
-    }
-
-    /// The checkout a link may resolve against, in order: the linking chat,
-    /// its agent-spawned descendants (the spawn nesting limit bounds the
-    /// walk), then the parent chat.
-    fn file_link_candidates(&self, chat_id: &str, cx: &App) -> Vec<String> {
-        let state = self.state.read(cx);
-        let mut candidates = vec![chat_id.to_owned()];
-        let mut frontier = vec![chat_id.to_owned()];
-        for _ in 0..MAX_SPAWN_DEPTH {
-            let mut next = Vec::new();
-            for parent in frontier {
-                let Some(children) = state.children_by_parent.agents.get(&parent) else {
-                    continue;
-                };
-                for &ix in children {
-                    let Some(child) = state.chats.get(ix) else {
-                        continue;
-                    };
-                    if !candidates.contains(&child.id) {
-                        candidates.push(child.id.clone());
-                    }
-                    next.push(child.id.clone());
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
-        }
-        if let Some(parent) = state
-            .chats
-            .iter()
-            .find(|chat| chat.id == chat_id)
-            .and_then(|chat| chat.parent_chat_id.clone())
-            && !candidates.contains(&parent)
-        {
-            candidates.push(parent);
-        }
-        candidates
-    }
-
-    /// The checkout a chat's files live in, from the state that owns it: a
-    /// side chat resolves through its own state, everyone else through the
-    /// main one.
-    fn chat_cwd(&self, chat_id: &str, cx: &App) -> Option<String> {
-        let owner = self
-            .link_owner(chat_id, cx)
-            .map(|(_, state)| state)
-            .unwrap_or_else(|| self.state.clone());
-        owner
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == chat_id)
-            .and_then(|chat| chat.cwd.clone())
     }
 
     /// Whether `chat_id` is an agent-spawned descendant of a chat this panel
@@ -14679,7 +14623,9 @@ mod exit_regressions {
                     .unwrap()
                     .transcript
                     .clone();
-                let ui = child.read(cx).link_ui().unwrap();
+                let ui = child
+                    .update(cx, |transcript, cx| transcript.link_ui(cx))
+                    .unwrap();
                 assert_eq!(ui.source_session.as_deref(), Some("first-session"));
                 activation.action = LinkAction::Internal;
                 activation.source_session = ui.source_session;

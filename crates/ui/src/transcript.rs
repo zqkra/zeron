@@ -3714,15 +3714,6 @@ impl Transcript {
         self.workspace_link = Some(handler);
     }
 
-    pub(crate) fn link_ui(&self) -> Option<render::LinkUi> {
-        self.workspace_link.clone().map(|mut link| {
-            if link.source_session.is_none() {
-                link.source_session = self.chat_id.clone();
-            }
-            link
-        })
-    }
-
     /// `RenderOptions::chats` + the user bubble's pill ui: `resolve` reads a
     /// per-fingerprint snapshot of every referenced chat (flatten runs
     /// without `App`, so resolution must be captured here), `open` activates
@@ -7160,7 +7151,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
-                    link: self.link_ui(),
+                    link: self.link_ui(cx),
                     chats: (!self.chat_refs.is_empty()).then(|| self.chat_ui(cx)),
                     workspace_root: workspace_root.clone(),
                     code,
@@ -7211,7 +7202,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
-                    link: self.link_ui(),
+                    link: self.link_ui(cx),
                     chats: (!self.chat_refs.is_empty()).then(|| self.chat_ui(cx)),
                     workspace_root: workspace_root.clone(),
                     code,
@@ -8730,14 +8721,46 @@ impl Transcript {
         )
     }
 
-    /// The workspace-link handler bound to `source_chat_id`: a report body's
-    /// file links open against the reporting chat's checkout, exactly as if
-    /// they were clicked in that chat's own transcript.
-    fn link_ui_for(&self, source_chat_id: &SharedString) -> Option<render::LinkUi> {
+    /// The workspace-link handler bound to `source_chat_id`: report bodies
+    /// open their file links in the reporting chat's checkout, not the
+    /// transcript's, and the roots that chat resolves against come along for
+    /// the trailing open glyph.
+    fn link_ui_for(
+        &mut self,
+        source_chat_id: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<render::LinkUi> {
+        let roots = self.file_link_roots(source_chat_id, cx);
         self.workspace_link.clone().map(|mut link| {
             link.source_session = Some(source_chat_id.to_string());
+            link.file_roots = Some(roots);
             link
         })
+    }
+
+    /// The handler bound to this transcript's own chat — or to the session
+    /// its handler already names (a subagent tab reports under its parent).
+    pub(crate) fn link_ui(&mut self, cx: &mut Context<Self>) -> Option<render::LinkUi> {
+        let source = self
+            .workspace_link
+            .as_ref()
+            .and_then(|link| link.source_session.clone())
+            .or_else(|| self.chat_id.clone())?;
+        self.link_ui_for(&SharedString::from(source), cx)
+    }
+
+    /// The ordered checkouts a file link from `chat_id` may open against:
+    /// the chat's own, its agent-spawned descendants', its parent's, then
+    /// this device's project roots.
+    fn file_link_roots(&self, chat_id: &str, cx: &gpui::App) -> Rc<Vec<String>> {
+        Rc::new(
+            self.state
+                .read(cx)
+                .file_link_roots(chat_id)
+                .into_iter()
+                .map(|(_, root)| root)
+                .collect(),
+        )
     }
 
     /// The checkout a chat's files live in, from the registry row.
@@ -8761,7 +8784,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> RenderOptions {
         let mut opts = RenderOptions::settled(SharedString::from(format!("{fold_key}#body")));
-        opts.link = self.link_ui_for(source_chat_id);
+        opts.link = self.link_ui_for(source_chat_id, cx);
         opts.chats = (!self.chat_refs.is_empty()).then(|| self.chat_ui(cx));
         opts.workspace_root = self.chat_cwd(source_chat_id, cx);
         opts
@@ -16217,6 +16240,7 @@ mod tests {
             transcript.update(cx, |this, cx| {
                 this.set_workspace_link_handler(crate::markdown::render::LinkUi {
                     source_session: None,
+                    file_roots: None,
                     handler: std::rc::Rc::new(|_, _, _| {
                         crate::markdown::render::LinkOutcome::Rejected
                     }),
