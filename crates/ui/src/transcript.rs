@@ -3538,6 +3538,12 @@ pub struct Transcript {
     /// boundary invalidates only the live tail per commit.
     render_cache: Rc<RefCell<RenderCache>>,
     workspace_link: Option<render::LinkUi>,
+    /// File-link roots per linking chat, valid for one
+    /// `AppState::link_roots_revision`: every rendered row asks for them.
+    file_link_roots: (
+        u64,
+        HashMap<SharedString, Rc<Vec<crate::workspace_links::FileLinkRoot>>>,
+    ),
     rendered_rows: HashSet<SharedString>,
     /// Last UI typography generation reflected in `list` item measurements.
     /// Family and size changes can alter prose wrapping without changing row
@@ -4008,6 +4014,7 @@ impl Transcript {
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
             workspace_link: None,
+            file_link_roots: Default::default(),
             rendered_rows: HashSet::new(),
             typography_generation: crate::typography::generation(cx),
             content_width: crate::settings::transcript_width(cx),
@@ -8753,11 +8760,19 @@ impl Transcript {
     /// the chat's own, its agent-spawned descendants', its parent's, then
     /// this device's project roots.
     fn file_link_roots(
-        &self,
-        chat_id: &str,
+        &mut self,
+        chat_id: &SharedString,
         cx: &gpui::App,
     ) -> Rc<Vec<crate::workspace_links::FileLinkRoot>> {
-        Rc::new(self.state.read(cx).file_link_roots(chat_id))
+        let state = self.state.read(cx);
+        let (revision, memo) = &mut self.file_link_roots;
+        if *revision != state.link_roots_revision {
+            *revision = state.link_roots_revision;
+            memo.clear();
+        }
+        memo.entry(chat_id.clone())
+            .or_insert_with(|| Rc::new(state.file_link_roots(chat_id)))
+            .clone()
     }
 
     /// The checkout a chat's files live in, from the registry row.

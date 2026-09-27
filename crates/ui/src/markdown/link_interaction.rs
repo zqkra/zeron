@@ -278,19 +278,21 @@ impl Element for LinkRanges {
                 let menu_focus = state.menu_focus.clone();
                 let pending = state.menu_focus_pending.clone();
                 let initial_focus = state.menu_focus[0].clone();
-                // A resolved file link gains rows for the file itself
-                // between "Open in Zeron" and the web actions; the
-                // system-level ones mount only when the owning root lives
-                // on this device. The tab cycle visits only mounted rows.
+                // A resolved file link swaps the web actions for rows about
+                // the file itself: "Open in Zeron" opens it in the file
+                // viewer, and the system-level rows mount only when the
+                // owning root lives on this device. The tab cycle visits
+                // only mounted rows.
                 let file = self
                     .ui
                     .as_ref()
                     .and_then(|ui| ui.file_link(&state.targets[index].original));
                 let cycle: &[usize] = match &file {
-                    Some(file) if file.local => &[0, 1, 2, 3, 4, 5, 6],
-                    Some(_) => &[0, 3, 4, 5, 6],
+                    Some(file) if file.local => &[0, 1, 2, 3],
+                    Some(_) => &[0, 3],
                     None => &[0, 4, 5, 6],
                 };
+                let file_resolved = file.is_some();
                 let mut card = crate::popover::popover_card(&theme)
                     .child(
                         gpui::canvas(
@@ -352,7 +354,9 @@ impl Element for LinkRanges {
                     let target = state.targets[index].clone();
                     let ui = self.ui.clone();
                     let menu = state.menu.clone();
-                    let enabled = action == LinkAction::Copy || target.navigation.is_ok();
+                    let enabled = action == LinkAction::Copy
+                        || target.navigation.is_ok()
+                        || (action == LinkAction::Internal && file_resolved);
                     popover::menu_row(
                         &theme,
                         false,
@@ -403,7 +407,11 @@ impl Element for LinkRanges {
                 card = card.child(action_row(
                     LinkAction::Internal,
                     "Open in Zeron",
-                    icons::GLOBE,
+                    if file_resolved {
+                        icons::DOCUMENT
+                    } else {
+                        icons::GLOBE
+                    },
                     0,
                     "link-menu-open-zeron",
                 ));
@@ -444,59 +452,63 @@ impl Element for LinkRanges {
                         }),
                     ));
                 }
-                card = card.child(action_row(
-                    LinkAction::External,
-                    "Open in external browser",
-                    icons::ARROW_UP_RIGHT,
-                    4,
-                    "link-menu-open-external",
-                ));
-                card = card.child(action_row(
-                    LinkAction::Copy,
-                    "Copy link address",
-                    icons::COPY,
-                    5,
-                    "link-menu-copy-address",
-                ));
-                let open_in_zeron = crate::settings::current(cx).open_web_links_in_zeron;
-                let menu = state.menu.clone();
-                card = card.child(popover::menu_separator()).child(
-                    popover::menu_row(
-                        &theme,
-                        false,
-                        format!("{}-link-{index}-default-destination", self.id),
-                    )
-                    .id("Open links in Zeron")
-                    .debug_selector(|| "link-menu-default-destination".into())
-                    .child(div().w(px(16.)).flex_none().when(open_in_zeron, |el| {
-                        el.child(
-                            icons::icon(icons::CHECK)
-                                .size(px(16.))
-                                .text_color(theme.text_muted),
+                // Browser actions and the web-link preference mean nothing
+                // for a file on disk.
+                if !file_resolved {
+                    card = card.child(action_row(
+                        LinkAction::External,
+                        "Open in external browser",
+                        icons::ARROW_UP_RIGHT,
+                        4,
+                        "link-menu-open-external",
+                    ));
+                    card = card.child(action_row(
+                        LinkAction::Copy,
+                        "Copy link address",
+                        icons::COPY,
+                        5,
+                        "link-menu-copy-address",
+                    ));
+                    let open_in_zeron = crate::settings::current(cx).open_web_links_in_zeron;
+                    let menu = state.menu.clone();
+                    card = card.child(popover::menu_separator()).child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("{}-link-{index}-default-destination", self.id),
                         )
-                    }))
-                    .child("Open links in Zeron")
-                    .track_focus(&state.menu_focus[6])
-                    .role(Role::Button)
-                    .aria_label(if open_in_zeron {
-                        "Open links in Zeron, checked"
-                    } else {
-                        "Open links in Zeron, unchecked"
-                    })
-                    .focus_visible(|s| s.bg(crate::theme::card_selected_bg()))
-                    .on_click(move |_, window, cx| {
-                        crate::settings::update(
-                            crate::settings::SavePolicy::Immediate,
-                            cx,
-                            |settings| {
-                                settings.open_web_links_in_zeron = !open_in_zeron;
-                            },
-                        );
-                        menu.borrow_mut().take();
-                        cx.refresh_windows();
-                        window.refresh();
-                    }),
-                );
+                        .id("Open links in Zeron")
+                        .debug_selector(|| "link-menu-default-destination".into())
+                        .child(div().w(px(16.)).flex_none().when(open_in_zeron, |el| {
+                            el.child(
+                                icons::icon(icons::CHECK)
+                                    .size(px(16.))
+                                    .text_color(theme.text_muted),
+                            )
+                        }))
+                        .child("Open links in Zeron")
+                        .track_focus(&state.menu_focus[6])
+                        .role(Role::Button)
+                        .aria_label(if open_in_zeron {
+                            "Open links in Zeron, checked"
+                        } else {
+                            "Open links in Zeron, unchecked"
+                        })
+                        .focus_visible(|s| s.bg(crate::theme::card_selected_bg()))
+                        .on_click(move |_, window, cx| {
+                            crate::settings::update(
+                                crate::settings::SavePolicy::Immediate,
+                                cx,
+                                |settings| {
+                                    settings.open_web_links_in_zeron = !open_in_zeron;
+                                },
+                            );
+                            menu.borrow_mut().take();
+                            cx.refresh_windows();
+                            window.refresh();
+                        }),
+                    );
+                }
                 let mut popup = crate::popover::menu_at(
                     "transcript-link-actions",
                     position,
@@ -1152,10 +1164,10 @@ mod rendered_tests {
         });
     }
 
-    /// A resolved file link's context menu gains the file rows between
-    /// "Open in Zeron" and the web actions — the system-level ones only
-    /// when the owning root is on this device — and they act on the
-    /// resolved absolute path.
+    /// A resolved file link's context menu swaps the web actions for file
+    /// rows — the system-level ones only when the owning root is on this
+    /// device — which act on the resolved absolute path, and "Open in
+    /// Zeron" routes the file to the viewer.
     #[gpui::test]
     fn file_link_menu_offers_local_rows_and_acts_on_the_absolute_path(
         cx: &mut gpui::TestAppContext,
@@ -1170,10 +1182,11 @@ mod rendered_tests {
             root: "/repo dir".into(),
             local: true,
         }]);
+        let activated: Rc<RefCell<Vec<LinkActivation>>> = Rc::default();
         let (_view, cx) = cx.add_window_view(|_, _| Fixture {
             markdown: "see [lib](src/lib.rs) here".into(),
             width: 320.,
-            activated: Rc::default(),
+            activated: activated.clone(),
             file_roots: Some(roots),
         });
         let position = cx.update(|_, _| {
@@ -1187,13 +1200,20 @@ mod rendered_tests {
             "link-menu-open-default",
             "link-menu-show-in-folder",
             "link-menu-copy-path",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} should be mounted for a local file link"
+            );
+        }
+        for selector in [
             "link-menu-open-external",
             "link-menu-copy-address",
             "link-menu-default-destination",
         ] {
             assert!(
-                cx.debug_bounds(selector).is_some(),
-                "{selector} should be mounted for a local file link"
+                cx.debug_bounds(selector).is_none(),
+                "{selector} is a web-link row"
             );
         }
 
@@ -1217,11 +1237,22 @@ mod rendered_tests {
             copied.and_then(|item| item.text()).as_deref(),
             Some("/repo dir/src/lib.rs")
         );
+
+        // "Open in Zeron" is live for a file link and hands it to the
+        // owning surface as an internal open.
+        cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
+        let row = cx.debug_bounds("link-menu-open-zeron").unwrap().center();
+        cx.simulate_click(row, gpui::Modifiers::default());
+        let activated = activated.borrow();
+        let last = activated.last().expect("open in zeron activates the link");
+        assert_eq!(last.action, LinkAction::Internal);
+        assert_eq!(last.target.original, "src/lib.rs");
     }
 
     /// A root on another device resolves the link (the file opens through
     /// that chat's context) but cannot offer local system actions; a web
-    /// link shows no file rows at all.
+    /// link shows only the web rows.
     #[gpui::test]
     fn file_link_menu_hides_system_rows_for_remote_and_web_links(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -1254,15 +1285,16 @@ mod rendered_tests {
             });
             cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
             cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
+            assert!(cx.debug_bounds("link-menu-open-zeron").is_some());
             for selector in [
-                "link-menu-open-zeron",
                 "link-menu-open-external",
                 "link-menu-copy-address",
                 "link-menu-default-destination",
             ] {
-                assert!(
+                assert_eq!(
                     cx.debug_bounds(selector).is_some(),
-                    "{selector} should be mounted"
+                    !has_copy_path,
+                    "{selector} mounts only for web links"
                 );
             }
             for selector in ["link-menu-open-default", "link-menu-show-in-folder"] {
