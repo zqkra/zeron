@@ -1365,9 +1365,10 @@ impl ReportBody {
     }
 
     /// The collapsed report's target height: one rendered Markdown line, or
-    /// the whole body when it is shorter than that.
-    fn preview_height(&self) -> f32 {
-        REPORT_PREVIEW_HEIGHT.min(self.height())
+    /// the whole body when it is shorter than that. `full` is the body's
+    /// measured natural height (its source-line estimate before it lands).
+    fn preview_height(full: f32) -> f32 {
+        REPORT_PREVIEW_HEIGHT.min(full)
     }
 }
 
@@ -3635,6 +3636,11 @@ pub struct Transcript {
     /// click handlers read them as exact endpoints for the RESIZE tween. This
     /// preserves smooth layout motion without a paint → notify feedback loop.
     user_heights: HashMap<SharedString, Rc<Cell<f32>>>,
+    /// Natural laid-out heights for report bodies, keyed by the body's fold
+    /// key. The body column's paint canvas writes these cells; the fold
+    /// targets read them so an expanded report grows to its real wrapped
+    /// height instead of the source-line estimate.
+    report_heights: HashMap<SharedString, Rc<Cell<f32>>>,
     /// Pending long-press toggle. A single task is enough because only one
     /// pointer can own a hold gesture at a time; a token invalidates stale
     /// timers when the pointer is released or moves into a text selection.
@@ -4143,6 +4149,7 @@ impl Transcript {
             tool_details: HashMap::new(),
             user_folds: HashMap::new(),
             user_heights: HashMap::new(),
+            report_heights: HashMap::new(),
             user_hold_task: None,
             user_hold_token: 0,
             user_collapse_scroll: None,
@@ -5271,6 +5278,7 @@ impl Transcript {
             self.historical_markdown.clear();
             self.user_folds.clear();
             self.user_heights.clear();
+            self.report_heights.clear();
             self.compact_fold_heights.clear();
             self.compact_fold_settle = None;
             self.user_hold_token = self.user_hold_token.wrapping_add(1);
@@ -8848,23 +8856,33 @@ impl Transcript {
         let reduce_motion = cx.reduce_motion();
         // Line heights must stay analytic: one tree row per update plus the
         // report body of every item whose own fold is open.
-        let item_folds: Vec<FoldState> = (0..items.len())
-            .map(|ix| {
-                self.folds
-                    .get(&SharedString::from(format!("{row_id}#c{ix}")))
-                    .copied()
-                    .unwrap_or_default()
+        let item_keys: Vec<SharedString> = (0..items.len())
+            .map(|ix| SharedString::from(format!("{row_id}#c{ix}")))
+            .collect();
+        let item_folds: Vec<FoldState> = item_keys
+            .iter()
+            .map(|key| self.folds.get(key).copied().unwrap_or_default())
+            .collect();
+        // The body's real wrapped height once the paint probe has measured it;
+        // the source-line estimate only bridges the first frame.
+        let item_heights: Vec<f32> = items
+            .iter()
+            .zip(&item_keys)
+            .map(|(item, key)| {
+                item.body
+                    .as_ref()
+                    .map_or(0.0, |body| self.report_body_height(key, body))
             })
             .collect();
         let target = if open {
             CHIPS_TOP_PAD
-                + items
+                + item_folds
                     .iter()
-                    .zip(&item_folds)
-                    .map(|(item, fold)| {
+                    .zip(&item_heights)
+                    .map(|(fold, full)| {
                         TOOL_TREE_ROW_HEIGHT
                             + if fold.open.unwrap_or(false) {
-                                item.body.as_ref().map_or(0.0, |body| body.height())
+                                *full
                             } else {
                                 0.0
                             }
@@ -8931,7 +8949,7 @@ impl Transcript {
             div().overflow_hidden().h(px(body_height)).child(
                 div().pt(px(CHIPS_TOP_PAD)).flex().flex_col().children(
                     items.iter().enumerate().map(|(ix, item)| {
-                        let key = SharedString::from(format!("{row_id}#c{ix}"));
+                        let key = item_keys[ix].clone();
                         let item_fold = item_folds[ix];
                         let item_open = item_fold.open.unwrap_or(false);
                         let line = self.update_line(item, cx);
@@ -8939,7 +8957,7 @@ impl Transcript {
                             let (height, item_animating) = fold_tween_height(
                                 item_fold,
                                 0.0,
-                                report.height(),
+                                item_heights[ix],
                                 item_open,
                                 now,
                                 reduce_motion,
@@ -9035,11 +9053,14 @@ impl Transcript {
         let open = body.is_some() && fold.open.unwrap_or(false);
         let now = Instant::now();
         let reduce_motion = cx.reduce_motion();
-        let (current, animating) = body.as_ref().map_or((0.0, false), |body| {
+        // The body's real wrapped height once the paint probe has measured it;
+        // the source-line estimate only bridges the first frame.
+        let full = body.map_or(0.0, |body| self.report_body_height(fold_key, body));
+        let (current, animating) = body.map_or((0.0, false), |_| {
             fold_tween_height(
                 fold,
-                body.preview_height(),
-                body.height(),
+                ReportBody::preview_height(full),
+                full,
                 open,
                 now,
                 reduce_motion,
@@ -9326,9 +9347,10 @@ impl Transcript {
             .into_any_element()
     }
 
-    /// The report body's inner structure: Markdown clipped to its own text
-    /// budget, with the counted tail row outside the clip so it is always
-    /// read.
+    /// The report body's inner structure: the rendered Markdown plus the
+    /// counted tail row, at its natural height. The column's paint probe
+    /// records that height for the fold targets; the caller's clip only hides
+    /// it while the fold is closed.
     fn report_body_clip(
         &mut self,
         fold_key: &SharedString,
@@ -9338,24 +9360,56 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let content = self.report_body_markdown(fold_key, body, theme, window, cx);
+        let measured = self
+            .report_heights
+            .entry(fold_key.clone())
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone();
+        let view = cx.entity_id();
         div()
+            .relative()
             .w_full()
             .min_w_0()
+            .flex_none()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex_none()
-                    .overflow_hidden()
-                    .max_h(px(body.text_height()))
-                    .child(content),
-            )
+            .child(content)
             .when(body.truncated_by > 0, |column| {
                 column.child(more_lines_row(body.truncated_by, theme))
             })
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, _window, cx| {
+                        // The column lays out at natural height even while the
+                        // outer clip is shorter, so this is the real target.
+                        let height = f32::from(bounds.size.height);
+                        if (measured.get() - height).abs() > 0.5 {
+                            measured.set(height);
+                            cx.notify(view);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .into_any_element()
+    }
+
+    /// The target height of a report body: its measured natural height when
+    /// the paint probe has landed, the source-line estimate on the first
+    /// frame.
+    fn report_body_height(&mut self, key: &SharedString, body: &ReportBody) -> f32 {
+        let measured = self
+            .report_heights
+            .entry(key.clone())
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .get();
+        if measured > 0.0 {
+            measured
+        } else {
+            body.height()
+        }
     }
 }
 
@@ -15848,17 +15902,23 @@ mod tests {
         };
         let one = body("one line");
         assert_eq!(
-            one.preview_height(),
+            ReportBody::preview_height(one.height()),
             render::MD_LINE_HEIGHT.min(one.height())
         );
-        assert_eq!(one.preview_height(), render::MD_LINE_HEIGHT);
+        assert_eq!(
+            ReportBody::preview_height(one.height()),
+            render::MD_LINE_HEIGHT
+        );
         let many = body("first\nsecond\nthird\nfourth");
         assert!(many.height() > render::MD_LINE_HEIGHT);
         assert_eq!(
-            many.preview_height(),
+            ReportBody::preview_height(many.height()),
             render::MD_LINE_HEIGHT.min(many.height())
         );
-        assert_eq!(many.preview_height(), render::MD_LINE_HEIGHT);
+        assert_eq!(
+            ReportBody::preview_height(many.height()),
+            render::MD_LINE_HEIGHT
+        );
     }
 
     #[test]
