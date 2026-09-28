@@ -42,6 +42,10 @@ name = "selection-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "composer-quote-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
 name = "new-project-fixture"
 required-features = ["project-palette-fixture"]
 

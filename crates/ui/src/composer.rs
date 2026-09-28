@@ -98,6 +98,11 @@ pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
 /// Input text metrics: `text-[14px] leading-relaxed` = 14 × 1.625 = 22.75.
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
+/// Leading offset per nested quote container, matching the pitch of the rails
+/// painted at the start of the line.
+const QUOTE_INDENT: f32 = 12.0;
+/// Quote rail thickness.
+const QUOTE_RAIL_WIDTH: f32 = 2.0;
 /// A compact ramp; the glyph-ascent inset keeps the clip edge invisible.
 const INPUT_FADE_BAND: f32 = 12.0;
 /// Single-select questions auto-advance after this long.
@@ -1771,6 +1776,9 @@ pub struct ComposerInput {
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
     line_indents: Vec<Pixels>,
+    /// Nested quote containers shaped into each retained line, parallel to
+    /// `line_indents`. Reserved for quote chrome, not for list markers.
+    line_quote_depths: Vec<usize>,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
     content_height: f32,
@@ -1871,6 +1879,7 @@ impl ComposerInput {
             last_lines: Vec::new(),
             line_starts: vec![0],
             line_indents: Vec::new(),
+            line_quote_depths: Vec::new(),
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
             content_height: INPUT_LINE_HEIGHT,
@@ -3051,6 +3060,11 @@ impl ComposerInput {
 
     // ---- geometry ----
 
+    /// Leading offset reserved for the quote rails on one shaped line.
+    fn quote_offset(&self, line_ix: usize) -> Pixels {
+        px(self.line_quote_depths.get(line_ix).copied().unwrap_or(0) as f32 * QUOTE_INDENT)
+    }
+
     /// Content-local point for a byte index (y grows down from content top).
     fn point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         self.point_for_display_index(self.projection.raw_to_display(index))
@@ -3106,7 +3120,10 @@ impl ComposerInput {
                 } else {
                     px(0.0)
                 };
-                return Some(point(local.x + indent, local.y + px(y_offset)));
+                return Some(point(
+                    local.x + self.quote_offset(line_ix) + indent,
+                    local.y + px(y_offset),
+                ));
             }
         }
         None
@@ -3154,6 +3171,7 @@ impl ComposerInput {
                     bounds.push(Bounds::new(
                         point(
                             start_x
+                                + self.quote_offset(line_ix)
                                 + if row_ix > 0 {
                                     self.line_indents.get(line_ix).copied().unwrap_or_default()
                                 } else {
@@ -3188,7 +3206,10 @@ impl ComposerInput {
                 } else {
                     px(0.0)
                 };
-                let local = point(position.x - indent, px(y.min(height - 1.0).max(0.0)));
+                let local = point(
+                    position.x - self.quote_offset(line_ix) - indent,
+                    px(y.min(height - 1.0).max(0.0)),
+                );
                 let ix = line
                     .closest_index_for_position(local, self.line_height)
                     .unwrap_or_else(|ix| ix);
@@ -3626,7 +3647,7 @@ impl ComposerInput {
             .collect();
         face_events.sort_by_key(|event| event.0);
         let mut face_event = 0;
-        let mut face_depth = [0isize; 4];
+        let mut face_depth = [0isize; 5];
         let runs: Vec<TextRun> = boundaries
             .windows(2)
             .filter(|r| r[1] > r[0])
@@ -3677,6 +3698,11 @@ impl ComposerInput {
                         run.color = Theme::of(cx).syntax.color(*kind);
                     }
                 }
+                // Quote ink is the lowest priority: bold, italic and code keep
+                // their weight/style/wash while the text tone stays muted.
+                if !chip && face_depth[composer_markdown::Face::Quote as usize] > 0 {
+                    run.color = theme.text_muted;
+                }
                 run
             })
             .collect();
@@ -3701,6 +3727,12 @@ impl ComposerInput {
             .filter(|(_, face)| *face == composer_markdown::Face::Code)
             .map(|(range, _)| range)
             .collect();
+        let quote_ranges: Vec<_> = raw_faces
+            .iter()
+            .filter(|(_, face)| *face == composer_markdown::Face::Quote)
+            .map(|(range, _)| range)
+            .collect();
+        let mut quote_depths = Vec::new();
         for text in display.split('\n') {
             let raw_line = self
                 .content
@@ -3710,6 +3742,7 @@ impl ComposerInput {
                 .next()
                 .unwrap_or_default();
             let mut indent = px(0.0);
+            let mut quote_depth = 0;
             if self.mentions_enabled && !is_placeholder {
                 if let Some(prefix) = composer_markdown::list_prefix(raw_line).filter(|prefix| {
                     let marker_at = raw_at + prefix.indent;
@@ -3731,7 +3764,16 @@ impl ComposerInput {
                         .width
                         .min(width * 0.4);
                 }
+                let quote_ix = quote_ranges.partition_point(|range| range.end <= raw_at);
+                if quote_ranges
+                    .get(quote_ix)
+                    .is_some_and(|range| range.contains(&raw_at))
+                {
+                    quote_depth =
+                        composer_markdown::quote_prefix(raw_line).map_or(0, |prefix| prefix.depth);
+                }
             }
+            let quote_offset = px(quote_depth as f32 * QUOTE_INDENT);
             let end = display_at + text.len();
             let first_run = run_ranges.partition_point(|(r, _)| r.end <= display_at);
             let line_runs: Vec<TextRun> = run_ranges[first_run..]
@@ -3752,7 +3794,7 @@ impl ComposerInput {
                 text.to_string().into(),
                 font_size,
                 &line_runs,
-                (!self.single_line).then_some((width - indent).max(px(20.0))),
+                (!self.single_line).then_some((width - quote_offset - indent).max(px(20.0))),
                 None,
             ) {
                 let chips: Vec<_> = self.projection.mentions[self
@@ -3766,16 +3808,22 @@ impl ComposerInput {
                     .collect();
                 for mut line in shaped {
                     if !self.single_line {
-                        wrap_reference_chips(&mut line, &chips, (width - indent).max(px(20.0)));
+                        wrap_reference_chips(
+                            &mut line,
+                            &chips,
+                            (width - quote_offset - indent).max(px(20.0)),
+                        );
                     }
                     lines.push(line);
                     indents.push(indent);
+                    quote_depths.push(quote_depth);
                 }
             }
             display_at = end + 1;
             raw_at += raw_line.len() + 1;
         }
         self.line_indents = indents;
+        self.line_quote_depths = quote_depths;
 
         // Logical line byte offsets (each shaped line covers one \n-split line).
         let mut line_starts = Vec::with_capacity(lines.len());
@@ -4371,11 +4419,12 @@ impl gpui::Element for ComposerTextElement {
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
-        let (lines, indents, line_height, scroll, scroll_left) =
+        let (lines, indents, quote_depths, line_height, scroll, scroll_left) =
             self.input.update(cx, |input, _| {
                 (
                     std::mem::take(&mut input.last_lines),
                     input.line_indents.clone(),
+                    input.line_quote_depths.clone(),
                     input.line_height,
                     input.scroll_top,
                     input.scroll_left,
@@ -4395,10 +4444,30 @@ impl gpui::Element for ComposerTextElement {
                     window.paint_quad(quad);
                 }
                 let mut y = bounds.top() - px(scroll);
+                let origin_x = bounds.left() - px(scroll_left);
                 for (line_ix, line) in lines.iter().enumerate() {
                     let height = line.size(line_height).height;
                     let indent = indents.get(line_ix).copied().unwrap_or_default();
-                    if indent > px(0.0) && !line.wrap_boundaries().is_empty() {
+                    let quote_depth = quote_depths.get(line_ix).copied().unwrap_or(0);
+                    let quote_offset = px(quote_depth as f32 * QUOTE_INDENT);
+                    // One rail per nested container, spanning the whole logical
+                    // line so the rails stay continuous across wraps and
+                    // consecutive quoted lines.
+                    if quote_depth > 0 {
+                        let rail = Theme::of(cx).hairline(0.20);
+                        for depth in 0..quote_depth {
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(origin_x + px(depth as f32 * QUOTE_INDENT), y),
+                                    size(px(QUOTE_RAIL_WIDTH), height),
+                                ),
+                                rail,
+                            ));
+                        }
+                    }
+                    if (quote_offset > px(0.0) || indent > px(0.0))
+                        && !line.wrap_boundaries().is_empty()
+                    {
                         for row in 0..=line.wrap_boundaries().len() {
                             let row_bounds = Bounds::new(
                                 point(bounds.left(), y + line_height * row),
@@ -4409,7 +4478,8 @@ impl gpui::Element for ComposerTextElement {
                                 |window| {
                                     let _ = line.paint(
                                         point(
-                                            bounds.left() - px(scroll_left)
+                                            origin_x
+                                                + quote_offset
                                                 + if row > 0 { indent } else { px(0.0) },
                                             y,
                                         ),
@@ -4424,7 +4494,7 @@ impl gpui::Element for ComposerTextElement {
                         }
                     } else {
                         let _ = line.paint(
-                            point(bounds.left() - px(scroll_left), y),
+                            point(origin_x + quote_offset, y),
                             line_height,
                             gpui::TextAlign::Left,
                             Some(bounds),
@@ -11326,6 +11396,28 @@ mod tests {
     }
 
     #[gpui::test]
+    fn quoted_lines_reserve_the_rail_offset_and_keep_caret_mapping(cx: &mut gpui::TestAppContext) {
+        with_composer_input(cx, |input, window, cx| {
+            let text = "> quoted line\n> > nested\n\nquestion";
+            input.set_text(text, cx);
+            input.layout_text(px(320.), &window.text_style(), window, cx);
+            assert_eq!(input.line_quote_depths, vec![1, 2, 0, 0]);
+            assert_eq!(input.projection.display, "quoted line\nnested\n\nquestion");
+            // Hidden markers leave a leading offset on every quoted line.
+            assert_eq!(input.point_for_index(0).unwrap().x, px(QUOTE_INDENT));
+            let nested = input.point_for_index(text.find("nested").unwrap()).unwrap();
+            assert!(nested.x >= px(QUOTE_INDENT * 2.0));
+            // Hit testing subtracts the same offset, so clicks stay on their
+            // own line instead of landing in the row above.
+            let first_line_end = text.find('\n').unwrap();
+            let raw = input
+                .caret_for_point(point(px(QUOTE_INDENT), nested.y + px(2.0)))
+                .0;
+            assert!(raw > first_line_end, "{raw}");
+        });
+    }
+
+    #[gpui::test]
     fn quoted_list_indentation_preserves_containers_and_selection(cx: &mut gpui::TestAppContext) {
         with_composer_input(cx, |input, window, cx| {
             for original in ["> - café\n> - [x] done", "> > - café\r\n> > - [x] done"] {
@@ -13816,5 +13908,23 @@ impl Composer {
     /// landed where the composer shows it.
     pub fn fixture_appshots_draft<'a>(&self, cx: &'a gpui::App) -> &'a str {
         self.input.read(cx).text()
+    }
+
+    /// Replace the draft and place the caret, for fixtures that need a
+    /// specific active line (quote markers, for example, follow it).
+    pub fn fixture_set_draft(
+        &mut self,
+        text: &str,
+        caret: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.update(cx, |input, cx| {
+            input.set_text(text, cx);
+            input.move_to(caret, cx);
+            let focus = input.focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        cx.notify();
     }
 }
