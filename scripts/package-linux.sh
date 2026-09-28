@@ -31,7 +31,10 @@ rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/zeron"
 install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
-install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
+# Icon: the macOS masked squircle, cropped to the margins Linux docks expect
+# (dist/linux/icon-512.png). Desktops draw app icons as-is, so the full-bleed
+# dist/zeron.png would show as a hard square.
+install -m 644 "$ROOT/dist/linux/icon-512.png" "$STAGE/zeron.png"
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 
@@ -42,7 +45,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/zeron" "$HOME/.local/bin/zeron"
 install -Dm644 "$HERE/zeron.desktop" "$HOME/.local/share/applications/zeron.desktop"
-install -Dm644 "$HERE/zeron.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/zeron.png"
+# hicolor declares no 1024x1024 size, so an icon there is never looked up.
+install -Dm644 "$HERE/zeron.png" "$HOME/.local/share/icons/hicolor/512x512/apps/zeron.png"
+# A user icon cache written before this install would hide the new icon.
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+  && gtk-update-icon-cache -q -f -t "$HOME/.local/share/icons/hicolor" || true
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
 echo "Installed. Make sure ~/.local/bin is on your PATH."
