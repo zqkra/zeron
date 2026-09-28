@@ -176,16 +176,59 @@ fn main() -> anyhow::Result<()> {
                     window.update(cx, |s, _, cx| s.fixture_appshots_transcript_end(cx))?;
                     pause(cx, 400).await;
                     let selected = window.update(cx, |s, _, cx| {
-                        s.fixture_appshots_select_range("assistant#text.0:0", 0..96, cx)
+                        // Start the selection mid-paragraph, with a full
+                        // line of prose above it, so the bar floats over text:
+                        // with a translucent surface, that text would show
+                        // through if the card did not blur its backdrop.
+                        let start = REPLY
+                            .find("while Reply in side chat")
+                            .expect("selection anchor must exist");
+                        s.fixture_appshots_select_range(
+                            "assistant#text.0:0",
+                            start..start + 150,
+                            cx,
+                        )
                     })?;
                     anyhow::ensure!(selected, "the reply paragraph must be painted");
                     pause(cx, 500).await;
+                    // Capture the opaque pair explicitly; the default surface
+                    // is translucent on this fixture's themes.
+                    cx.update(|cx| {
+                        appearance::set_surface(
+                            zeron_theme::SurfacePreference::Opaque,
+                            cx,
+                        )
+                    });
+                    pause(cx, 700).await;
                     capture(window.into(), cx, &output, "selection-bar-dark")?;
                     cx.update(|cx| appearance::set_mode(appearance::AppearanceMode::Light, cx));
                     pause(cx, 700).await;
                     capture(window.into(), cx, &output, "selection-bar-light")?;
-                    window.update(cx, |s, _, cx| s.fixture_appshots_add_selection(cx))?;
+                    cx.update(|cx| {
+                        appearance::set_surface(
+                            zeron_theme::SurfacePreference::Frosted,
+                            cx,
+                        );
+                        appearance::set_mode(appearance::AppearanceMode::Dark, cx);
+                    });
+                    pause(cx, 800).await;
+                    capture(
+                        window.into(),
+                        cx,
+                        &output,
+                        "selection-bar-frost-dark",
+                    )?;
+                    cx.update(|cx| appearance::set_mode(appearance::AppearanceMode::Light, cx));
+                    pause(cx, 700).await;
+                    capture(
+                        window.into(),
+                        cx,
+                        &output,
+                        "selection-bar-frost-light",
+                    )?;
                     cx.update(|cx| appearance::set_mode(appearance::AppearanceMode::Dark, cx));
+                    pause(cx, 700).await;
+                    window.update(cx, |s, _, cx| s.fixture_appshots_add_selection(cx))?;
                     pause(cx, 900).await;
                     capture(window.into(), cx, &output, "selection-added-dark")?;
                     let draft = window.update(cx, |s, _, cx| {
@@ -200,7 +243,9 @@ fn main() -> anyhow::Result<()> {
                     );
                     std::fs::write(
                         output.join("result.txt"),
-                        format!("selection fixture: bar dark/light + quoted draft\n---\n{draft}"),
+                        format!(
+                            "selection fixture: bar opaque/frost dark+light + quoted draft\n---\n{draft}"
+                        ),
                     )?;
                     Ok(())
                 }

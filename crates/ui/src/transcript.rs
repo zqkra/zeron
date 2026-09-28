@@ -163,6 +163,8 @@ pub(crate) fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixe
 const SELECTION_BAR_GAP_PX: f32 = 6.0;
 /// Bar height: a 24px button inside 2px of padding on each side.
 const SELECTION_BAR_HEIGHT_PX: f32 = 28.0;
+/// Bar corner rounding, matched by the backdrop blur it floats on.
+const SELECTION_BAR_RADIUS_PX: f32 = 8.0;
 /// Flip the bar below the selection when its first line starts this close to
 /// the viewport top (gap + bar + a little slack).
 const SELECTION_BAR_FLIP_PX: f32 = 36.0;
@@ -4750,7 +4752,7 @@ impl Transcript {
             .occlude()
             .border_1()
             .border_color(theme.border)
-            .rounded(px(8.0))
+            .rounded(px(SELECTION_BAR_RADIUS_PX))
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .bg(crate::popover::surface_bg(&theme))
             .p(px(2.0))
@@ -4813,7 +4815,17 @@ impl Transcript {
                         viewport.left() + px(place.x),
                         viewport.top() + px(place.y),
                     ))
-                    .child(motion::menu_in("selection-bar", bar)),
+                    .child(motion::menu_in(
+                        "selection-bar",
+                        // The bar floats over transcript prose, so it needs the
+                        // same backdrop blur as every other menu; on opaque
+                        // surfaces the wrapper is a pass-through.
+                        div().child(crate::frost::frosted(
+                            SELECTION_BAR_RADIUS_PX,
+                            crate::frost::MENU_BLUR,
+                            bar,
+                        )),
+                    )),
             )
             .into_any_element(),
         )
