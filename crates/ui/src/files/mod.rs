@@ -42,6 +42,13 @@ use crate::surface_chrome::{
     CONTROL_RADIUS as TOOLBAR_BUTTON_RADIUS, CONTROL_SIZE as TOOLBAR_BUTTON_SIZE, toolbar,
 };
 
+/// A file document opened by absolute path beyond the workspace root — a
+/// link-opened host file. It has no tree entry and no watch, and the owning
+/// device serves it read-only.
+pub(super) fn path_is_outside(path: &str) -> bool {
+    path.starts_with('/')
+}
+
 pub(super) fn toolbar_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)

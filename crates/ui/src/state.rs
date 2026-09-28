@@ -1258,6 +1258,21 @@ impl AppState {
         roots
     }
 
+    /// Whether `chat_id` lives on this device — an outside file link from it
+    /// resolves to this disk, so its menu may offer local file actions. An
+    /// unprobed device id (or an unknown chat row) counts as local, matching
+    /// `file_link_roots`.
+    pub(crate) fn chat_is_local(&self, chat_id: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_none_or(|chat| {
+                self.local_device_id
+                    .as_deref()
+                    .is_none_or(|local| chat.device_id == local)
+            })
+    }
+
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.

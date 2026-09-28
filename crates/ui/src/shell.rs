@@ -3224,6 +3224,7 @@ impl Shell {
         let shell = cx.weak_entity();
         crate::markdown::render::LinkUi {
             source_session,
+            source_local: false,
             file_roots: None,
             handler: std::rc::Rc::new(move |activation, window, cx| {
                 shell
@@ -3539,13 +3540,21 @@ impl Shell {
             .unwrap_or_else(|| self.state.clone());
         let roots = owner_state.read(cx).file_link_roots(chat_id);
         let root_refs: Vec<&str> = roots.iter().map(|root| root.root.as_str()).collect();
-        let Some((ix, link)) = crate::workspace_links::first_root_owning(target, root_refs) else {
-            return false;
+        use crate::workspace_links::FileLinkResolution;
+        let (owner_chat, link) = match crate::workspace_links::first_root_owning(target, root_refs)
+        {
+            // A project root has no chat of its own; its link opens in the
+            // linking chat's file context.
+            Some(FileLinkResolution::Owned { root, link }) => (
+                roots[root].chat.as_deref().unwrap_or(chat_id).to_owned(),
+                link,
+            ),
+            // An absolute path no known root owns is still a file link: it
+            // opens read-only through the linking chat's own file context.
+            Some(FileLinkResolution::Outside(link)) => (chat_id.to_owned(), link),
+            None => return false,
         };
-        // A project root has no chat of its own; its link opens in the
-        // linking chat's file context.
-        let owner_chat = roots[ix].chat.as_deref().unwrap_or(chat_id);
-        let Some(owner) = self.link_owner(owner_chat, cx) else {
+        let Some(owner) = self.link_owner(&owner_chat, cx) else {
             return false;
         };
 

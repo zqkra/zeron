@@ -144,6 +144,7 @@ impl Element for LinkRanges {
                     let destination = target.original.clone();
                     let tooltip_bounds = state.tooltip_bounds.clone();
                     let click_ui = self.ui.clone();
+                    let tooltip_ui = self.ui.clone();
                     let menu_focus_pending = state.menu_focus_pending.clone();
                     let pointer_focus_pending = menu_focus_pending.clone();
                     let keyboard_dismissed = state.dismissed.clone();
@@ -156,8 +157,19 @@ impl Element for LinkRanges {
                             hit.hoverable_tooltip(move |_, cx| {
                                 let url = destination.clone();
                                 let bounds = tooltip_bounds.clone();
-                                cx.new(|_| super::link_destination::Destination(url, bounds))
-                                    .into()
+                                let ui = tooltip_ui.clone();
+                                cx.new(|_| {
+                                    // A file link shows its decoded path —
+                                    // root-relative inside the workspace,
+                                    // absolute outside — not the raw href.
+                                    let shown = ui
+                                        .as_ref()
+                                        .and_then(|ui| ui.file_link(&url))
+                                        .map(|file| file.path)
+                                        .unwrap_or(url);
+                                    super::link_destination::Destination(shown, bounds)
+                                })
+                                .into()
                             })
                         })
                         .w(rect.size.width)
@@ -231,8 +243,14 @@ impl Element for LinkRanges {
                     if let Some(rect) =
                         range_rects(&self.layout, &self.links[index].0, 0., 0.).first()
                     {
+                        let shown = self
+                            .ui
+                            .as_ref()
+                            .and_then(|ui| ui.file_link(&state.targets[index].original))
+                            .map(|file| file.path)
+                            .unwrap_or_else(|| state.targets[index].original.clone());
                         let card = super::link_destination::destination_card(
-                            &state.targets[index].original,
+                            &shown,
                             state.tooltip_bounds.clone(),
                             window,
                             cx,
@@ -621,6 +639,7 @@ mod tests {
                     let captured = seen.clone();
                     let ui = LinkUi {
                         source_session: Some("parent".into()),
+                        source_local: false,
                         file_roots: None,
                         handler: Rc::new(move |a, _, _| {
                             *captured.borrow_mut() =
@@ -690,6 +709,7 @@ mod rendered_tests {
             let activated = self.activated.clone();
             opts.link = Some(LinkUi {
                 source_session: Some("session".into()),
+                source_local: false,
                 file_roots: self.file_roots.clone(),
                 handler: Rc::new(move |a, _, _| {
                     activated.borrow_mut().push(a.clone());

@@ -8752,8 +8752,10 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> Option<render::LinkUi> {
         let roots = self.file_link_roots(source_chat_id, cx);
+        let source_local = self.state.read(cx).chat_is_local(source_chat_id);
         self.workspace_link.clone().map(|mut link| {
             link.source_session = Some(source_chat_id.to_string());
+            link.source_local = source_local;
             link.file_roots = Some(roots);
             link
         })
@@ -16343,6 +16345,7 @@ mod tests {
             transcript.update(cx, |this, cx| {
                 this.set_workspace_link_handler(crate::markdown::render::LinkUi {
                     source_session: None,
+                    source_local: false,
                     file_roots: None,
                     handler: std::rc::Rc::new(|_, _, _| {
                         crate::markdown::render::LinkOutcome::Rejected

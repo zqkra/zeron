@@ -2,7 +2,7 @@
 use crate::image_media::release_media;
 use crate::{
     markdown::{
-        parser::{self, Block, BlockTree},
+        parser::{self, Block, BlockTree, InlineRun},
         render::{self, LinkUi, RenderCache, RenderOptions},
     },
     theme::Theme,
@@ -35,6 +35,53 @@ fn block_source_lines(source: &str, tree: &BlockTree) -> Vec<u32> {
         .iter()
         .map(|top| starts.partition_point(|start| *start <= top.range.start) as u32)
         .collect()
+}
+
+/// A preview of a file beyond the workspace renders its local links as
+/// plain text: they would resolve against the linking chat's checkout, not
+/// the document's own folder, so their styling drops before render. Web
+/// links keep their normal handling.
+fn strip_outside_links(block: &mut Block) {
+    fn strip_runs(runs: &mut [InlineRun]) {
+        for run in runs {
+            if run.style.image.is_none()
+                && run
+                    .style
+                    .link
+                    .as_deref()
+                    .is_some_and(|target| !web_target(target))
+            {
+                run.style.link = None;
+            }
+            if let Some(image) = &mut run.style.image {
+                if image
+                    .link
+                    .as_deref()
+                    .is_some_and(|target| !web_target(target))
+                {
+                    image.link = None;
+                }
+            }
+        }
+    }
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => strip_runs(runs),
+        Block::BlockQuote { children } => children.iter_mut().for_each(strip_outside_links),
+        Block::List { items, .. } => items.iter_mut().flatten().for_each(strip_outside_links),
+        Block::Table { header, rows, .. } => {
+            header.iter_mut().for_each(strip_runs);
+            rows.iter_mut().flatten().for_each(strip_runs);
+        }
+        Block::CodeBlock { .. } | Block::Rule => {}
+    }
+}
+
+/// Destinations a preview still treats as links: web navigation and mail,
+/// mirroring `preview_link_outcome`.
+fn web_target(target: &str) -> bool {
+    crate::browser::model::transcript_address(target).is_ok()
+        || (!target.chars().any(char::is_control)
+            && url::Url::parse(target).is_ok_and(|url| url.scheme() == "mailto"))
 }
 
 fn comment_block(lines: &[u32], line: u32) -> Option<usize> {
@@ -417,6 +464,8 @@ impl MarkdownPreview {
         self.loading = self.tree.is_empty();
         self.truncated = truncated || clipped;
         let parsed_source: Arc<str> = Arc::from(source.as_str());
+        // Outside documents render their local links as plain text.
+        let outside = super::path_is_outside(&self.path);
         self.parse_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(120))
@@ -424,7 +473,12 @@ impl MarkdownPreview {
             let (tree, highlights, anchors, block_lines) = cx
                 .background_executor()
                 .spawn(async move {
-                    let tree = parser::parse_full(&source);
+                    let mut tree = parser::parse_full(&source);
+                    if outside {
+                        for top in &mut tree.blocks {
+                            strip_outside_links(&mut Arc::make_mut(top).block);
+                        }
+                    }
                     let block_lines = block_source_lines(&source, &tree);
                     let mut highlights = HashMap::new();
                     let mut anchors = HashMap::new();
@@ -980,6 +1034,7 @@ impl MarkdownPreview {
         let open_web_link = self.open_web_link.clone();
         LinkUi {
             source_session: None,
+            source_local: false,
             file_roots: None,
             handler: Rc::new(move |activation, _, cx| {
                 if weak.upgrade().is_none() {

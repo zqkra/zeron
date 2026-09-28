@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -135,6 +136,9 @@ pub use super::links::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
 #[derive(Clone)]
 pub struct LinkUi {
     pub source_session: Option<String>,
+    /// The linking chat lives on this device — outside links get their
+    /// system-level menu rows (default app, file manager).
+    pub source_local: bool,
     /// The ordered checkouts a file link may resolve against on this surface,
     /// the linking chat's own first. `None` renders no trailing open glyph
     /// and offers no file paths — previews and web-only surfaces.
@@ -145,20 +149,32 @@ pub struct LinkUi {
 impl LinkUi {
     /// The workspace file `target` resolves to under this surface's roots,
     /// when the link is one at all. Drives the trailing open glyph and the
-    /// menu's file rows; the click path re-resolves with owners. The
-    /// absolute path comes from the resolved root joined with the link's
-    /// workspace-relative path, never from the raw link text.
+    /// menu's file rows; the click path re-resolves with owners. Owned links
+    /// get their absolute path from the resolved root joined with the link's
+    /// workspace-relative path; an outside link's absolute path is the
+    /// decoded target itself.
     pub(crate) fn file_link(&self, target: &str) -> Option<crate::workspace_links::FileLink> {
         let roots = self.file_roots.as_deref()?;
-        let (ix, link) = crate::workspace_links::first_root_owning(
+        match crate::workspace_links::first_root_owning(
             target,
             roots.iter().map(|root| root.root.as_str()),
-        )?;
-        let root = &roots[ix];
-        Some(crate::workspace_links::FileLink {
-            absolute: root.absolute(&link),
-            local: root.local,
-        })
+        )? {
+            crate::workspace_links::FileLinkResolution::Owned { root, link } => {
+                let root = &roots[root];
+                Some(crate::workspace_links::FileLink {
+                    absolute: root.absolute(&link),
+                    path: link.path,
+                    local: root.local,
+                })
+            }
+            crate::workspace_links::FileLinkResolution::Outside(link) => {
+                Some(crate::workspace_links::FileLink {
+                    absolute: PathBuf::from(&link.path),
+                    path: link.path,
+                    local: self.source_local,
+                })
+            }
+        }
     }
 }
 

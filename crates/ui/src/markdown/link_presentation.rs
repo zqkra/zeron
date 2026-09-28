@@ -607,6 +607,7 @@ mod tests {
         opts.workspace_root = Some("/repo".into());
         opts.link = Some(LinkUi {
             source_session: Some("chat".into()),
+            source_local: true,
             file_roots: Some(Rc::new(vec![crate::workspace_links::FileLinkRoot {
                 chat: Some("chat".into()),
                 root: "/repo".into(),
@@ -642,6 +643,7 @@ mod tests {
         let mut no_roots = opts.clone();
         no_roots.link = Some(LinkUi {
             source_session: Some("chat".into()),
+            source_local: false,
             file_roots: None,
             handler: Rc::new(|_, _, _| LinkOutcome::Rejected),
         });
