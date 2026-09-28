@@ -8673,9 +8673,9 @@ impl Transcript {
         crate::frost::frosted(5.0, 16.0, badge).into_any_element()
     }
 
-    /// One agent line inside a fold: the ordinary tree-row layout with the
-    /// child's harness mark at the branch tip. A child update adds an outcome
-    /// word and, under the line, its report body.
+    /// One agent line inside a fold: the ordinary tree-row layout — the agent
+    /// tool glyph at the branch tip, the child named by its chat badge. A
+    /// child update adds an outcome word and, under the line, its report body.
     #[allow(clippy::too_many_arguments)] // a render seam, not a public API
     fn agent_line_row(
         &mut self,
@@ -16784,8 +16784,9 @@ mod tests {
         });
     }
 
-    /// The report card references its sender so the card's live title follows
-    /// the sender's row, exactly like a child-update card's child.
+    /// The report row resolves its sender live, so the badge's title follows
+    /// the sender's row, exactly like a child update's badge follows its
+    /// child.
     #[gpui::test]
     fn agent_message_rows_reference_their_sender(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
