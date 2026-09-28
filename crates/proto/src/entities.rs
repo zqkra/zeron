@@ -621,6 +621,9 @@ pub enum WorkspaceReadOnlyReason {
     TooLarge,
     PermissionDenied,
     NotRegularFile,
+    /// A file read by absolute path beyond the chat's workspace root: reads
+    /// are allowed, writes never are.
+    OutsideWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
