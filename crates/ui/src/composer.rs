@@ -2196,6 +2196,15 @@ impl ComposerInput {
         cx.notify();
     }
 
+    /// Append a quoted transcript selection to the draft, caret after it.
+    /// The quote rule lives with the selection state; a blank selection
+    /// leaves the draft untouched.
+    pub fn insert_selection_quote(&mut self, selection: &str, cx: &mut Context<Self>) {
+        if let Some(draft) = crate::markdown::selection::quoted_draft(&self.content, selection) {
+            self.set_text(draft, cx);
+        }
+    }
+
     fn invalidate_mention_tooltip(&mut self) {
         self.mention_tooltip_generation = self.mention_tooltip_generation.wrapping_add(1);
         self.mention_tooltip = MentionTooltipPhase::Hidden;
@@ -5756,6 +5765,14 @@ impl Composer {
 
     pub fn show_appshot_error(&mut self, message: String, cx: &mut Context<Self>) {
         self.show_error(message, cx);
+    }
+
+    /// Append a quoted transcript selection to the draft, caret after it.
+    /// A blank selection leaves the draft untouched.
+    pub fn insert_selection_quote(&mut self, selection: &str, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.insert_selection_quote(selection, cx));
+        cx.notify();
     }
 
     /// Mark this as a side chat's composer: below the input it shows only
@@ -9749,6 +9766,27 @@ mod tests {
                 composer
                     .input
                     .update(cx, |input, cx| test(input, window, cx));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn selection_quote_appends_to_the_draft_with_the_caret_at_the_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("my prompt", cx));
+                composer.insert_selection_quote("one\ntwo", cx);
+                let input = composer.input.read(cx);
+                assert_eq!(input.text(), "my prompt\n> one\n> two\n");
+                assert_eq!(input.selected_range, input.text().len()..input.text().len());
+                // A blank selection leaves the draft untouched.
+                composer.insert_selection_quote("  \n ", cx);
+                assert_eq!(composer.input.read(cx).text(), "my prompt\n> one\n> two\n");
             })
             .unwrap();
     }
@@ -13772,5 +13810,11 @@ impl Composer {
     pub fn fixture_clear_appshots(&mut self, cx: &mut Context<Self>) {
         self.appshots.clear();
         cx.notify();
+    }
+
+    /// The current draft, for fixtures that assert a programmatic insertion
+    /// landed where the composer shows it.
+    pub fn fixture_appshots_draft<'a>(&self, cx: &'a gpui::App) -> &'a str {
+        self.input.read(cx).text()
     }
 }
