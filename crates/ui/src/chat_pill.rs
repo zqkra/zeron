@@ -1,7 +1,7 @@
 //! A chat reference as a compact inline chip: harness brand mark, live title,
-//! live status glyph. Shared by the transcript's spawn chips and child-update
-//! cards — resolution always happens at render time (rows are prepared off
-//! the UI thread), so a rename or a status flip is a repaint, not a rebuild.
+//! live status glyph. Resolution always happens at render time (rows are
+//! prepared off the UI thread), so a rename or a status flip is a repaint,
+//! not a rebuild.
 
 use std::hash::{Hash, Hasher};
 
@@ -128,59 +128,9 @@ pub(crate) fn chat_refs_fingerprint<'a>(
     hasher.finish()
 }
 
-/// The chip itself: 12px harness mark (BOT until the harness is known), a
-/// truncating title, and the sidebar's status glyph. Sized to ride inline in
-/// markdown text — the inline `@chat:` mention pills render with it; tool
-/// rows deliberately do NOT (they keep the native chip look).
-/// It is a label, not a button; callers that want a click wrap it.
-#[allow(dead_code)]
-pub(crate) fn chat_chip(
-    chat: &ChatRef,
-    theme: &Theme,
-    view: EntityId,
-    cx: &mut gpui::App,
-) -> AnyElement {
-    let (mark, tint) = chat
-        .harness
-        .map(crate::pickers::harness_brand_icon)
-        .unwrap_or((icons::BOT, None));
-    div()
-        .min_w_0()
-        .flex()
-        .items_center()
-        .gap(px(5.0))
-        .child(
-            icon(mark)
-                .size(px(12.0))
-                .flex_none()
-                .text_color(tint.unwrap_or(theme.text_muted)),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(if chat.known {
-                    theme.text
-                } else {
-                    theme.text_muted
-                })
-                .child(chat.title.clone()),
-        )
-        .when(chat.known, |chip| {
-            chip.child(status_glyph(
-                format!("chat-pill-{}", chat.chat_id),
-                chat.indicator,
-                view,
-                theme,
-                cx,
-            ))
-        })
-        .into_any_element()
-}
-
 /// The status slot every chat row ends in: spinner while working, check when
 /// finished-unseen, a plain status dot otherwise. Shared by the activity
-/// menu, the transcript's chat chips and the child-update cards.
+/// menu and the transcript's chat rows.
 pub(crate) fn status_glyph(
     key: String,
     status: ChatIndicator,

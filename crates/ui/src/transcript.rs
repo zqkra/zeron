@@ -4,7 +4,7 @@
 //! Row model (docs/research/mugen-pretext.md §3):
 //! - one row per BLOCK: user message = one bubble row; assistant messages split
 //!   into one row per markdown top-level block, plus consecutive-tool groups
-//!   (agent/spawn chips split out so they never collapse) and input/error chips;
+//!   (agent/spawn tools split into their own group) and input/error chips;
 //! - stable row ids `{msgId}#{partId}.{blockIx}` / `{msgId}#g{groupIx}` — LIVE
 //!   (streaming) entries split per block exactly like completed ones (the list
 //!   virtualizes them, so a fading live reply re-renders only its visible tail
@@ -42,7 +42,7 @@ use gpui::{
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
 use zeron_proto::orchestration::{self, ChildOutcome};
 use zeron_proto::view::{ZeronChatVerb, zeron_chat_command};
-use zeron_proto::{ChatIndicator, ToolCall};
+use zeron_proto::{ChatIndicator, HarnessId, ToolCall};
 
 use crate::markdown::chat_pills;
 use crate::markdown::parser::{
@@ -88,17 +88,10 @@ const MAX_PENDING_QUEUED_TURNS: usize = 256;
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
 const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
 const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
-/// Activity row height / gap — analytic, so fold heights need no measurement.
-/// Ordinary tools place their icon on the rail; subagents retain a 30px card.
-/// Rows stack without a gap so the rail continues alongside expanded output.
-pub const CHIP_HEIGHT: f32 = 38.0;
-pub const CHIP_GAP: f32 = 0.0;
+/// The height of a row's content line inside its [`TOOL_TREE_ROW_HEIGHT`]
+/// slot. Analytic, so fold heights need no measurement; rows stack without a
+/// gap so the rail continues alongside expanded output.
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
-/// Inner height of the chip header: [`CHIP_CARD_HEIGHT`] is the card's
-/// border-box (explicit `h` in gpui includes the 1px border), so a 30px
-/// header inside a 30px bordered card clips 2px off the bottom and every
-/// glyph/icon reads high (user report).
-const CHIP_HEADER_HEIGHT: f32 = CHIP_CARD_HEIGHT - 2.0;
 /// Child labels and expanded text share one edge beneath the compact summary.
 /// The child gutter reserves room for
 /// a longer elbow, a 4px break before the icon, and an 8px icon-to-text gap.
@@ -115,6 +108,13 @@ const TOOL_LABEL_LINE_HEIGHT: f32 = 18.0;
 const TOOL_GROUP_HEADER_HEIGHT: f32 = 26.0;
 /// Compact rows retain the analytic heights used by row and group folds.
 const TOOL_TREE_ROW_HEIGHT: f32 = 32.0;
+/// The report body's left inset: the header's 22px gutter plus its 6px gap.
+const REPORT_TEXT_INSET: f32 = 28.0;
+/// The report seam stops short of the body's last line so it reads as a guide
+/// running alongside the text, not a border under it.
+const REPORT_SEAM_BOTTOM_INSET: f32 = 4.0;
+/// How much of a collapsed report shows: its first rendered Markdown line.
+const REPORT_PREVIEW_HEIGHT: f32 = render::MD_LINE_HEIGHT;
 const TOOL_FOLD: motion::MotionSpec = motion::MotionSpec::new(140, motion::EASE_OUT);
 /// BoardUI task-list cadence: a slow light sweep keeps the active summary
 /// legible, while each newly appended row reveals quickly enough to read as a
@@ -482,49 +482,159 @@ fn agent_exec(call: &ToolCall, output: Option<&str>) -> Option<AgentExec> {
 
 /// Per-paint resolution of a `zeron chat` exec — see [`Transcript::agent_view`].
 struct AgentView {
-    /// Spawn chips ride the native spawn path on a shimmed call.
-    tool: Option<ToolItem>,
-    /// The spawn's resolved child id — output mention first, the registry
-    /// fallback otherwise. Drives the chip's whole-card click + open arrow.
-    child: Option<SharedString>,
+    /// A spawn renders as an agent line inside its group.
+    line: Option<AgentLine>,
     /// Messaging verbs keep their real call and only override the header's
     /// label/detail/trail text.
     content: Option<ChipContent>,
 }
 
-/// Subagent spawn chips — [`ToolCall::is_subagent_spawn`], the shared genus
-/// every driver decodes its spawn tool into. These stay out of the
-/// collapsible "Called N tools" wrap so a running subagent is visible
-/// without opening the fold.
+/// One agent spawn resolved for its line inside a fold: a `zeron chat spawn`
+/// exec, or a native agent call bound to its subagent doc. Everything the
+/// line paints statically resolves per paint against the registry, so a
+/// child's rename or status flip is a repaint.
+struct AgentLine {
+    /// The chat's harness — the mark inside the badge's icon well.
+    harness: Option<HarnessId>,
+    title: SharedString,
+    /// A registry-known chat: the badge is the link and reads in full
+    /// contrast. A native spawn link counts as known even before the child
+    /// chat resolves, because its doc is the target.
+    known: bool,
+    model: Option<SharedString>,
+    /// The trailing status slot — spinners need `App`, so the line stores
+    /// what to draw and the renderer builds it.
+    glyph: Option<AgentGlyph>,
+    /// At least one live cue: a spawn command still in flight, or a child
+    /// still working. The collapsed group header shows its own spinner for
+    /// this instead of hiding a running spawn behind the fold.
+    running: bool,
+    failed: bool,
+    open: Option<AgentOpen>,
+    /// Identity for the status glyph's loader: the child id when known, the
+    /// spawn part otherwise.
+    status_key: SharedString,
+}
+
+/// The trailing status slot of an agent line.
+enum AgentGlyph {
+    /// The spawn command has not settled: the mini working spinner.
+    Spinner,
+    /// The child's own live indicator.
+    Status(ChatIndicator),
+}
+
+/// What a row click does: toggle its own report body, or activate the chat
+/// the row names. The badge click always opens; the row click prefers the
+/// body when there is one.
+#[derive(Clone)]
+enum LineClick {
+    Toggle {
+        key: SharedString,
+        from: f32,
+        open: bool,
+    },
+    Open(AgentOpen),
+}
+
+/// The event an open target activates. `chat_id` is the transcript's own
+/// chat — the doc a subagent tab is keyed by.
+fn open_event(chat_id: Option<&str>, open: &AgentOpen) -> TranscriptEvent {
+    match open {
+        AgentOpen::ChildChat(child) => TranscriptEvent::OpenChildChat {
+            chat_id: child.to_string(),
+        },
+        AgentOpen::Subagent {
+            doc_id,
+            title,
+            frozen,
+        } => TranscriptEvent::OpenSubagent {
+            chat_id: chat_id.unwrap_or_default().to_string(),
+            doc_id: doc_id.to_string(),
+            title: title.to_string(),
+            frozen: *frozen,
+        },
+    }
+}
+
+/// Build a row's click handler for a [`LineClick`]. The closure must be a
+/// concrete type for `on_click`, and the toggle/open bodies are small enough
+/// that expanding them at each call site beats a boxed handler.
+macro_rules! line_click {
+    ($click:expr, $cx:expr, $chat_id:expr) => {{
+        let click = $click;
+        let chat_id = $chat_id;
+        $cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+            cx.stop_propagation();
+            match &click {
+                LineClick::Open(open) => cx.emit(open_event(chat_id.as_deref(), open)),
+                LineClick::Toggle { key, from, open } => {
+                    let entry = this.folds.entry(key.clone()).or_default();
+                    entry.from = *from;
+                    entry.open = Some(*open);
+                    entry.epoch += 1;
+                    entry.toggled_at = Some(Instant::now());
+                    entry.disclosure_at = entry.toggled_at;
+                    cx.notify();
+                }
+            }
+        })
+    }};
+}
+
+/// What activating an agent line opens.
+#[derive(Clone)]
+enum AgentOpen {
+    /// A spawned child chat in the right pane.
+    ChildChat(SharedString),
+    /// A subagent's transcript tab, hosted by the shell.
+    Subagent {
+        doc_id: SharedString,
+        title: SharedString,
+        frozen: bool,
+    },
+}
+
+/// A child update's report body as its line renders it: the fold's current
+/// state and revealed height, plus the content column under the line.
+struct AgentLineBody {
+    open: bool,
+    height: f32,
+    animating: bool,
+    content: AnyElement,
+}
+
+/// Subagent spawn calls — [`ToolCall::is_subagent_spawn`], the shared genus
+/// every driver decodes its spawn tool into. Agent tools form their own group
+/// (see [`is_agent_tool`]) so a running subagent is not buried among ordinary
+/// reads and runs.
 fn is_agent_call(call: &ToolCall) -> bool {
     call.is_subagent_spawn()
 }
 
-/// The chip's GENUS is the call itself, never the ref: docs written before
-/// the claude-driver fix carry stray `subagent_ref`s on ordinary Run chips
+/// An item's GENUS is the call itself, never the ref: docs written before
+/// the claude-driver fix carry stray `subagent_ref`s on ordinary Run rows
 /// (a background shell's `task_notification` was mis-tagged as subagent
-/// traffic), and honoring the ref alone turned those Runs into spawn chips
+/// traffic), and honoring the ref alone turned those Runs into spawn links
 /// that opened empty, never-created subagent docs.
 fn is_agent_tool(item: &ToolItem) -> bool {
-    is_agent_call(&item.call)
-        || matches!(&item.agent, Some(agent) if agent.verb == ZeronChatVerb::Spawn)
+    is_agent_call(&item.call) || is_spawn_exec(item)
 }
 
-/// A chip renders as the spawn LINK (whole-card click → subagent tab) only
-/// when an agent call has actually been bound to its doc.
+/// A row renders as the spawn LINK (click → subagent tab) only when an
+/// agent call has actually been bound to its doc.
 fn is_spawn_link(item: &ToolItem) -> bool {
     is_agent_call(&item.call) && item.subagent_ref.is_some()
 }
 
-/// Ordinary tool groups fold behind a summary header; agent/spawn chips
-/// render as their own always-open row.
-fn tool_group_collapses(tools: &[ToolItem]) -> bool {
-    tools.iter().any(|t| !is_agent_tool(t))
+/// A `zeron chat spawn` exec — the CLI side of the same spawn genus.
+fn is_spawn_exec(item: &ToolItem) -> bool {
+    matches!(&item.agent, Some(agent) if agent.verb == ZeronChatVerb::Spawn)
 }
 
 /// Column budget for soft-wrapping thought text into detail lines. The
 /// detail body is preformatted (no element wrapping), so the wrap happens
-/// here — conservative enough to fit the card at typical transcript widths.
+/// here — conservative enough to fit the row at typical transcript widths.
 const THOUGHT_WRAP_COLS: usize = 96;
 
 /// Flatten a thought's parsed markdown into wrapped, STYLED detail lines —
@@ -1188,22 +1298,22 @@ pub enum RowKind {
         items: Arc<Vec<ChildUpdateItem>>,
     },
     /// An agent-to-agent message with a chat-attributed header (a child's
-    /// `zeron chat tell`). It renders as the same compact card a child update
+    /// `zeron chat tell`). It renders as the report row a single child update
     /// wears instead of a user bubble: the child is reporting, not the user
     /// speaking. Legacy headers without a chat id keep the bubble.
     AgentMessage {
-        /// The sender's chat — resolved live for the card's title and opened
-        /// by its arrow.
+        /// The sender's chat — resolved live for the badge's title and opened
+        /// by its click.
         sender_chat_id: SharedString,
         /// The header's label, the title fallback while the sender is unknown.
         sender_label: SharedString,
-        /// The message body, expanded behind the card's chevron and rendered
+        /// The message body, expanded behind the row's chevron and rendered
         /// as Markdown; the entry's hover action still copies the raw body.
         body: Arc<ReportBody>,
     },
 }
 
-/// One report card's expandable body: the excerpt capped at
+/// One report row's expandable body: the excerpt capped at
 /// [`EXCERPT_MAX_LINES`] source lines and parsed once with the entry's
 /// Markdown parser, the counted tail, and the chat whose checkout the body's
 /// file links open against — a child works in its own worktree, so the files
@@ -1241,7 +1351,7 @@ impl ReportBody {
         }
     }
 
-    /// The expanded card's height: the capped body at the Markdown line
+    /// The expanded row's height: the capped body at the Markdown line
     /// pitch, the gaps between its blocks, and the counted tail row.
     fn height(&self) -> f32 {
         self.text_height() + usize::from(self.truncated_by > 0) as f32 * OUTPUT_LINE_HEIGHT
@@ -1253,14 +1363,24 @@ impl ReportBody {
         let gaps = self.tree.blocks.len().saturating_sub(1);
         (lines + gaps) as f32 * render::MD_LINE_HEIGHT + OUTPUT_BODY_PAD
     }
+
+    /// The collapsed report's target height: one rendered Markdown line, or
+    /// the whole body when it is shorter than that.
+    fn preview_height(&self) -> f32 {
+        REPORT_PREVIEW_HEIGHT.min(self.height())
+    }
 }
+
+/// The line cap every expanded report body keeps — the same budget the
+/// plain-text excerpt enforced, now spent on rendered Markdown lines.
+const EXCERPT_MAX_LINES: usize = 8;
 
 /// One child-chat update inside a [`RowKind::ChildUpdates`] row.
 #[derive(Clone)]
 pub struct ChildUpdateItem {
-    /// The part id — the card's stable identity inside its group.
+    /// The part id — the line's stable identity inside its group.
     pub part_id: SharedString,
-    /// Content pinned at delivery: the card falls back to these when the
+    /// Content pinned at delivery: the line falls back to these when the
     /// child no longer resolves.
     pub child_chat_id: SharedString,
     pub child_title: SharedString,
@@ -1268,7 +1388,7 @@ pub struct ChildUpdateItem {
     pub body: Option<Arc<ReportBody>>,
 }
 
-/// Row identity for a child-update card: hash everything the card paints
+/// Row identity for a child-update line: hash everything the row paints
 /// statically (titles and live status resolve at render, so they only need
 /// the stored copy as a fallback here).
 fn child_updates_version(items: &[ChildUpdateItem]) -> u64 {
@@ -1293,9 +1413,9 @@ fn child_updates_version(items: &[ChildUpdateItem]) -> u64 {
 
 /// Merge adjacent [`RowKind::ChildUpdates`] rows into one group row. The
 /// child notifier writes one system entry per update; bursts therefore
-/// arrive as a RUN of single-card rows, which read better collapsed.
+/// arrive as a RUN of single-update rows, which read better collapsed.
 /// Applied per entry (intra-entry runs) and again on the assembled row list
-/// (cross-entry runs) — the card keeps the run's FIRST row id so a late
+/// (cross-entry runs) — the row keeps the run's FIRST row id so a late
 /// arrival remeasures in place instead of flashing a fresh row.
 fn merge_child_updates(rows: &mut Vec<Row>) {
     let mut ix = 0;
@@ -1586,8 +1706,8 @@ pub fn rows_for_entry(
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
         // An attributed agent message is a child reporting, not the user
-        // speaking: it renders as a compact report card (the child-update
-        // card's path). A legacy header carries no chat id, and an ordinary
+        // speaking: it renders as the report row (the single child update's
+        // path). A legacy header carries no chat id, and an ordinary
         // prompt does not parse at all — both keep the bubble.
         if let Some(sender) = zeron_proto::orchestration::parse_agent_message(&body)
             && let Some(sender_chat_id) = sender.sender_chat_id
@@ -2343,6 +2463,19 @@ pub fn tool_group_summary(tools: &[ToolItem]) -> String {
     #[cfg(test)]
     FORBID_ROW_PREPARATION
         .with(|forbidden| assert!(!forbidden.get(), "tool summary formatting ran on UI thread"));
+    // An agent-only group is one repeated verb, so its count is the useful
+    // summary — the shared per-tool formatter would spell out "Agent" again.
+    if !tools.is_empty() && tools.iter().all(is_agent_tool) {
+        let failed = tools.iter().filter(|tool| tool.is_error).count();
+        let mut summary = match tools.len() {
+            1 => "Spawned 1 agent".to_owned(),
+            n => format!("Spawned {n} agents"),
+        };
+        if failed > 0 {
+            summary.push_str(&format!(" · {failed} failed"));
+        }
+        return summary;
+    }
     let pairs: Vec<(ToolCall, bool)> = tools
         .iter()
         .filter(|t| t.kind == ToolItemKind::Call)
@@ -2488,18 +2621,10 @@ fn tool_group_title(text: SharedString, shimmer_phase: Option<f32>, theme: &Them
 // cell grid).
 pub use zeron_proto::view::{single_line, tool_chip_content};
 
-/// Analytic expanded-chips height — no measurement needed for the fold tween.
-pub fn chips_height(count: usize) -> f32 {
-    if count == 0 {
-        return 0.0;
-    }
-    CHIPS_TOP_PAD + count as f32 * CHIP_HEIGHT + (count as f32 - 1.0) * CHIP_GAP
-}
-
-/// Analytic height an open detail adds to its chip's card (separator + body)
-/// — output blocks by line count, diff blocks via the changes pane's own
-/// [`crate::changes::body_height`]. The chip's own [`CHIP_HEIGHT`] is already
-/// counted by [`chips_height`].
+/// Analytic height an open detail adds to its row (separator + body) — output
+/// blocks by line count, diff blocks via the changes pane's own
+/// [`crate::changes::body_height`]. The row's own [`TOOL_TREE_ROW_HEIGHT`] is
+/// counted by the group's fold heights.
 pub fn detail_height(detail: &ToolDetail) -> f32 {
     let body = match detail {
         ToolDetail::Output {
@@ -3660,7 +3785,7 @@ pub struct Transcript {
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
     /// Chat ids the current rows reference (agent-chip targets, spawn
-    /// children, child-update cards). Rebuilt in [`Self::sync`]; the watcher
+    /// children, child-update rows). Rebuilt in [`Self::sync`]; the watcher
     /// below fingerprints their live titles/status so a child's settle
     /// repaints its chip without a transcript revision.
     chat_refs: std::collections::BTreeSet<String>,
@@ -3709,8 +3834,8 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
-    /// A chip/card referencing a chat was activated: open that chat in the
-    /// right pane (side-chat tab surface).
+    /// A row referencing a chat was activated: open that chat in the right
+    /// pane (side-chat tab surface).
     OpenChildChat { chat_id: String },
 }
 
@@ -3724,8 +3849,7 @@ impl Transcript {
     /// `RenderOptions::chats` + the user bubble's pill ui: `resolve` reads a
     /// per-fingerprint snapshot of every referenced chat (flatten runs
     /// without `App`, so resolution must be captured here), `open` activates
-    /// the chat, and `card` builds the sole-mention card from the same chip
-    /// chrome the spawn cards use.
+    /// the chat, and `card` builds the sole-mention line.
     fn chat_ui(&mut self, cx: &mut Context<Self>) -> chat_pills::ChatUi {
         // Ids the cached resolver missed are queued for a live resolve —
         // reuse the snapshot only while it covered everything asked of it
@@ -3808,67 +3932,67 @@ impl Transcript {
             Rc::new(
                 move |chat_id: &str, _window: &mut Window, cx: &mut gpui::App| {
                     // The token may be a short prefix: resolve first, then
-                    // key and open the card by the OWNED chat's full id.
+                    // key and open the row by the OWNED chat's full id.
                     let chat = crate::chat_pill::ChatRef::resolve_target(state.read(cx), chat_id)
                         .unwrap_or_else(|| crate::chat_pill::ChatRef::unavailable(chat_id));
                     let theme = Theme::of(cx).clone();
                     let chat_id = chat.chat_id.clone();
-                    // The sole-mention card is the spawn chip's chrome — 38px
-                    // slot, 30px card, hairline + ink wash — with the shared
-                    // `chat_chip` (harness mark · title · status glyph) as its
-                    // content and the same open-arrow trail tile.
-                    let arrow = div()
-                        .size(px(18.0))
-                        .flex_none()
-                        .rounded(px(5.0))
-                        .bg(crate::theme::ink(0.06))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
-                                .size(px(11.0))
-                                .text_color(theme.text_muted.opacity(0.8)),
-                        );
-                    let card = div()
-                        .id(SharedString::from(format!("sole-chat-{chat_id}")))
-                        .h(px(CHIP_CARD_HEIGHT))
+                    // A paragraph that is only a chat mention reads as an
+                    // activity row's own line: the chat badge is the link and
+                    // the status glyph rides beside it — no card chrome.
+                    let (mark, tint) = chat
+                        .harness
+                        .map(crate::pickers::harness_brand_icon)
+                        .unwrap_or((crate::icons::BOT, None));
+                    let mut badge = entity_badge(
+                        crate::icons::icon(mark)
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(tint.unwrap_or(theme.text_muted))
+                            .into_any_element(),
+                        chat.title.clone(),
+                        if chat.known {
+                            theme.text.opacity(0.85)
+                        } else {
+                            theme.text_muted
+                        },
+                        &theme,
+                    )
+                    .id(SharedString::from(format!("sole-chat-{chat_id}")));
+                    if chat.known {
+                        badge = badge
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.ink(0.10)))
+                            .on_click({
+                                let open = open.clone();
+                                let chat_id = chat_id.clone();
+                                move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    open(&chat_id, window, cx);
+                                }
+                            });
+                    }
+                    let badge = crate::frost::frosted(5.0, 16.0, badge).into_any_element();
+                    div()
+                        .h(px(TOOL_TREE_ROW_HEIGHT))
                         .w_full()
                         .min_w_0()
                         .flex()
                         .items_center()
                         .gap(px(8.0))
-                        .px(px(8.0))
                         .overflow_hidden()
-                        .rounded(px(9.0))
-                        .border_1()
-                        .border_color(crate::theme::hairline(0.07))
-                        .bg(crate::theme::ink(0.03))
                         .text_size(px(TOOL_LABEL_SIZE))
                         .line_height(px(TOOL_LABEL_LINE_HEIGHT))
-                        .when(chat.known, |card| {
-                            card.cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::ink(0.05)))
-                                .on_click({
-                                    let open = open.clone();
-                                    let chat_id = chat_id.clone();
-                                    move |_, window, cx| open(&chat_id, window, cx)
-                                })
+                        .child(badge)
+                        .when(chat.known, |row| {
+                            row.child(crate::chat_pill::status_glyph(
+                                format!("chat-pill-{chat_id}"),
+                                chat.indicator,
+                                owner,
+                                &theme,
+                                cx,
+                            ))
                         })
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .child(crate::chat_pill::chat_chip(&chat, &theme, owner, cx)),
-                        )
-                        .when(chat.known, |card| card.child(arrow));
-                    div()
-                        .h(px(CHIP_HEIGHT))
-                        .w_full()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .child(card)
                         .into_any_element()
                 },
             )
@@ -3949,8 +4073,8 @@ impl Transcript {
             .ok();
         });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
-        // Live-referencing chips (spawn/tell/wait/output cards, child-update
-        // cards) resolve their titles and status glyphs at RENDER time —
+        // Live-referencing rows (spawn/tell/wait/output, child updates)
+        // resolve their titles and status glyphs at RENDER time —
         // `sync` skips unchanged transcripts, so the chips' own fingerprint
         // drives the repaint instead (the activity menu's observer pattern).
         let chat_ref_watch = cx.observe(&state, |this: &mut Self, state, cx| {
@@ -5236,12 +5360,12 @@ impl Transcript {
             )
         };
 
-        // Child-update cards from back-to-back system entries collapse into
+        // Child-update rows from back-to-back system entries collapse into
         // one "N subagents updated" row.
         merge_child_updates(&mut new_rows);
-        // The update cards continue the run they were delivered into — an
+        // The update rows continue the run they were delivered into — an
         // entry seam's reserved timestamp strip would read as a hole between
-        // the chips and the card, so the row before a card gives it up (the
+        // the chips and the row, so the row before an update gives it up (the
         // run's tail row still carries the timestamp).
         for ix in 1..new_rows.len() {
             if matches!(new_rows[ix].kind, RowKind::ChildUpdates { .. }) {
@@ -5392,11 +5516,6 @@ impl Transcript {
             let RowKind::ToolGroup { tools, .. } = &row.kind else {
                 continue;
             };
-            // Agent/spawn groups are standalone cards, not task trees —
-            // except under compact mode, where they collapse like the rest.
-            if !self.compact_mode && !tool_group_collapses(tools) {
-                continue;
-            }
             live_tool_groups.insert(row.id.clone());
             let historical = historical_tools.get(&row.entry_id);
             let whole_group_historical =
@@ -5616,7 +5735,7 @@ impl Transcript {
     }
 
     /// Refresh the set of chat ids the rendered rows reference (agent exec
-    /// chip targets, spawn children, child-update cards) and re-fingerprint
+    /// chip targets, spawn children, child-update rows) and re-fingerprint
     /// their live identity. The fingerprint observer then repaints when a
     /// referenced child's title, harness, model or status changes — the doc
     /// doesn't change when a child settles, so [`Self::sync`] alone never
@@ -7684,11 +7803,6 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut fold = self.folds.get(row_id).copied().unwrap_or_default();
-        // Agent/spawn chips never fold: they are their own row, always open,
-        // no "Called N tools" header — a running subagent stays visible.
-        // Compact mode is the exception: EVERYTHING sits under the one work
-        // accordion, spawn chips included.
-        let collapses = self.compact_mode || tool_group_collapses(tools);
         let arrival_pending = !cx.reduce_motion()
             && self.tool_group_reveals.get(row_id).is_some_and(|reveal| {
                 reveal.starts.iter().flatten().any(|start| {
@@ -7701,12 +7815,12 @@ impl Transcript {
         // Compact mode never auto-opens — not for the streaming tail, and not
         // to show chips arriving mid-reveal. Collapsed-by-default is the mode.
         let effective_auto_open = auto_open || (arrival_pending && !self.compact_mode);
-        let open = !collapses || fold.open.unwrap_or(effective_auto_open);
+        let open = fold.open.unwrap_or(effective_auto_open);
         // Compact shells only change `open` through `toggle_fold`, which
         // already seeds `from` with the body's measured height — the
         // rendered-height reset below must not clobber it with the shell's
         // own (unused) body tracking.
-        if collapses && !compact_shell {
+        if !compact_shell {
             let reveal = self.tool_group_reveals.entry(row_id.clone()).or_default();
             if reveal
                 .rendered_open
@@ -7723,8 +7837,7 @@ impl Transcript {
         // fold — any unresolved chip (a running tool, a live thought) keeps it
         // pulsing until the turn's work settles. Compute this before the
         // collapsed-body skip, which may empty `tools`.
-        let active =
-            collapses && (auto_open || (self.compact_mode && tools.iter().any(|t| !t.resolved)));
+        let active = auto_open || (self.compact_mode && tools.iter().any(|t| !t.resolved));
         if self.compact_mode && active {
             self.compact_live_entries.insert(row_id.clone());
         }
@@ -7759,23 +7872,31 @@ impl Transcript {
                 && fold
                     .toggled_at
                     .is_some_and(|at| at.elapsed() < TOOL_FOLD.total()));
-        let tools = if body_visible { tools.as_slice() } else { &[] };
         // `zeron chat` execs resolve their live targets/spawn state once per
-        // paint — spawn chips get a shimmed call; the messaging verbs get a
-        // label/detail override.
+        // paint — spawns become agent lines, the messaging verbs get a
+        // label/detail override. Resolved for the WHOLE group, before the
+        // collapsed-body skip empties `tools`: a settled agent group still
+        // reports its running spawns in the header.
         let agent_views: Vec<Option<AgentView>> =
             tools.iter().map(|tool| self.agent_view(tool, cx)).collect();
+        let agent_only = !tools.is_empty() && tools.iter().all(is_agent_tool);
+        let agent_running = agent_views
+            .iter()
+            .flatten()
+            .any(|view| view.line.as_ref().is_some_and(|line| line.running));
+        let tools = if body_visible { tools.as_slice() } else { &[] };
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
         // needs no row rebuild — arrival is a cx.notify, like a fold toggle.
         let details: Vec<Option<Arc<ToolDetail>>> = tools
             .iter()
-            .map(|tool| {
-                // Spawn chips never expand — the subagent doc is the record
-                // of what the tool did, and an inline body would only repeat
-                // it. The whole chip is the "open that doc" click instead.
-                if is_spawn_link(tool) {
+            .zip(&agent_views)
+            .map(|(tool, agent_view)| {
+                // Spawn links never expand — the child chat or the subagent
+                // doc is the record of what the tool did, and an inline body
+                // would only repeat it. The line opens that instead.
+                if agent_view.as_ref().is_some_and(|view| view.line.is_some()) {
                     return None;
                 }
                 // Among fetched blobs, the most recently REQUESTED one wins —
@@ -7797,7 +7918,13 @@ impl Transcript {
         // always answers "what exactly was this call?", output or not.
         let invocations: Vec<Option<Arc<ToolDetail>>> = tools
             .iter()
-            .map(|tool| tool.invocation.clone().filter(|_| !is_spawn_link(tool)))
+            .zip(&agent_views)
+            .map(|(tool, agent_view)| {
+                if agent_view.as_ref().is_some_and(|view| view.line.is_some()) {
+                    return None;
+                }
+                tool.invocation.clone()
+            })
             .collect();
         // Fetch affordance under each open detail whose full payload is still
         // sidecar-only: `(ref, label)`. Diff offered first (the richer
@@ -7893,11 +8020,7 @@ impl Transcript {
                     .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
             })
             .collect();
-        let base_row_height = if collapses {
-            TOOL_TREE_ROW_HEIGHT
-        } else {
-            CHIP_HEIGHT
-        };
+        let base_row_height = TOOL_TREE_ROW_HEIGHT;
         let mut motion_active = false;
         let row_heights: Vec<f32> = details
             .iter()
@@ -7997,6 +8120,7 @@ impl Transcript {
         };
 
         let toggle_id = row_id.clone();
+        let view = cx.entity_id();
         // A quiet summary sits above the activity rail; its chevron occupies
         // the same gutter as the rounded task-tree elbows below it.
         let header = div()
@@ -8059,10 +8183,21 @@ impl Transcript {
                         ),
                         None => tool_group_title(summary.clone(), shimmer_phase, theme),
                     }),
-            );
+            )
+            // A collapsed agent group hides its lines, so the header carries
+            // the live cue: a running spawn must not disappear behind the
+            // fold until its child settles.
+            .when(agent_only && !open && agent_running, |header| {
+                header.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
+                    format!("{row_id}-agents"),
+                    2.0,
+                    theme.glyph,
+                    view,
+                    cx,
+                )))
+            });
 
         if compact_shell {
-            let view = cx.entity_id();
             // The sibling body rows tween under TOOL_FOLD — keep frames (and
             // the chevron's disclosure rotation) pumping until it lands.
             if !reduce_motion
@@ -8093,211 +8228,157 @@ impl Transcript {
                 .into_any_element();
         }
 
-        let chips = div()
-            .pt(px(CHIPS_TOP_PAD))
-            .flex()
-            .flex_col()
-            .gap(px(CHIP_GAP))
-            .children(tools.iter().enumerate().map(|(ix, tool)| {
-                let reveal = reveal_progress[ix];
-                let connector_reveal = connector_progress[ix];
-                let content_reveal = tool_connector_parts(connector_reveal, ix > 0).1;
-                let continuation_reveal =
-                    tool_connector_continuation(connector_progress.get(ix + 1).copied());
-                let row_height = row_heights[ix];
-                let agent_view = agent_views.get(ix).and_then(Option::as_ref);
-                // A `zeron chat spawn` exec IS a subagent spawn chip — same
-                // chrome as a native "Agent: …" call — except the click opens
-                // the spawned CHILD CHAT (when its id is known) instead of a
-                // subagent doc.
-                if let Some(shim) = agent_view.and_then(|view| view.tool.as_ref()) {
-                    let on_open = agent_view
-                        .and_then(|view| view.child.clone())
-                        .map(|chat_id| {
-                            cx.listener(move |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.emit(TranscriptEvent::OpenChildChat {
-                                    chat_id: chat_id.to_string(),
-                                });
-                            })
-                        });
-                    return subagent_chip(
-                        shim,
-                        SharedString::from(format!("{row_id}#s{ix}")),
-                        on_open,
-                        collapses,
-                        theme,
-                        cx.entity_id(),
-                        cx,
-                    );
-                }
-                // Spawn chips are LINKS, not accordions: the click opens the
-                // subagent's transcript as a right-pane tab (the shell hosts
-                // the surface — the chip only announces which doc it indexes).
-                if let Some(doc_id) = tool.subagent_ref.clone().filter(|_| is_spawn_link(tool)) {
-                    let chat_id = self.chat_id.clone().unwrap_or_default();
-                    let title = subagent_tab_title(&tool.call);
-                    let frozen = matches!(
-                        tool.subagent_status,
-                        Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
-                    );
-                    return subagent_chip(
-                        tool,
-                        SharedString::from(format!("{row_id}#s{ix}")),
-                        Some(cx.listener(move |_, _, _, cx| {
-                            cx.emit(TranscriptEvent::OpenSubagent {
-                                chat_id: chat_id.clone(),
-                                doc_id: doc_id.to_string(),
-                                title: title.to_string(),
-                                frozen,
-                            });
-                        })),
-                        collapses,
-                        theme,
-                        cx.entity_id(),
-                        cx,
-                    );
-                }
-                let content = agent_view.and_then(|view| view.content.as_ref());
-                let detail = details[ix].clone();
-                let invocation = invocations[ix].clone();
-                if detail.is_none() && invocation.is_none() {
-                    return reveal_tool_row(
-                        tool_chip(
-                            tool,
-                            content,
-                            collapses,
+        let chips =
+            div()
+                .pt(px(CHIPS_TOP_PAD))
+                .flex()
+                .flex_col()
+                .children(tools.iter().enumerate().map(|(ix, tool)| {
+                    let reveal = reveal_progress[ix];
+                    let connector_reveal = connector_progress[ix];
+                    let content_reveal = tool_connector_parts(connector_reveal, ix > 0).1;
+                    let continuation_reveal =
+                        tool_connector_continuation(connector_progress.get(ix + 1).copied());
+                    let row_height = row_heights[ix];
+                    let agent_view = agent_views.get(ix).and_then(Option::as_ref);
+                    // A spawn link is an agent line: harness mark on the rail, the
+                    // child's live title, and a click that opens the spawned chat
+                    // or the subagent doc it indexes.
+                    if let Some(line) = agent_view.and_then(|view| view.line.as_ref()) {
+                        let key = SharedString::from(format!("{row_id}#s{ix}"));
+                        let row = self.agent_line_row(
+                            &key,
+                            line,
+                            None,
+                            None,
+                            content_reveal,
                             ix > 0,
                             ix + 1 < tools.len(),
-                            content_reveal,
                             connector_reveal,
                             continuation_reveal,
                             theme,
-                            cx.entity_id(),
                             cx,
-                        ),
-                        row_height,
-                        reveal,
-                    );
-                }
-                let affordance = affordances[ix].clone();
-                let open = detail_opens[ix];
-                let dfold = detail_folds[ix];
-                let key = SharedString::from(format!("{row_id}#d{ix}"));
-                // Ordinary tools expand into muted text along the same column.
-                // Subagent fallbacks retain their card; explicit heights keep
-                // the row and group fold animations in sync.
-                let animating = dfold.epoch > 0
-                    && dfold
-                        .toggled_at
-                        .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
-                let toggle_key = key.clone();
-                let mut card = div()
-                    .my(px((base_row_height - CHIP_CARD_HEIGHT) / 2.0))
-                    .when(collapses, |el| el.ml(px(ACTIVITY_TEXT_GAP)))
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .when(!collapses, |card| {
-                        card.rounded(px(9.0))
-                            .border_1()
-                            .border_color(crate::theme::hairline(0.07))
-                            .bg(crate::theme::ink(0.03))
-                    })
-                    .child(
-                        div()
-                            .id(key.clone())
-                            .h(px(if collapses {
-                                CHIP_CARD_HEIGHT
-                            } else {
-                                CHIP_HEADER_HEIGHT
-                            }))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                let entry =
-                                    this.tool_details.entry(toggle_key.clone()).or_default();
-                                let currently_open = entry.open.unwrap_or(open);
-                                entry.from = row_height - base_row_height + CHIP_CARD_HEIGHT;
-                                entry.open = Some(!currently_open);
-                                entry.epoch += 1;
-                                entry.toggled_at = Some(Instant::now());
-                                cx.notify();
-                            }))
-                            .child(chip_header(tool, content, open, theme, cx.entity_id(), cx)),
-                    );
-                // The body stays mounted while the close tween shrinks over it.
-                // Invocation first (what was asked), then output/diff (what
-                // came back), separated by a small gap.
-                if open || animating {
-                    let mut panel = div()
-                        .flex_none()
+                        );
+                        return reveal_tool_row(row, row_height, reveal);
+                    }
+                    let content = agent_view.and_then(|view| view.content.as_ref());
+                    let detail = details[ix].clone();
+                    let invocation = invocations[ix].clone();
+                    if detail.is_none() && invocation.is_none() {
+                        return reveal_tool_row(
+                            tool_chip(
+                                tool,
+                                content,
+                                ix > 0,
+                                ix + 1 < tools.len(),
+                                content_reveal,
+                                connector_reveal,
+                                continuation_reveal,
+                                theme,
+                                cx.entity_id(),
+                                cx,
+                            ),
+                            row_height,
+                            reveal,
+                        );
+                    }
+                    let affordance = affordances[ix].clone();
+                    let open = detail_opens[ix];
+                    let dfold = detail_folds[ix];
+                    let key = SharedString::from(format!("{row_id}#d{ix}"));
+                    // Ordinary tools expand into muted text along the same column.
+                    // Subagent fallbacks retain their card; explicit heights keep
+                    // the row and group fold animations in sync.
+                    let animating = dfold.epoch > 0
+                        && dfold
+                            .toggled_at
+                            .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
+                    let toggle_key = key.clone();
+                    let mut card = div()
+                        .my(px((base_row_height - CHIP_CARD_HEIGHT) / 2.0))
+                        .ml(px(ACTIVITY_TEXT_GAP))
                         .min_w_0()
+                        .flex_1()
                         .flex()
                         .flex_col()
-                        .overflow_hidden();
-                    if let Some(invocation) = invocation.as_deref() {
-                        panel = panel
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
-                            )
-                            .child(detail_body(invocation, None, theme));
-                    }
-                    if let Some(detail) = detail.as_deref() {
-                        panel = panel
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
-                            )
-                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
-                    }
-                    if let Some(ChipAffordance { blob_ref, label }) = affordance {
-                        let loading = matches!(
-                            self.blob_details.get(&blob_ref),
-                            Some(BlobFetch::Loading(_))
-                        );
-                        let mut row = div()
-                            .id(SharedString::from(format!("{key}-blob")))
-                            .h(px(BLOB_AFFORDANCE_HEIGHT))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .text_size(px(TOOL_TEXT_SIZE))
-                            .text_color(theme.text_faint)
-                            .child(label);
-                        if !loading {
-                            row = row
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id(key.clone())
+                                .h(px(CHIP_CARD_HEIGHT))
+                                .flex_none()
+                                .flex()
+                                .items_center()
                                 .cursor_pointer()
-                                .hover(|s| s.text_color(theme.text_muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                    cx.stop_propagation();
+                                    let entry =
+                                        this.tool_details.entry(toggle_key.clone()).or_default();
+                                    let currently_open = entry.open.unwrap_or(open);
+                                    entry.from = row_height - base_row_height + CHIP_CARD_HEIGHT;
+                                    entry.open = Some(!currently_open);
+                                    entry.epoch += 1;
+                                    entry.toggled_at = Some(Instant::now());
                                     cx.notify();
-                                }));
+                                }))
+                                .child(chip_header(tool, content, open, theme, cx.entity_id(), cx)),
+                        );
+                    // The body stays mounted while the close tween shrinks over it.
+                    // Invocation first (what was asked), then output/diff (what
+                    // came back), separated by a small gap.
+                    if open || animating {
+                        let mut panel = div()
+                            .flex_none()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden();
+                        if let Some(invocation) = invocation.as_deref() {
+                            panel = panel
+                                .child(div().h(px(DETAIL_SEPARATOR)).flex_none())
+                                .child(detail_body(invocation, None, theme));
                         }
-                        panel = panel.child(row);
+                        if let Some(detail) = detail.as_deref() {
+                            panel = panel
+                                .child(div().h(px(DETAIL_SEPARATOR)).flex_none())
+                                .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                        }
+                        if let Some(ChipAffordance { blob_ref, label }) = affordance {
+                            let loading = matches!(
+                                self.blob_details.get(&blob_ref),
+                                Some(BlobFetch::Loading(_))
+                            );
+                            let mut row = div()
+                                .id(SharedString::from(format!("{key}-blob")))
+                                .h(px(BLOB_AFFORDANCE_HEIGHT))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .text_size(px(TOOL_TEXT_SIZE))
+                                .text_color(theme.text_faint)
+                                .child(label);
+                            if !loading {
+                                row = row
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(theme.text_muted))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                        cx.notify();
+                                    }));
+                            }
+                            panel = panel.child(row);
+                        }
+                        card = card.child(panel);
                     }
-                    card = card.child(panel);
-                }
-                let card = card.h(px(row_height - base_row_height + CHIP_CARD_HEIGHT));
-                let card = div().min_w_0().flex_1().child(card);
-                let row = div()
-                    .w_full()
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    // Stretch the line alongside the expanded text.
-                    .when(collapses, |row| {
-                        row.child(activity_rail(
+                    let card = card.h(px(row_height - base_row_height + CHIP_CARD_HEIGHT));
+                    let card = div().min_w_0().flex_1().child(card);
+                    let row = div()
+                        .w_full()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        // Stretch the line alongside the expanded text.
+                        .child(activity_rail(
                             tool,
                             content,
                             ix > 0,
@@ -8307,15 +8388,14 @@ impl Transcript {
                             base_row_height,
                             theme,
                         ))
-                    })
-                    .child(card.when(collapses && content_reveal < 1.0, |card| {
-                        card.relative()
-                            .top(px(4.0 * (1.0 - content_reveal)))
-                            .opacity(content_reveal)
-                    }))
-                    .into_any_element();
-                reveal_tool_row(row, row_height, reveal)
-            }));
+                        .child(card.when(content_reveal < 1.0, |card| {
+                            card.relative()
+                                .top(px(4.0 * (1.0 - content_reveal)))
+                                .opacity(content_reveal)
+                        }))
+                        .into_any_element();
+                    reveal_tool_row(row, row_height, reveal)
+                }));
 
         let chips = chips.into_any_element();
 
@@ -8341,31 +8421,24 @@ impl Transcript {
         if let Some(reveal) = self.tool_group_reveals.get_mut(row_id) {
             reveal.rendered_height = body_height;
         }
-        let body: AnyElement = if !collapses {
-            chips.into_any_element()
-        } else {
-            div()
-                .overflow_hidden()
-                .h(px(body_height))
-                .child(chips)
-                .into_any_element()
-        };
+        let body: AnyElement = div()
+            .overflow_hidden()
+            .h(px(body_height))
+            .child(chips)
+            .into_any_element();
 
-        let view = cx.entity_id();
         div()
             .relative()
             .flex()
             .flex_col()
-            // Tool summaries and cards are code-adjacent chrome. Detail bodies
+            // Tool summaries and rows are code-adjacent chrome. Detail bodies
             // retain their explicit mono/diff typography below this boundary.
             .font_family(theme.font_sans_fixed.clone())
-            .when(collapses, |el| {
-                el.child(reveal_tool_row(
-                    header.into_any_element(),
-                    TOOL_GROUP_HEADER_HEIGHT,
-                    header_reveal,
-                ))
-            })
+            .child(reveal_tool_row(
+                header.into_any_element(),
+                TOOL_GROUP_HEADER_HEIGHT,
+                header_reveal,
+            ))
             .child(body)
             .when(motion_active || animate_worked, |group| {
                 group.child(
@@ -8411,14 +8484,62 @@ impl Transcript {
         .map(|child| SharedString::from(child.id.clone()))
     }
 
-    /// What a `zeron chat` exec needs beyond its doc-resident fields,
-    /// resolved against the registry per paint. A spawn gets a SHIMMED call
-    /// so the native chip machinery renders it exactly like a driver-reported
-    /// subagent spawn (`Agent` label, live title as detail, model trail,
-    /// spinner, OpenArrow); the messaging verbs get a label/detail override
-    /// naming their live targets.
+    /// What a tool needs beyond its doc-resident fields, resolved against the
+    /// registry per paint. A spawn becomes an [`AgentLine`]: a `zeron chat
+    /// spawn` exec lifts its child id out of the output (or the registry
+    /// fallback) and a native agent call carries its subagent doc. The
+    /// messaging verbs get a label/detail override naming their live targets.
     fn agent_view(&self, tool: &ToolItem, cx: &gpui::App) -> Option<AgentView> {
-        let agent = tool.agent.as_ref()?;
+        let Some(agent) = tool.agent.as_ref() else {
+            // A native agent call bound to its doc is the same line as a
+            // `zeron chat spawn` exec; only the mark and the open target
+            // differ.
+            if is_spawn_link(tool) {
+                let harness = self
+                    .chat_id
+                    .as_deref()
+                    .map(|chat_id| crate::chat_pill::ChatRef::resolve(self.state.read(cx), chat_id))
+                    .and_then(|chat| chat.harness);
+                let title = subagent_tab_title(&tool.call);
+                let (glyph, running, failed) = match tool.subagent_status {
+                    Some(SubagentStatus::Running) => (Some(AgentGlyph::Spinner), true, false),
+                    Some(SubagentStatus::Failed) => (
+                        Some(AgentGlyph::Status(ChatIndicator::Errored)),
+                        false,
+                        true,
+                    ),
+                    _ => (Some(AgentGlyph::Status(ChatIndicator::Idle)), false, false),
+                };
+                let doc_id = tool.subagent_ref.clone().unwrap_or_default();
+                let frozen = matches!(
+                    tool.subagent_status,
+                    Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
+                );
+                return Some(AgentView {
+                    line: Some(AgentLine {
+                        harness,
+                        title: title.clone(),
+                        known: true,
+                        model: tool.call.subagent_model().map(SharedString::from),
+                        glyph,
+                        running,
+                        failed,
+                        open: Some(AgentOpen::Subagent {
+                            doc_id: doc_id.clone(),
+                            title,
+                            frozen,
+                        }),
+                        status_key: if doc_id.is_empty() {
+                            tool.part_id.clone().into()
+                        } else {
+                            doc_id
+                        },
+                    }),
+                    content: None,
+                });
+            }
+            return None;
+        };
         let state = self.state.read(cx);
         match agent.verb {
             ZeronChatVerb::Spawn => {
@@ -8433,47 +8554,39 @@ impl Transcript {
                     .as_deref()
                     .map(|id| crate::chat_pill::ChatRef::resolve(state, id));
                 let known = child.as_ref().filter(|c| c.known);
-                let detail = known
-                    .map(|c| c.title.to_string())
-                    .or_else(|| agent.label.as_ref().map(|label| label.to_string()))
-                    .or_else(|| agent.targets.first().map(|t| t.to_string()))
-                    .unwrap_or_default();
+                let title = known
+                    .map(|c| c.title.clone())
+                    .or_else(|| agent.label.clone())
+                    .or_else(|| agent.title.clone())
+                    .or_else(|| agent.targets.first().cloned())
+                    .unwrap_or_else(|| SharedString::from("Agent"));
                 let model = known
                     .and_then(|c| c.model.clone())
                     .or_else(|| agent.model.clone());
                 let failed =
                     tool.is_error || known.is_some_and(|c| c.indicator == ChatIndicator::Errored);
-                let running = !failed
-                    && (!tool.resolved
-                        || known.is_some_and(|c| c.indicator == ChatIndicator::Working));
-                let mut shim = tool.clone();
-                shim.agent = None;
-                shim.call = ToolCall::Unknown {
-                    name: if detail.is_empty() {
-                        "Agent".to_string()
-                    } else {
-                        format!("Agent: {detail}")
-                    },
-                    input: model.map(|model| serde_json::json!({ "model": model })),
-                };
-                shim.is_error = failed;
-                // The spinner gate reads (ref, status) — on an unresolved
-                // spawn the part id stands in as the spinner's key.
-                shim.subagent_ref = Some(
-                    child_id
-                        .clone()
-                        .unwrap_or_else(|| tool.part_id.clone().into()),
-                );
-                shim.subagent_status = Some(if running {
-                    SubagentStatus::Running
-                } else if failed {
-                    SubagentStatus::Failed
+                // The spawn command itself still in flight is the first live
+                // cue; once it settles, the child's own indicator takes over.
+                let spawning = !tool.resolved && !tool.is_error;
+                let glyph = if spawning {
+                    Some(AgentGlyph::Spinner)
                 } else {
-                    SubagentStatus::Done
-                });
+                    known.map(|c| AgentGlyph::Status(c.indicator))
+                };
+                let running = !failed
+                    && (spawning || known.is_some_and(|c| c.indicator == ChatIndicator::Working));
                 Some(AgentView {
-                    tool: Some(shim),
-                    child: child_id,
+                    line: Some(AgentLine {
+                        harness: known.and_then(|c| c.harness),
+                        title,
+                        known: known.is_some(),
+                        model,
+                        glyph,
+                        running,
+                        failed,
+                        open: child_id.clone().map(AgentOpen::ChildChat),
+                        status_key: child_id.unwrap_or_else(|| tool.part_id.clone().into()),
+                    }),
                     content: None,
                 })
             }
@@ -8498,8 +8611,7 @@ impl Transcript {
                     ZeronChatVerb::Spawn => unreachable!(),
                 };
                 Some(AgentView {
-                    tool: None,
-                    child: None,
+                    line: None,
                     content: Some(ChipContent {
                         label: label.into(),
                         detail: detail.into(),
@@ -8511,8 +8623,201 @@ impl Transcript {
         }
     }
 
-    /// The "N subagents updated" group row (a quiet header folding over the
-    /// individual cards) or, for a lone update, the card itself.
+    /// The chat badge every agent row names its child with: the entity chip a
+    /// tool row gives a file path, with the chat's harness mark in the well.
+    /// A known chat's badge IS the link to it.
+    fn chat_badge(
+        &self,
+        line: &AgentLine,
+        id: SharedString,
+        on_open: Option<LineClick>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (mark, tint) = line
+            .harness
+            .map(crate::pickers::harness_brand_icon)
+            .unwrap_or((crate::icons::BOT, None));
+        let mut badge = entity_badge(
+            crate::icons::icon(mark)
+                .size(px(14.0))
+                .flex_none()
+                .text_color(tint.unwrap_or(theme.text_muted))
+                .into_any_element(),
+            line.title.clone(),
+            if line.known {
+                theme.text.opacity(0.85)
+            } else {
+                theme.text_muted
+            },
+            theme,
+        )
+        .id(id);
+        if line.known {
+            badge = badge
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.ink(0.10)));
+            if let Some(on_open) = on_open {
+                let chat_id = self.chat_id.clone();
+                badge = badge.on_click(line_click!(on_open, cx, chat_id));
+            }
+        }
+        crate::frost::frosted(5.0, 16.0, badge).into_any_element()
+    }
+
+    /// One agent line inside a fold: the ordinary tree-row layout with the
+    /// child's harness mark at the branch tip. A child update adds an outcome
+    /// word and, under the line, its report body.
+    #[allow(clippy::too_many_arguments)] // a render seam, not a public API
+    fn agent_line_row(
+        &mut self,
+        key: &SharedString,
+        line: &AgentLine,
+        outcome: Option<ChildOutcome>,
+        body: Option<AgentLineBody>,
+        content_reveal: f32,
+        has_predecessor: bool,
+        continues: bool,
+        reveal: f32,
+        continuation_reveal: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view = cx.entity_id();
+        let body_open = body.as_ref().is_some_and(|body| body.open);
+        let body_animating = body.as_ref().is_some_and(|body| body.animating);
+        let open_click = line.open.clone().map(LineClick::Open);
+        // The whole line is the click: a body toggles, otherwise the target
+        // opens. The badge's own click stops propagation, so it never toggles.
+        let row_click = if let Some(body) = &body {
+            Some(LineClick::Toggle {
+                key: key.clone(),
+                from: body.height,
+                open: !body.open,
+            })
+        } else {
+            open_click.clone()
+        };
+        let badge = self.chat_badge(
+            line,
+            SharedString::from(format!("{key}-badge")),
+            open_click,
+            theme,
+            cx,
+        );
+        let row_click = row_click.map(|click| line_click!(click, cx, self.chat_id.clone()));
+        let mut content = div()
+            .id(SharedString::from(format!("{key}-line")))
+            .h(px(CHIP_CARD_HEIGHT))
+            .my(px((TOOL_TREE_ROW_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_size(px(TOOL_LABEL_SIZE))
+            .line_height(px(TOOL_LABEL_LINE_HEIGHT))
+            .text_color(theme.text_muted)
+            .group("agent-line")
+            .when(row_click.is_some(), |content| content.cursor_pointer());
+        if let Some(click) = row_click {
+            content = content.on_click(click);
+        }
+        content = content.child(badge);
+        if let Some(model) = &line.model {
+            content = content.child(model_trail(model.clone(), theme));
+        }
+        if let Some(outcome) = outcome {
+            content = content.child(outcome_word_element(outcome, None, theme));
+        }
+        content = content.child(div().flex_1());
+        if let Some(glyph) = &line.glyph {
+            content = content.child(
+                div().flex_none().child(match glyph {
+                    AgentGlyph::Spinner => crate::loaders::mini_glyph_spinner(
+                        format!("agent-line-{}", line.status_key),
+                        2.0,
+                        theme.glyph,
+                        view,
+                        cx,
+                    )
+                    .into_any_element(),
+                    AgentGlyph::Status(status) => crate::chat_pill::status_glyph(
+                        format!("agent-line-{}", line.status_key),
+                        *status,
+                        view,
+                        theme,
+                        cx,
+                    ),
+                }),
+            );
+        }
+        if body.is_some() {
+            content = content.child(chevron_tile("agent-line", body_open, line.failed, theme));
+        }
+        let mut column = div()
+            .ml(px(ACTIVITY_TEXT_GAP))
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .when(content_reveal < 1.0, |column| {
+                column
+                    .relative()
+                    .top(px(4.0 * (1.0 - content_reveal)))
+                    .opacity(content_reveal)
+            })
+            .child(content);
+        if let Some(body) = body {
+            column = column.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .overflow_hidden()
+                    .h(px(body.height))
+                    .child(body.content),
+            );
+        }
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .child(activity_rail_glyph(
+                crate::icons::BOT,
+                if line.failed {
+                    theme.danger
+                } else {
+                    theme.text_muted
+                },
+                has_predecessor,
+                continues,
+                reveal,
+                continuation_reveal,
+                TOOL_TREE_ROW_HEIGHT,
+                theme,
+            ))
+            .child(column)
+            .when(body_animating, |row| {
+                row.relative().child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            window.on_next_frame(move |_, cx| cx.notify(view));
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The "N agents updated" group row (a quiet header folding over the
+    /// individual lines) or, for a lone update, its report row.
     fn render_child_updates(
         &mut self,
         row_id: &SharedString,
@@ -8521,52 +8826,60 @@ impl Transcript {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // A lone update is the report row itself: no group header, no lead
+        // text — the settle notification IS the row.
         if items.len() == 1 {
-            return self.child_update_card(row_id, 0, &items[0], theme, window, cx);
+            let fold_key = SharedString::from(format!("{row_id}#c0"));
+            let line = self.update_line(&items[0], cx);
+            return self.render_report_row(
+                &fold_key,
+                &line,
+                Some(items[0].outcome),
+                None,
+                items[0].body.as_ref(),
+                theme,
+                window,
+                cx,
+            );
         }
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(false);
         let now = Instant::now();
         let reduce_motion = cx.reduce_motion();
-        // Card heights must stay analytic: CHIP_HEIGHT per card plus its
-        // excerpt when that card's fold is open (mid-tween heights follow
-        // the toggle's target, like detail folds inside a tool group).
-        let item_height = |ix: usize, item: &ChildUpdateItem| {
-            CHIP_HEIGHT
-                + if self
-                    .folds
+        // Line heights must stay analytic: one tree row per update plus the
+        // report body of every item whose own fold is open.
+        let item_folds: Vec<FoldState> = (0..items.len())
+            .map(|ix| {
+                self.folds
                     .get(&SharedString::from(format!("{row_id}#c{ix}")))
                     .copied()
                     .unwrap_or_default()
-                    .open
-                    .unwrap_or(false)
-                {
-                    excerpt_height(item)
-                } else {
-                    0.0
-                }
-        };
+            })
+            .collect();
         let target = if open {
-            items
-                .iter()
-                .enumerate()
-                .map(|(ix, item)| item_height(ix, item))
-                .sum()
+            CHIPS_TOP_PAD
+                + items
+                    .iter()
+                    .zip(&item_folds)
+                    .map(|(item, fold)| {
+                        TOOL_TREE_ROW_HEIGHT
+                            + if fold.open.unwrap_or(false) {
+                                item.body.as_ref().map_or(0.0, |body| body.height())
+                            } else {
+                                0.0
+                            }
+                    })
+                    .sum::<f32>()
         } else {
             0.0
         };
-        let mut animating = false;
-        let body_height = if let Some(at) = fold.toggled_at.filter(|_| !reduce_motion) {
-            let t = TOOL_FOLD.curve.eval(
-                now.saturating_duration_since(at).as_secs_f32() / TOOL_FOLD.total().as_secs_f32(),
-            );
-            if t < 1.0 {
-                animating = true;
-            }
-            motion::lerp(fold.from, target, t)
-        } else {
-            target
-        };
+        let (body_height, group_animating) =
+            fold_tween_height(fold, 0.0, target, open, now, reduce_motion);
+        let mut animating = group_animating
+            || item_folds.iter().any(|fold| {
+                fold.toggled_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < TOOL_FOLD.total())
+            });
         let disclosure_progress = if reduce_motion {
             if open { 1.0 } else { 0.0 }
         } else {
@@ -8612,19 +8925,49 @@ impl Transcript {
                     .flex()
                     .items_center()
                     .overflow_hidden()
-                    .child(SharedString::from(format!(
-                        "{} agents updated",
-                        items.len()
-                    ))),
+                    .child(SharedString::from(child_updates_summary(items))),
             );
-        let body = div().overflow_hidden().h(px(body_height)).child(
-            div().flex().flex_col().gap(px(CHIP_GAP)).children(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, item)| self.child_update_card(row_id, ix, item, theme, window, cx)),
-            ),
-        );
+        let body =
+            div().overflow_hidden().h(px(body_height)).child(
+                div().pt(px(CHIPS_TOP_PAD)).flex().flex_col().children(
+                    items.iter().enumerate().map(|(ix, item)| {
+                        let key = SharedString::from(format!("{row_id}#c{ix}"));
+                        let item_fold = item_folds[ix];
+                        let item_open = item_fold.open.unwrap_or(false);
+                        let line = self.update_line(item, cx);
+                        let item_body = item.body.as_ref().map(|report| {
+                            let (height, item_animating) = fold_tween_height(
+                                item_fold,
+                                0.0,
+                                report.height(),
+                                item_open,
+                                now,
+                                reduce_motion,
+                            );
+                            animating |= item_animating;
+                            AgentLineBody {
+                                open: item_open,
+                                height,
+                                animating: item_animating,
+                                content: self.report_body_clip(&key, report, theme, window, cx),
+                            }
+                        });
+                        self.agent_line_row(
+                            &key,
+                            &line,
+                            Some(item.outcome),
+                            item_body,
+                            1.0,
+                            ix > 0,
+                            item_open || ix + 1 < items.len(),
+                            1.0,
+                            1.0,
+                            theme,
+                            cx,
+                        )
+                    }),
+                ),
+            );
         let view = cx.entity_id();
         div()
             .flex()
@@ -8647,60 +8990,191 @@ impl Transcript {
             .into_any_element()
     }
 
-    /// One child-update card: a synthetic `Agent` call pins the BOT tile the
-    /// native spawn chip carries; the override carries the outcome label and
-    /// the child's live title. The whole card opens the child chat; the
-    /// excerpt expands behind a hover-revealed chevron.
-    fn child_update_card(
-        &mut self,
-        row_id: &SharedString,
-        ix: usize,
-        item: &ChildUpdateItem,
-        theme: &Theme,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// One child update as an agent line: the child's live mark and title.
+    /// The outcome word and the report body are the caller's additions.
+    fn update_line(&self, item: &ChildUpdateItem, cx: &gpui::App) -> AgentLine {
         let chat = {
             let state = self.state.read(cx);
             crate::chat_pill::ChatRef::resolve(state, &item.child_chat_id)
         };
-        let title = if chat.known {
-            chat.title.clone()
-        } else {
-            item.child_title.clone()
-        };
-        // The outcome word IS the label — the same voice a native agent chip
-        // uses — and failure wears the shared danger tint.
-        let (label, failed) = match item.outcome {
-            ChildOutcome::Completed => ("Agent finished", false),
-            ChildOutcome::Errored => ("Agent failed", true),
-            ChildOutcome::Interrupted => ("Agent interrupted", false),
-            ChildOutcome::NeedsInput => ("Agent needs input", false),
-        };
-        let tool = report_tool(item.part_id.clone(), failed);
-        let content = ChipContent {
-            label: label.into(),
-            detail: title,
-            trail_text: None,
-            icon: Some(crate::icons::BOT),
-        };
-        self.report_card(
-            SharedString::from(format!("{row_id}#c{ix}")),
-            &tool,
-            &content,
-            excerpt_body(item),
-            item.child_chat_id.clone(),
-            theme,
-            window,
-            cx,
-        )
+        AgentLine {
+            harness: chat.harness,
+            title: if chat.known {
+                chat.title.clone()
+            } else {
+                item.child_title.clone()
+            },
+            known: chat.known,
+            model: None,
+            glyph: None,
+            running: false,
+            failed: item.outcome == ChildOutcome::Errored,
+            open: chat
+                .known
+                .then(|| AgentOpen::ChildChat(item.child_chat_id.clone())),
+            status_key: item.child_chat_id.clone(),
+        }
     }
 
-    /// An agent message card: a child's attributed `zeron chat tell` wears
-    /// the same chrome as a child-update card — the chip names the sender and
-    /// the arrow opens it — with the message body behind the same hover
-    /// chevron, so a report reads like the settle notification instead of a
-    /// user bubble.
+    /// A report row: the group-header idiom plus a one-line preview of the
+    /// body. Collapsed shows the first rendered Markdown line under a seam;
+    /// expanding reveals the rest in place.
+    #[allow(clippy::too_many_arguments)] // a render seam, not a public API
+    fn render_report_row(
+        &mut self,
+        fold_key: &SharedString,
+        line: &AgentLine,
+        outcome: Option<ChildOutcome>,
+        lead: Option<SharedString>,
+        body: Option<&Arc<ReportBody>>,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fold = self.folds.get(fold_key).copied().unwrap_or_default();
+        let open = body.is_some() && fold.open.unwrap_or(false);
+        let now = Instant::now();
+        let reduce_motion = cx.reduce_motion();
+        let (current, animating) = body.as_ref().map_or((0.0, false), |body| {
+            fold_tween_height(
+                fold,
+                body.preview_height(),
+                body.height(),
+                open,
+                now,
+                reduce_motion,
+            )
+        });
+        let disclosure_progress = if reduce_motion {
+            if open { 1.0 } else { 0.0 }
+        } else {
+            tool_disclosure_progress(open, fold, now)
+        };
+        let view = cx.entity_id();
+        // The header toggles its body, seeded from the current height so a
+        // reversal mid-tween picks up where it is; without a body it opens
+        // the chat when the target is known.
+        let click: Option<LineClick> = if body.is_some() {
+            Some(LineClick::Toggle {
+                key: fold_key.clone(),
+                from: current,
+                open: !open,
+            })
+        } else {
+            line.open.clone().map(LineClick::Open)
+        };
+        let click = click.map(|click| line_click!(click, cx, self.chat_id.clone()));
+        let mut label = div()
+            .min_w_0()
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .overflow_hidden();
+        if let Some(lead) = lead {
+            label = label.child(div().flex_none().child(lead));
+        }
+        label = label.child(self.chat_badge(
+            line,
+            SharedString::from(format!("{fold_key}-badge")),
+            line.open.clone().map(LineClick::Open),
+            theme,
+            cx,
+        ));
+        if let Some(outcome) = outcome {
+            label = label.child(outcome_word_element(outcome, None, theme));
+        }
+        let header = div()
+            .id(fold_key.clone())
+            .group("report-row")
+            .relative()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .pr(px(4.0))
+            .h(px(TOOL_GROUP_HEADER_HEIGHT))
+            .cursor_pointer()
+            .text_size(px(TOOL_LABEL_SIZE))
+            .line_height(px(TOOL_LABEL_LINE_HEIGHT))
+            .text_color(theme.text_muted)
+            .hover(|s| s.text_color(theme.text))
+            .when_some(click, |header, click| header.on_click(click))
+            .child(div().w(px(22.0)).h(px(18.0)).flex_none().relative().when(
+                body.is_some(),
+                |gutter| {
+                    gutter.child(
+                        crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                            .absolute()
+                            .left(px(ACTIVITY_TRUNK_X - 7.0))
+                            .top(px(2.0))
+                            .size(px(14.0))
+                            .with_transformation(gpui::Transformation::rotate(gpui::radians(
+                                -std::f32::consts::FRAC_PI_2 * (1.0 - disclosure_progress),
+                            )))
+                            .text_color(theme.text_muted),
+                    )
+                },
+            ))
+            .child(label)
+            .child(div().flex_1());
+        let mut row = div()
+            .flex()
+            .flex_col()
+            .font_family(theme.font_sans_fixed.clone())
+            .child(header);
+        if let Some(body) = body {
+            let mut area = div()
+                .id(SharedString::from(format!("{fold_key}-body")))
+                .relative()
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .h(px(current))
+                .pl(px(REPORT_TEXT_INSET))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(ACTIVITY_TRUNK_X - 0.5))
+                        .top(px(0.0))
+                        .bottom(px(REPORT_SEAM_BOTTOM_INSET))
+                        .w(px(1.0))
+                        .bg(theme.hairline(0.12)),
+                )
+                .child(self.report_body_clip(fold_key, body, theme, window, cx));
+            // While collapsed the body area is part of the toggle; open, the
+            // body owns its clicks so links and selection keep working.
+            if !open && !animating {
+                let toggle = LineClick::Toggle {
+                    key: fold_key.clone(),
+                    from: current,
+                    open: true,
+                };
+                area =
+                    area.cursor_pointer()
+                        .on_click(line_click!(toggle, cx, self.chat_id.clone()));
+            }
+            row = row.child(area);
+        }
+        row.when(animating, |row| {
+            row.relative().child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        window.on_next_frame(move |_, cx| cx.notify(view));
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+        })
+        .into_any_element()
+    }
+
+    /// An agent message: a child's attributed `zeron chat tell` reads as the
+    /// settle report's row — the mark and live title name the sender and the
+    /// open tile goes to it — so a report is not mistaken for the user
+    /// speaking.
     #[allow(clippy::too_many_arguments)] // render seam, not a public API
     fn render_agent_message(
         &mut self,
@@ -8716,26 +9190,32 @@ impl Transcript {
             let state = self.state.read(cx);
             crate::chat_pill::ChatRef::resolve(state, sender_chat_id)
         };
-        // The chip names the sender; the written label is only the fallback
-        // for a sender the registry cannot resolve yet.
-        let title = if chat.known {
-            chat.title.clone()
-        } else {
-            sender_label.clone()
+        // The mark and title name the sender; the written label is only the
+        // fallback for a sender the registry cannot resolve yet.
+        let line = AgentLine {
+            harness: chat.harness,
+            title: if chat.known {
+                chat.title.clone()
+            } else {
+                sender_label.clone()
+            },
+            known: chat.known,
+            model: None,
+            glyph: None,
+            running: false,
+            failed: false,
+            open: chat
+                .known
+                .then(|| AgentOpen::ChildChat(sender_chat_id.clone())),
+            status_key: sender_chat_id.clone(),
         };
-        let tool = report_tool(row_id.clone(), false);
-        let content = ChipContent {
-            label: "Agent message".into(),
-            detail: title,
-            trail_text: None,
-            icon: Some(crate::icons::BOT),
-        };
-        self.report_card(
-            SharedString::from(format!("{row_id}#m")),
-            &tool,
-            &content,
-            Some(body.clone()),
-            sender_chat_id.clone(),
+        let fold_key = SharedString::from(format!("{row_id}#m"));
+        self.render_report_row(
+            &fold_key,
+            &line,
+            None,
+            Some(SharedString::from("Message from")),
+            Some(body),
             theme,
             window,
             cx,
@@ -8847,212 +9327,182 @@ impl Transcript {
             .into_any_element()
     }
 
-    /// The compact report card shared by child-update and agent-message rows:
-    /// the whole card opens `target_chat_id`'s chat (the spawn chip's
-    /// contract) and an optional body expands behind a hover-revealed
-    /// chevron, exactly like a rail chip's output block. The body renders as
-    /// Markdown whose links belong to the reporting chat.
-    #[allow(clippy::too_many_arguments)] // render seam, not a public API
-    fn report_card(
+    /// The report body's inner structure: Markdown clipped to its own text
+    /// budget, with the counted tail row outside the clip so it is always
+    /// read.
+    fn report_body_clip(
         &mut self,
-        fold_key: SharedString,
-        tool: &ToolItem,
-        content: &ChipContent,
-        body: Option<Arc<ReportBody>>,
-        target_chat_id: SharedString,
+        fold_key: &SharedString,
+        body: &ReportBody,
         theme: &Theme,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let body_h = body.as_ref().map_or(0.0, |body| body.height());
-        let fold = self.folds.get(&fold_key).copied().unwrap_or_default();
-        let open = fold.open.unwrap_or(false);
-        let now = Instant::now();
-        let reduce_motion = cx.reduce_motion();
-        let mut animating = false;
-        let current = if let Some(at) = fold.toggled_at.filter(|_| !reduce_motion) {
-            let t = TOOL_FOLD.curve.eval(
-                now.saturating_duration_since(at).as_secs_f32() / TOOL_FOLD.total().as_secs_f32(),
-            );
-            if t < 1.0 {
-                animating = true;
-            }
-            motion::lerp(fold.from, if open { body_h } else { 0.0 }, t)
-        } else if open {
-            body_h
-        } else {
-            0.0
-        };
-        let toggle = fold_key.clone();
-        // The whole card opens the target chat (the spawn chip's contract);
-        // the body's chevron appears on hover, like a rail chip's.
-        let header = div()
-            .group("tool-header")
-            .id(fold_key.clone())
-            .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
-            .h(px(CHIP_CARD_HEIGHT))
+        let content = self.report_body_markdown(fold_key, body, theme, window, cx);
+        div()
             .w_full()
             .min_w_0()
             .flex()
-            .items_center()
-            .gap(px(8.0))
-            .pr(px(8.0))
-            .overflow_hidden()
-            .rounded(px(9.0))
-            .border_1()
-            .border_color(crate::theme::hairline(0.07))
-            .bg(crate::theme::ink(0.03))
-            .cursor_pointer()
-            .hover(|s| s.bg(crate::theme::ink(0.05)))
-            .on_click(cx.listener(move |_, _, _, cx| {
-                cx.stop_propagation();
-                cx.emit(TranscriptEvent::OpenChildChat {
-                    chat_id: target_chat_id.to_string(),
-                });
-            }))
-            .child(div().flex_1().min_w_0().child(chip_header_row(
-                tool,
-                Some(content),
-                None,
-                theme,
-                cx.entity_id(),
-                cx,
-            )))
-            .when(body.is_some(), |row| {
-                row.child(
-                    div()
-                        .id(SharedString::from(format!("{fold_key}-tog")))
-                        .size(px(18.0))
-                        .flex_none()
-                        .opacity(0.0)
-                        .group_hover("tool-header", |style| style.opacity(1.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            let entry = this.folds.entry(toggle.clone()).or_default();
-                            let was_open = entry.open.unwrap_or(false);
-                            entry.from = if was_open { body_h } else { 0.0 };
-                            entry.open = Some(!was_open);
-                            entry.epoch += 1;
-                            entry.toggled_at = Some(Instant::now());
-                            entry.disclosure_at = entry.toggled_at;
-                            cx.notify();
-                        }))
-                        .child(
-                            crate::icons::icon(if open {
-                                crate::icons::ALT_ARROW_DOWN
-                            } else {
-                                crate::icons::ALT_ARROW_RIGHT
-                            })
-                            .size(px(12.0))
-                            .text_color(theme.text_faint),
-                        ),
-                )
-            })
+            .flex_col()
             .child(
-                div()
-                    .size(px(18.0))
-                    .flex_none()
-                    .rounded(px(5.0))
-                    .bg(crate::theme::ink(0.06))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
-                            .size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.8)),
-                    ),
-            );
-        let mut card = div().w_full().flex_none().flex().flex_col().child(header);
-        if current > 0.0
-            && let Some(body) = &body
-        {
-            // The Markdown area keeps the old excerpt's line budget; the
-            // counted tail row stays outside its clip so it is always read.
-            let content = self.report_body_markdown(&fold_key, body, theme, window, cx);
-            card = card.child(
                 div()
                     .w_full()
                     .min_w_0()
                     .flex_none()
                     .overflow_hidden()
-                    .h(px(current))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex_none()
-                                    .overflow_hidden()
-                                    .max_h(px(body.text_height()))
-                                    .child(content),
-                            )
-                            .when(body.truncated_by > 0, |column| {
-                                column.child(more_lines_row(body.truncated_by, theme))
-                            }),
-                    ),
-            );
-        }
-        let view = cx.entity_id();
-        card.when(animating, |card| {
-            card.relative().child(
-                canvas(
-                    |_, _, _| (),
-                    move |_, _, window, _| {
-                        window.on_next_frame(move |_, cx| cx.notify(view));
-                    },
-                )
-                .absolute()
-                .inset_0(),
+                    .max_h(px(body.text_height()))
+                    .child(content),
             )
+            .when(body.truncated_by > 0, |column| {
+                column.child(more_lines_row(body.truncated_by, theme))
+            })
+            .into_any_element()
+    }
+}
+
+/// The entity chip tool rows use to name a file or a chat: a 22px pill with
+/// a 20px icon well and a truncating label. One geometry for both, so a chat
+/// reads exactly like a file badge; callers frost the result (with their
+/// id/hover wrappers already applied).
+fn entity_badge(
+    icon: AnyElement,
+    label: SharedString,
+    label_color: gpui::Hsla,
+    theme: &Theme,
+) -> gpui::Div {
+    div()
+        .min_w_0()
+        .h(px(22.0))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .gap(px(6.0))
+        .rounded(px(5.0))
+        .bg(theme.ink(0.06))
+        .pl(px(1.0))
+        .pr(px(6.0))
+        .text_color(label_color)
+        .child(
+            div()
+                .size(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .bg(crate::file_icons::well_bg(theme))
+                .child(icon),
+        )
+        .child(div().min_w_0().truncate().child(label))
+}
+
+/// The chat badge every agent row names its child with: the entity chip a
+/// tool row gives a file path, with the chat's harness mark in the well. A
+/// known chat's badge IS the link to it.
+/// The faint model name an agent line trails its title with.
+fn model_trail(model: SharedString, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .h(px(18.0))
+        .flex()
+        .items_center()
+        .text_size(px(11.0))
+        .text_color(theme.text_faint)
+        .child(model)
+}
+
+/// The hover-revealed chevron tile a chip header draws for an expandable
+/// body: 18px, hidden until its row group is hovered.
+fn chevron_tile(group: &'static str, open: bool, failed: bool, theme: &Theme) -> gpui::Div {
+    div()
+        .size(px(18.0))
+        .flex_none()
+        .opacity(0.0)
+        .group_hover(group, |style| style.opacity(1.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(theme.text_muted.opacity(0.8))
+        .child(
+            crate::icons::icon(if open {
+                crate::icons::ALT_ARROW_DOWN
+            } else {
+                crate::icons::ALT_ARROW_RIGHT
+            })
+            .size(px(12.0))
+            .text_color(theme.text_faint)
+            .group_hover(group, |style| {
+                style.text_color(if failed { theme.danger } else { theme.text })
+            }),
+        )
+}
+
+/// The settle word a child update names in its model slot.
+fn outcome_word(outcome: ChildOutcome) -> (&'static str, bool) {
+    match outcome {
+        ChildOutcome::Completed => ("finished", false),
+        ChildOutcome::Errored => ("failed", true),
+        ChildOutcome::Interrupted => ("was interrupted", false),
+        ChildOutcome::NeedsInput => ("needs input", false),
+    }
+}
+
+/// The outcome word as an element: `theme.danger` when it failed, the
+/// caller's slot colour otherwise (the report header inherits its own).
+fn outcome_word_element(
+    outcome: ChildOutcome,
+    fallback: Option<gpui::Hsla>,
+    theme: &Theme,
+) -> gpui::Div {
+    let (text, danger) = outcome_word(outcome);
+    div()
+        .flex_none()
+        .when(danger, |word| word.text_color(theme.danger))
+        .when(!danger && fallback.is_some(), |word| {
+            word.text_color(fallback.unwrap_or(theme.text_faint))
         })
-        .into_any_element()
+        .child(SharedString::from(text))
+}
+
+/// The collapsed label of a multi-update group: how many children settled,
+/// and how many of them failed.
+fn child_updates_summary(items: &[ChildUpdateItem]) -> String {
+    let failed = items
+        .iter()
+        .filter(|item| item.outcome == ChildOutcome::Errored)
+        .count();
+    let mut summary = format!("{} agents updated", items.len());
+    if failed > 0 {
+        summary.push_str(&format!(" · {failed} failed"));
     }
+    summary
 }
 
-/// The synthetic "Agent" call every report card pins the BOT tile with; the
-/// override supplies the label and live detail.
-fn report_tool(part_id: SharedString, failed: bool) -> ToolItem {
-    ToolItem {
-        part_id: part_id.to_string(),
-        call: ToolCall::Unknown {
-            name: "Agent".into(),
-            input: None,
-        },
-        is_error: failed,
-        resolved: true,
-        detail: None,
-        invocation: None,
-        output_ref: None,
-        output_bytes: None,
-        diff_ref: None,
-        subagent_ref: None,
-        subagent_status: None,
-        subagent_tail: None,
-        kind: ToolItemKind::Call,
-        agent: None,
+/// A fold's rendered height for this frame, tweening between `closed` and
+/// `open` under [`TOOL_FOLD`]; the bool reports whether the tween is still
+/// running so the caller can keep pumping frames.
+fn fold_tween_height(
+    fold: FoldState,
+    closed: f32,
+    open: f32,
+    open_now: bool,
+    now: Instant,
+    reduce_motion: bool,
+) -> (f32, bool) {
+    let target = if open_now { open } else { closed };
+    if reduce_motion {
+        return (target, false);
     }
-}
-
-/// The line cap every expanded report body keeps — the same budget the
-/// plain-text excerpt enforced, now spent on rendered Markdown lines.
-const EXCERPT_MAX_LINES: usize = 8;
-
-fn excerpt_body(item: &ChildUpdateItem) -> Option<Arc<ReportBody>> {
-    item.body.clone()
-}
-
-fn excerpt_height(item: &ChildUpdateItem) -> f32 {
-    excerpt_body(item).map_or(0.0, |body| body.height())
+    let Some(at) = fold.toggled_at else {
+        return (target, false);
+    };
+    let t = TOOL_FOLD
+        .curve
+        .eval(now.saturating_duration_since(at).as_secs_f32() / TOOL_FOLD.total().as_secs_f32());
+    if t >= 1.0 {
+        return (target, false);
+    }
+    (motion::lerp(fold.from, target, t), true)
 }
 
 /// The settle word a `zeron chat wait` printed, lifted from the captured
@@ -9472,7 +9922,7 @@ fn file_badge_name(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// The body of an expanded chip card, under the header's separator. Diffs
+/// The body of an expanded tool row, under the header's separator. Diffs
 /// render through the changes pane's section body — the real component, with
 /// hunk headers, dual line-number gutters, accent bars, row washes, and
 /// syntax runs — so an inline tool diff is indistinguishable from the
@@ -9664,9 +10114,6 @@ fn note_chip_detail(tool: &ToolItem) -> String {
 enum ChipTrail {
     /// Expand/collapse chevron — flipped while the detail body is open.
     Chevron { open: bool },
-    /// Top-right "opens elsewhere" arrow — the spawn chip's link to its
-    /// subagent tab.
-    OpenArrow,
 }
 
 /// Header content for chips whose label/detail don't come from the call
@@ -9693,15 +10140,15 @@ fn chip_icon(tool: &ToolItem, content: Option<&ChipContent>) -> &'static str {
         })
 }
 
-/// The chip's content row: icon tile + label + detail line (+ trailing tile
-/// when the chip expands or links out). Shared between the plain chip, the
-/// header of an expandable chip card, and the spawn link chip.
+/// The content row of an ordinary tool row: icon tile + label + detail line
+/// (+ trailing tile when the row expands or links out). The agent spawn line
+/// does not go through here — it names its child with the chat badge.
 ///
-/// Spawn chips carry their subagent's lifecycle VISUALLY, in the chip's own
-/// language: while running the mini working spinner (the sidebar's) pulses
-/// at the right of the ordinary static detail; done is the ordinary quiet
-/// chip; failed takes the danger tint — no status words, no live text (a
-/// header rewriting itself per stream delta read as noise — user report).
+/// A bound subagent row carries its lifecycle VISUALLY: while running the
+/// mini working spinner (the sidebar's) pulses at the right of the ordinary
+/// static detail; done is the ordinary quiet row; failed takes the danger
+/// tint — no status words, no live text (a header rewriting itself per
+/// stream delta read as noise — user report).
 fn chip_header_row(
     tool: &ToolItem,
     content: Option<&ChipContent>,
@@ -9721,7 +10168,6 @@ fn chip_header_row(
             (label.into(), detail.into())
         }
     };
-    let activity = !is_agent_tool(tool);
     let file_path = match &tool.call {
         ToolCall::ReadFile { path }
         | ToolCall::WriteFile { path, .. }
@@ -9736,7 +10182,7 @@ fn chip_header_row(
             && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
     // Text resolves its color during layout, so group-hover text needs stable
     // child IDs under the keyed, expandable header to retain hover state.
-    let hover_text = activity && trail.is_some() && !failed;
+    let hover_text = trail.is_some() && !failed;
     let tint = if failed {
         theme.danger
     } else {
@@ -9744,48 +10190,21 @@ fn chip_header_row(
     };
     div()
         .group("tool-header")
-        .h(px(if activity {
-            CHIP_CARD_HEIGHT
-        } else {
-            CHIP_HEADER_HEIGHT
-        }))
+        .h(px(CHIP_CARD_HEIGHT))
         .w_full()
         .min_w_0()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.0))
-        .px(px(if activity { 0.0 } else { 8.0 }))
         .text_size(px(TOOL_LABEL_SIZE))
         .line_height(px(TOOL_LABEL_LINE_HEIGHT))
-        .when(!activity, |row| {
-            row.child(
-                // Subagent icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
-                // icon size-3).
-                div()
-                    .size(px(18.0))
-                    .flex_none()
-                    .rounded(px(5.0))
-                    .bg(crate::theme::ink(0.08))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        crate::icons::icon(chip_icon(tool, content))
-                            .size(px(12.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-        })
         .child(
             div()
                 .flex_none()
                 .h(px(TOOL_LABEL_LINE_HEIGHT))
                 .flex()
                 .items_center()
-                .when(!activity, |label| {
-                    label.font_weight(gpui::FontWeight::MEDIUM)
-                })
                 .text_color(tint)
                 .child(label)
                 .map(|label| {
@@ -9801,7 +10220,6 @@ fn chip_header_row(
         )
         .child(
             div()
-                .when(!activity, |detail| detail.flex_1())
                 .min_w_0()
                 .h(px(if file_path.is_some() {
                     22.0
@@ -9809,68 +10227,40 @@ fn chip_header_row(
                     TOOL_LABEL_LINE_HEIGHT
                 }))
                 .flex()
-                .when(activity && detail.is_empty(), |detail| detail.hidden())
+                .when(detail.is_empty(), |detail| detail.hidden())
                 .items_center()
                 .truncate()
                 .text_color(if failed {
                     theme.danger
-                } else if activity {
-                    theme.text_muted
                 } else {
-                    theme.text.opacity(0.85)
+                    theme.text_muted
                 })
                 .child(if let Some(path) = file_path {
-                    let badge = div()
-                        .min_w_0()
-                        .h(px(22.0))
-                        .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .gap(px(6.0))
-                        .rounded(px(5.0))
-                        .bg(theme.ink(0.06))
-                        .pl(px(1.0))
-                        .pr(px(6.0))
-                        .text_color(if failed {
+                    let badge = entity_badge(
+                        crate::file_icons::icon(
+                            crate::file_icons::FileIconIdentity::file(path),
+                            theme.appearance,
+                        )
+                        .size(px(14.0))
+                        .into_any_element(),
+                        SharedString::from(file_badge_name(path).to_owned()),
+                        if failed {
                             theme.danger
                         } else {
                             theme.text.opacity(0.85)
-                        })
-                        .child(
-                            div()
-                                .size(px(20.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.0))
-                                .bg(crate::file_icons::well_bg(theme))
-                                .child(
-                                    crate::file_icons::icon(
-                                        crate::file_icons::FileIconIdentity::file(path),
-                                        theme.appearance,
-                                    )
-                                    .size(px(14.0)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .child(SharedString::from(file_badge_name(path).to_owned())),
-                        )
-                        .map(|badge| {
-                            if hover_text {
-                                badge
-                                    .id("tool-file-badge")
-                                    .group_hover("tool-header", |style| {
-                                        style.text_color(theme.text)
-                                    })
-                                    .into_any_element()
-                            } else {
-                                badge.into_any_element()
-                            }
-                        });
+                        },
+                        theme,
+                    )
+                    .map(|badge| {
+                        if hover_text {
+                            badge
+                                .id("tool-file-badge")
+                                .group_hover("tool-header", |style| style.text_color(theme.text))
+                                .into_any_element()
+                        } else {
+                            badge.into_any_element()
+                        }
+                    });
                     crate::frost::frosted(5.0, 16.0, badge).into_any_element()
                 } else {
                     div().min_w_0().truncate().child(detail).into_any_element()
@@ -9942,46 +10332,14 @@ fn chip_header_row(
         })
         .when_some(trail, |row, trail| {
             // Trailing tile matching the group header's: a chevron for the
-            // output/diff accordion, or the open-arrow for spawn chips.
-            let tile = div()
-                .size(px(18.0))
-                .flex_none()
-                .when(activity, |tile| {
-                    tile.opacity(0.0)
-                        .group_hover("tool-header", |style| style.opacity(1.0))
-                })
-                .when(!activity, |tile| {
-                    tile.rounded(px(5.0)).bg(crate::theme::ink(0.06))
-                })
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.text_muted.opacity(0.8));
+            // output/diff accordion, revealed on hover.
             row.child(match trail {
-                ChipTrail::Chevron { open } => tile.child(
-                    crate::icons::icon(if open {
-                        crate::icons::ALT_ARROW_DOWN
-                    } else {
-                        crate::icons::ALT_ARROW_RIGHT
-                    })
-                    .size(px(12.0))
-                    .text_color(theme.text_faint)
-                    .when(activity, |caret| {
-                        caret.group_hover("tool-header", |style| {
-                            style.text_color(if failed { theme.danger } else { theme.text })
-                        })
-                    }),
-                ),
-                ChipTrail::OpenArrow => tile.child(
-                    crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
-                        .size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.8)),
-                ),
+                ChipTrail::Chevron { open } => chevron_tile("tool-header", open, failed, theme),
             })
         })
 }
 
-/// The header row of an expandable chip card.
+/// The header row of an expandable tool row.
 fn chip_header(
     tool: &ToolItem,
     content: Option<&ChipContent>,
@@ -10091,12 +10449,37 @@ fn activity_rail(
     row_height: f32,
     theme: &Theme,
 ) -> gpui::Div {
-    let color = theme.hairline(0.12);
     let tint = if tool.is_error {
         theme.danger
     } else {
         theme.text_muted
     };
+    activity_rail_glyph(
+        chip_icon(tool, content),
+        tint,
+        has_predecessor,
+        continues,
+        reveal,
+        continuation_reveal,
+        row_height,
+        theme,
+    )
+}
+
+/// The rail with its branch-tip glyph left to the caller: an agent line draws
+/// the agent tool glyph like every other row.
+#[allow(clippy::too_many_arguments)] // a paint seam, not a public API
+fn activity_rail_glyph(
+    glyph: &'static str,
+    tint: gpui::Hsla,
+    has_predecessor: bool,
+    continues: bool,
+    reveal: f32,
+    continuation_reveal: f32,
+    row_height: f32,
+    theme: &Theme,
+) -> gpui::Div {
+    let color = theme.hairline(0.12);
     let (incoming_reveal, branch_reveal) = tool_connector_parts(reveal, has_predecessor);
     div()
         .relative()
@@ -10145,7 +10528,7 @@ fn activity_rail(
             .inset_0(),
         )
         .child(
-            crate::icons::icon(chip_icon(tool, content))
+            crate::icons::icon(glyph)
                 .absolute()
                 .left(px(ACTIVITY_ICON_LEFT))
                 .top(px(row_height / 2.0 - ACTIVITY_ICON_SIZE / 2.0))
@@ -10177,11 +10560,11 @@ fn activity_ribbon(path: &mut PathBuilder, points: &[Point<Pixels>]) {
     path.close();
 }
 
-/// A plain activity row, or a card for a subagent without a linked document.
+/// A plain activity row: the rail in the gutter, the chip content beside it.
+#[allow(clippy::too_many_arguments)] // a paint seam, not a public API
 fn tool_chip(
     tool: &ToolItem,
     content: Option<&ChipContent>,
-    rail: bool,
     has_predecessor: bool,
     continues: bool,
     content_reveal: f32,
@@ -10191,32 +10574,26 @@ fn tool_chip(
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> AnyElement {
-    let row_height = if rail {
-        TOOL_TREE_ROW_HEIGHT
-    } else {
-        CHIP_HEIGHT
-    };
+    let row_height = TOOL_TREE_ROW_HEIGHT;
     div()
         .h(px(row_height))
         .w_full()
         .flex_none()
         .flex()
         .flex_row()
-        .when(rail, |row| {
-            row.child(activity_rail(
-                tool,
-                content,
-                has_predecessor,
-                continues,
-                connector_reveal,
-                continuation_reveal,
-                row_height,
-                theme,
-            ))
-        })
+        .child(activity_rail(
+            tool,
+            content,
+            has_predecessor,
+            continues,
+            connector_reveal,
+            continuation_reveal,
+            row_height,
+            theme,
+        ))
         .child(
             div()
-                .when(rail, |el| el.ml(px(ACTIVITY_TEXT_GAP)))
+                .ml(px(ACTIVITY_TEXT_GAP))
                 .my(px((row_height - CHIP_CARD_HEIGHT) / 2.0))
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
@@ -10224,74 +10601,12 @@ fn tool_chip(
                 .flex()
                 .items_center()
                 .overflow_hidden()
-                .when(!rail, |card| {
-                    card.rounded(px(9.0))
-                        .border_1()
-                        .border_color(crate::theme::hairline(0.07))
-                        .bg(crate::theme::ink(0.03))
-                })
-                .when(rail && content_reveal < 1.0, |card| {
+                .when(content_reveal < 1.0, |card| {
                     card.relative()
                         .top(px(4.0 * (1.0 - content_reveal)))
                         .opacity(content_reveal)
                 })
                 .child(chip_header_row(tool, content, None, theme, view, cx)),
-        )
-        .into_any_element()
-}
-
-/// A spawn chip: same card as [`tool_chip`], but the WHOLE card is the
-/// "open the subagent tab" click (open-arrow tile in the trailing slot).
-/// No accordion — an inline body would only repeat the subagent's own
-/// transcript. The group guide rail is omitted for agent-only rows (no
-/// collapse header for it to hang from).
-fn subagent_chip(
-    tool: &ToolItem,
-    id: SharedString,
-    on_open: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
-    rail: bool,
-    theme: &Theme,
-    view: gpui::EntityId,
-    cx: &mut gpui::App,
-) -> AnyElement {
-    let trail = on_open.is_some().then_some(ChipTrail::OpenArrow);
-    div()
-        .h(px(CHIP_HEIGHT))
-        .w_full()
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .when(rail, |row| {
-            row.child(
-                div()
-                    .ml(px(12.0))
-                    .h_full()
-                    .w(px(1.0))
-                    .flex_none()
-                    .bg(crate::theme::ink(0.08)),
-            )
-        })
-        .child(
-            div()
-                .id(id)
-                .when(rail, |el| el.ml(px(12.0)))
-                .h(px(CHIP_CARD_HEIGHT))
-                .min_w_0()
-                .flex_1()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .rounded(px(9.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.07))
-                .bg(crate::theme::ink(0.03))
-                .when_some(on_open, |card, on_open| {
-                    card.cursor_pointer()
-                        .hover(|s| s.bg(crate::theme::ink(0.05)))
-                        .on_click(on_open)
-                })
-                .child(chip_header_row(tool, None, trail, theme, view, cx)),
         )
         .into_any_element()
 }
@@ -13070,9 +13385,9 @@ mod tests {
 
     #[test]
     fn agent_calls_split_out_of_ordinary_tool_groups() {
-        // Agent/spawn chips must not share a collapse with Reads/Runs: a
-        // lone Agent used to hide behind "Called 1 tool", and a mixed
-        // group hid the running subagent until the user opened the fold.
+        // Agent/spawn rows must not share a fold with Reads/Runs: a mixed
+        // group would hide a running subagent behind the ordinary tools'
+        // summary until the user opened it.
         let entry = assistant(
             "m-agent",
             MessageStatus::Complete,
@@ -13108,27 +13423,25 @@ mod tests {
             panic!("ordinary group expected")
         };
         assert_eq!(tools.len(), 2);
-        assert!(tool_group_collapses(tools));
+        assert!(tools.iter().all(|t| !is_agent_tool(t)));
         assert!(!*auto_open);
 
         let RowKind::ToolGroup { tools, .. } = &rows[2].kind else {
             panic!("agent group expected")
         };
         assert_eq!(tools.len(), 1);
-        assert!(!tool_group_collapses(tools));
         assert!(is_agent_tool(&tools[0]));
 
         let RowKind::ToolGroup { tools, .. } = &rows[3].kind else {
             panic!("ordinary group expected")
         };
         assert_eq!(tools.len(), 1);
-        assert!(tool_group_collapses(tools));
+        assert!(tools.iter().all(|t| !is_agent_tool(t)));
 
         let RowKind::ToolGroup { tools, .. } = &rows[4].kind else {
             panic!("consecutive agents share a group")
         };
         assert_eq!(tools.len(), 2);
-        assert!(!tool_group_collapses(tools));
         assert!(tools.iter().all(is_agent_tool));
     }
 
@@ -13137,8 +13450,8 @@ mod tests {
         // Docs written before the claude-driver fix carry subagent refs on
         // ordinary Run chips (a background shell's task_notification was
         // mis-tagged as subagent traffic). The ref alone must not change the
-        // chip's genus: it folds with its neighbors and renders as a plain
-        // tool, never as a spawn link to a doc that was never created.
+        // chip's genus: it stays in the ordinary tools' group and renders as
+        // a plain row, never as a spawn link to a doc that was never created.
         let mut stray = tool_part("b", "git clone …");
         if let MessagePart::Tool {
             subagent_ref,
@@ -13160,13 +13473,12 @@ mod tests {
             panic!("tool group expected")
         };
         assert_eq!(tools.len(), 3);
-        assert!(tool_group_collapses(tools));
         assert!(tools.iter().all(|t| !is_agent_tool(t)));
         assert!(tools.iter().all(|t| !is_spawn_link(t)));
     }
 
     #[test]
-    fn lone_completed_agent_stays_uncollapsed() {
+    fn lone_agent_forms_its_own_group() {
         let entry = assistant(
             "m-lone",
             MessageStatus::Complete,
@@ -13181,10 +13493,10 @@ mod tests {
             panic!("agent group expected")
         };
         assert_eq!(tools.len(), 1);
-        assert!(!tool_group_collapses(tools), "no 'Called 1 tool' wrap");
+        assert!(tools.iter().all(is_agent_tool));
         assert!(
             !*auto_open,
-            "auto_open is a streaming flag; agent rows ignore it at paint"
+            "auto_open is a streaming flag; the fold follows it at paint"
         );
     }
 
@@ -13213,11 +13525,10 @@ mod tests {
         let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
             panic!()
         };
-        assert!(tool_group_collapses(tools));
+        assert!(tools.iter().all(|t| !is_agent_tool(t)));
         let RowKind::ToolGroup { tools, .. } = &rows[1].kind else {
             panic!()
         };
-        assert!(!tool_group_collapses(tools));
         assert!(is_agent_call(&tools[0].call));
     }
 
@@ -15404,6 +15715,153 @@ mod tests {
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
     }
 
+    /// A spawn tool item: the `zeron chat spawn` exec carries its parsed verb,
+    /// which is what makes the group an agent group.
+    fn spawn_tool(title: &str) -> ToolItem {
+        let call = ToolCall::Exec {
+            command: format!("zeron chat spawn --title \"{title}\""),
+        };
+        ToolItem {
+            part_id: format!("spawn-{title}"),
+            agent: agent_exec(&call, None),
+            call,
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            kind: ToolItemKind::Call,
+        }
+    }
+
+    fn native_agent_tool(description: &str) -> ToolItem {
+        ToolItem {
+            part_id: "native".into(),
+            call: ToolCall::Unknown {
+                name: format!("Agent: {description}"),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            kind: ToolItemKind::Call,
+            agent: None,
+        }
+    }
+
+    #[test]
+    fn agent_groups_name_their_spawns() {
+        assert_eq!(
+            tool_group_summary(&[spawn_tool("audit")]),
+            "Spawned 1 agent"
+        );
+        let mut tools = vec![
+            native_agent_tool("scan repo"),
+            spawn_tool("audit"),
+            spawn_tool("backoff"),
+        ];
+        assert_eq!(tool_group_summary(&tools), "Spawned 3 agents");
+        tools[1].is_error = true;
+        assert_eq!(tool_group_summary(&tools), "Spawned 3 agents · 1 failed");
+        // A mixed group keeps the ordinary per-tool summary.
+        let mut mixed = tools;
+        mixed.push(ToolItem {
+            part_id: "plain".into(),
+            call: ToolCall::Exec {
+                command: "ls".into(),
+            },
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            kind: ToolItemKind::Call,
+            agent: None,
+        });
+        assert!(!tool_group_summary(&mixed).starts_with("Spawned"));
+    }
+
+    #[test]
+    fn outcome_words_name_the_settle() {
+        assert_eq!(outcome_word(ChildOutcome::Completed), ("finished", false));
+        assert_eq!(outcome_word(ChildOutcome::Errored), ("failed", true));
+        assert_eq!(
+            outcome_word(ChildOutcome::Interrupted),
+            ("was interrupted", false)
+        );
+        assert_eq!(
+            outcome_word(ChildOutcome::NeedsInput),
+            ("needs input", false)
+        );
+    }
+
+    #[test]
+    fn child_update_groups_count_their_failures() {
+        let item = |id: &str, outcome: ChildOutcome| ChildUpdateItem {
+            part_id: id.into(),
+            child_chat_id: "child".into(),
+            child_title: "child".into(),
+            outcome,
+            body: None,
+        };
+        assert_eq!(
+            child_updates_summary(&[
+                item("a", ChildOutcome::Completed),
+                item("b", ChildOutcome::Errored),
+            ]),
+            "2 agents updated · 1 failed"
+        );
+        assert_eq!(
+            child_updates_summary(&[
+                item("a", ChildOutcome::Completed),
+                item("b", ChildOutcome::NeedsInput),
+            ]),
+            "2 agents updated"
+        );
+    }
+
+    #[test]
+    fn report_preview_shows_one_line() {
+        let body = |text: &str| {
+            ReportBody::capped(
+                text,
+                &SharedString::from("chat"),
+                &mut |_, text| Arc::new(parse_full(text)),
+                "preview",
+            )
+        };
+        let one = body("one line");
+        assert_eq!(
+            one.preview_height(),
+            render::MD_LINE_HEIGHT.min(one.height())
+        );
+        assert_eq!(one.preview_height(), render::MD_LINE_HEIGHT);
+        let many = body("first\nsecond\nthird\nfourth");
+        assert!(many.height() > render::MD_LINE_HEIGHT);
+        assert_eq!(
+            many.preview_height(),
+            render::MD_LINE_HEIGHT.min(many.height())
+        );
+        assert_eq!(many.preview_height(), render::MD_LINE_HEIGHT);
+    }
+
     #[test]
     fn subagent_tab_titles() {
         // The tab is the BARE task — the "Agent:" genus is stripped.
@@ -15512,7 +15970,7 @@ mod tests {
     #[test]
     fn multiline_command_flattens_to_one_chip_line() {
         // The user's breaker: a multi-line script in a Run chip. The detail
-        // must come out as ONE sanitized line — the chip's fixed 30px card
+        // must come out as ONE sanitized line — the row's fixed-height label
         // then truncates it with an ellipsis like the original's CSS.
         let (label, detail) = tool_chip_content(&ToolCall::Exec {
             command: "set -e\nfixture_in_original=0\n\tgrep -c  \"x\"".into(),
@@ -15520,8 +15978,6 @@ mod tests {
         assert_eq!(label, "Run");
         assert_eq!(detail, "set -e fixture_in_original=0 grep -c \"x\"");
         assert!(!detail.contains('\n'));
-        // The chip row height is a constant, independent of content shape.
-        assert_eq!(chips_height(1), CHIPS_TOP_PAD + CHIP_HEIGHT);
         // Every detail kind is sanitized (MCP inputs / queries are model text).
         let (_, q) = tool_chip_content(&ToolCall::WebSearch {
             query: "line one\nline two".into(),
@@ -15675,16 +16131,6 @@ mod tests {
         assert_eq!(single_line("plain"), "plain");
         assert_eq!(single_line(""), "");
         assert_eq!(single_line("\n\n"), "");
-    }
-
-    #[test]
-    fn chips_height_is_analytic() {
-        assert_eq!(chips_height(0), 0.0);
-        assert_eq!(chips_height(1), CHIPS_TOP_PAD + CHIP_HEIGHT);
-        assert_eq!(
-            chips_height(3),
-            CHIPS_TOP_PAD + 3.0 * CHIP_HEIGHT + 2.0 * CHIP_GAP
-        );
     }
 
     #[test]
@@ -15941,10 +16387,8 @@ mod tests {
         };
         match &row.kind {
             RowKind::ToolGroup { tools, .. } => {
-                assert!(
-                    !tool_group_collapses(tools),
-                    "agent chips never fold behind a summary"
-                );
+                assert!(tools.iter().all(is_agent_tool));
+                assert_eq!(tool_group_summary(tools), "Spawned 1 agent");
                 assert_eq!(
                     tools[0].agent.as_ref().map(|a| a.verb),
                     Some(ZeronChatVerb::Spawn)
@@ -16070,7 +16514,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn spawn_chip_resolves_child_model_and_arrow_from_the_registry(cx: &mut gpui::TestAppContext) {
+    fn spawn_line_resolves_child_model_and_target_from_the_registry(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -16108,15 +16552,20 @@ mod tests {
                 let view = this
                     .agent_view(&tools[0], cx)
                     .expect("the spawn should classify");
-                // Registry fallback paired the chip with its child.
-                assert_eq!(view.child.as_deref(), Some("c-beta"));
-                let shim = view.tool.expect("a spawn renders on a shimmed call");
-                assert_eq!(shim.subagent_ref.as_deref(), Some("c-beta"));
+                let line = view.line.expect("a spawn renders as an agent line");
+                // Registry fallback paired the line with its child.
+                assert!(matches!(
+                    line.open,
+                    Some(AgentOpen::ChildChat(ref chat_id)) if chat_id == "c-beta"
+                ));
+                assert_eq!(line.status_key.as_ref(), "c-beta");
                 assert_eq!(
-                    shim.call.subagent_model(),
+                    line.model.as_deref(),
                     Some("claude-haiku-4-5"),
-                    "the chip must name the child's real model"
+                    "the line must name the child's real model"
                 );
+                assert!(line.known, "a resolved child is a known chat");
+                assert_eq!(line.harness, Some(zeron_proto::HarnessId::ClaudeCode));
             });
         });
     }
@@ -16401,7 +16850,53 @@ mod tests {
 #[cfg(feature = "appshots-fixture")]
 impl Transcript {
     pub fn fixture_appshots_start(&mut self, cx: &mut Context<Self>) {
+        // Release the tail pin first: a pinned list glides straight back to
+        // the end, so the scroll to the top would never land.
+        self.stop_automatic_scrolling();
         self.list.scroll_to(gpui::ListOffset::default());
         cx.notify();
+    }
+
+    /// Open or close every agent fold, so one capture run can show the
+    /// activity collapsed and expanded.
+    pub fn fixture_appshots_agent_folds(&mut self, open: bool, cx: &mut Context<Self>) {
+        let mut keys: Vec<SharedString> = Vec::new();
+        for row in &self.rows {
+            match &row.kind {
+                RowKind::ToolGroup {
+                    tools,
+                    compact_shell,
+                    ..
+                } => {
+                    if !compact_shell && !tools.is_empty() && tools.iter().all(is_agent_tool) {
+                        keys.push(row.id.clone());
+                    }
+                }
+                RowKind::ChildUpdates { items } => {
+                    if items.len() > 1 {
+                        keys.push(row.id.clone());
+                    }
+                    for (ix, item) in items.iter().enumerate() {
+                        if item.body.is_some() {
+                            keys.push(SharedString::from(format!("{}#c{ix}", row.id)));
+                        }
+                    }
+                }
+                RowKind::AgentMessage { .. } => {
+                    keys.push(SharedString::from(format!("{}#m", row.id)));
+                }
+                _ => {}
+            }
+        }
+        for key in keys {
+            self.folds.entry(key).or_default().open = Some(open);
+        }
+        cx.notify();
+    }
+
+    /// Scroll the list to the bottom the same way the jump-to-bottom control
+    /// does.
+    pub fn fixture_appshots_end(&mut self, cx: &mut Context<Self>) {
+        self.jump_to_bottom(cx);
     }
 }

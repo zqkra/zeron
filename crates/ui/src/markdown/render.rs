@@ -1865,10 +1865,10 @@ fn text_element(
                 .into_any_element();
         }
     }
-    // A paragraph that is only one `@chat:` mention renders as the spawn
-    // card (chip + open arrow), like `sole_file_reference` does for files.
-    // Deferred: `chat_chip`'s status spinner needs `App`, which the render
-    // pass lacks — the child builds inside request_layout.
+    // A paragraph that is only one `@chat:` mention renders as the activity
+    // row's own line (chat badge + status glyph), like `sole_file_reference`
+    // does for files. Deferred: the status spinner needs `App`, which the
+    // render pass lacks — the child builds inside request_layout.
     if !bold_default
         && let Some(chats) = &opts.chats
         && let Some(chat_id) = sole_chat_mention(runs)

@@ -15643,6 +15643,16 @@ impl Shell {
         self.transcript
             .update(cx, |t, cx| t.fixture_appshots_start(cx));
     }
+
+    pub fn fixture_appshots_transcript_agent_folds(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.transcript
+            .update(cx, |t, cx| t.fixture_appshots_agent_folds(open, cx));
+    }
+
+    pub fn fixture_appshots_transcript_end(&mut self, cx: &mut Context<Self>) {
+        self.transcript
+            .update(cx, |t, cx| t.fixture_appshots_end(cx));
+    }
 }
 
 #[cfg(test)]

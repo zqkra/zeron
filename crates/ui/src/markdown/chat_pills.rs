@@ -35,8 +35,8 @@ pub struct ChatUi {
     pub resolve: Rc<dyn Fn(&str) -> ChatRef>,
     /// Click activation — opens the referenced chat in the right pane.
     pub open: Rc<dyn Fn(&str, &mut Window, &mut App)>,
-    /// Whole-paragraph-mention card body. The renderer cannot build it
-    /// itself: `chat_chip`'s status spinner needs `App`, which only exists at
+    /// Whole-paragraph-mention row body. The renderer cannot build it
+    /// itself: the badge's status spinner needs `App`, which only exists at
     /// element request_layout — see [`DeferredElement`].
     pub card: Rc<dyn Fn(&str, &mut Window, &mut App) -> AnyElement>,
     /// View entity leasing the status glyph's loader.
