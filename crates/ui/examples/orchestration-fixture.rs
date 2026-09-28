@@ -214,7 +214,7 @@ fn main() -> anyhow::Result<()> {
                 window.update(cx,|s,_,cx|s.fixture_appshots_activity(Some("chats"),cx))?;
                 pause(cx,600).await;
                 capture(window.into(),cx,&output,"orchestration-activity-chats-dark")?;
-                std::fs::write(output.join("result.txt"),"orchestration: agent exec chips, grouped child-update cards, activity split. Fixture data only; no agent traffic.\n")?;
+                std::fs::write(output.join("result.txt"),"orchestration: collapsible agent activity groups, child-update report rows, activity split. Fixture data only; no agent traffic.\n")?;
                 Ok(())
             }.await;
             if let Err(error)=run {eprintln!("orchestration fixture failed: {error:#}");*result.lock().unwrap()=Some(format!("{error:#}"));}
