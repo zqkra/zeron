@@ -186,6 +186,7 @@ pub fn truncate(
             .map(|pill| super::chat_pills::PillSpan {
                 range: shown(&pill.range),
                 icon_slot: shown(&pill.icon_slot),
+                label: shown(&pill.label),
                 status_slot: shown(&pill.status_slot),
                 chat: pill.chat.clone(),
             })
@@ -341,6 +342,7 @@ fn with_file_link_glyphs(flat: &FlatText, opts: &RenderOptions) -> FlatText {
             .map(|pill| super::chat_pills::PillSpan {
                 range: map_range(&pill.range),
                 icon_slot: map_range(&pill.icon_slot),
+                label: map_range(&pill.label),
                 status_slot: map_range(&pill.status_slot),
                 chat: pill.chat.clone(),
             })

@@ -50,9 +50,12 @@ pub struct PillSpan {
     pub range: Range<usize>,
     /// The reserved leading NBSP band the harness mark overlays.
     pub icon_slot: Range<usize>,
+    /// The pill's title text — the range [`pill_runs`] gives the sans label
+    /// run, and the range the harness-name strip applies to.
+    pub label: Range<usize>,
     /// The reserved trailing NBSP band the status glyph overlays.
     pub status_slot: Range<usize>,
-    /// Render-time resolution.
+    /// Render-time resolution; `chat.title` stays the full stored title.
     pub chat: ChatRef,
 }
 
@@ -72,25 +75,36 @@ pub(crate) fn substitute(
         let chat = resolve(chat_id);
         out.push_str(&text[at..range.start]);
         let start = out.len();
+        let title = crate::chat_pill::display_title(&chat.title, chat.harness);
         let (mut icon_slot, mut status_slot) = (start..start, start..start);
         if chat.known {
             out.push_str(SLOT);
             icon_slot = start..out.len();
-            out.push_str(&chat.title);
+            let label = out.len()..out.len() + title.len();
+            out.push_str(title);
             out.push_str(NBSP);
             status_slot = out.len()..out.len() + SLOT.len();
             out.push_str(SLOT);
+            pills.push(PillSpan {
+                range: start..out.len(),
+                icon_slot,
+                label,
+                status_slot,
+                chat,
+            });
         } else {
             out.push_str(NBSP);
-            out.push_str(&chat.title);
+            let label = out.len()..out.len() + title.len();
+            out.push_str(title);
             out.push_str(NBSP);
+            pills.push(PillSpan {
+                range: start..out.len(),
+                icon_slot,
+                label,
+                status_slot,
+                chat,
+            });
         }
-        pills.push(PillSpan {
-            range: start..out.len(),
-            icon_slot,
-            status_slot,
-            chat,
-        });
         offsets.omissions.push((range.clone(), start..out.len()));
         at = range.end;
     }
@@ -98,17 +112,52 @@ pub(crate) fn substitute(
     (out, pills, offsets)
 }
 
-/// The pill's run style — the mention-chip treatment (mono on code wash,
-/// muted for unknown chats).
-pub(crate) fn pill_run(len: usize, known: bool, theme: &Theme) -> gpui::TextRun {
+/// The pill's wash radius, shared by the inline underlay and the row pill.
+pub(crate) const PILL_RADIUS: f32 = 5.0;
+
+/// The pill's shaped runs. The NBSP bands keep their mono advance — the
+/// reserved slots must stay wide enough for the 12px mark regardless of the
+/// surrounding font — while the title follows the UI sans font the text
+/// around it uses. `theme.text.opacity(0.85)` for a known chat, muted for the
+/// placeholder.
+pub(crate) fn pill_runs(pill: &PillSpan, theme: &Theme) -> Vec<gpui::TextRun> {
+    let color = if pill.chat.known {
+        theme.text.opacity(0.85)
+    } else {
+        theme.text_muted
+    };
+    let run = |len: usize, font: gpui::Font| gpui::TextRun {
+        len,
+        font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let mut runs = Vec::with_capacity(3);
+    if pill.label.start > pill.range.start {
+        runs.push(run(
+            pill.label.start - pill.range.start,
+            gpui::font(theme.font_mono.clone()),
+        ));
+    }
+    runs.push(run(pill.label.len(), gpui::font(theme.font_sans.clone())));
+    if pill.range.end > pill.label.end {
+        runs.push(run(
+            pill.range.end - pill.label.end,
+            gpui::font(theme.font_mono.clone()),
+        ));
+    }
+    runs
+}
+
+/// A file mention inside the composer or a user bubble keeps the inline-code
+/// treatment: mono on the code wash. Chat pills no longer share it.
+pub(crate) fn mention_run(len: usize, theme: &Theme) -> gpui::TextRun {
     gpui::TextRun {
         len,
         font: gpui::font(theme.font_mono.clone()),
-        color: if known {
-            theme.code_text
-        } else {
-            theme.text_muted
-        },
+        color: theme.code_text,
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -153,19 +202,7 @@ fn pill_tooltip(chat: &ChatRef) -> SharedString {
 }
 
 fn harness_name(harness: zeron_proto::HarnessId) -> &'static str {
-    use zeron_proto::HarnessId::*;
-    match harness {
-        ClaudeCode => "Claude Code",
-        Codex => "Codex",
-        Cursor => "Cursor",
-        Devin => "Devin",
-        Grok => "Grok",
-        Hermes => "Hermes",
-        Pi => "Pi",
-        Opencode => "OpenCode",
-        Antigravity => "Antigravity",
-        Mock => "Mock",
-    }
+    crate::chat_pill::harness_display_name(harness)
 }
 
 fn indicator_name(indicator: zeron_proto::ChatIndicator) -> &'static str {
@@ -481,6 +518,45 @@ mod tests {
             &shown[pill.range.clone()],
             format!("{SLOT}Scout{NBSP}{SLOT}")
         );
+    }
+
+    #[test]
+    fn substitute_strips_a_repeated_harness_from_the_title() {
+        let resolve = |chat_id: &str| ChatRef {
+            chat_id: chat_id.into(),
+            title: "Audit the sync layer (Codex)".into(),
+            harness: Some(HarnessId::Codex),
+            model: None,
+            indicator: ChatIndicator::Working,
+            known: true,
+        };
+        let text = "see @chat:child-1 there";
+        let mention = text.find('@').unwrap()..text.find(" there").unwrap();
+        let (shown, pills, _) = substitute(text, &[(mention, "child-1".into())], &resolve);
+        assert_eq!(
+            &shown[pills[0].label.clone()],
+            "Audit the sync layer",
+            "the pill drops a trailing harness the mark already names"
+        );
+        assert_eq!(pills[0].chat.title.as_ref(), "Audit the sync layer (Codex)");
+    }
+
+    #[test]
+    fn pill_runs_keep_mono_slots_and_a_sans_label() {
+        let theme = Theme::dark();
+        let text = "see @chat:child-1 there";
+        let mention = text.find('@').unwrap()..text.find(" there").unwrap();
+        let (_, pills, _) = substitute(text, &[(mention, "child-1".into())], &resolve_known);
+        let runs = pill_runs(&pills[0], &theme);
+        assert_eq!(
+            runs.iter().map(|run| run.len).sum::<usize>(),
+            pills[0].range.len()
+        );
+        assert_eq!(runs.len(), 3, "icon slot, label, status slot");
+        assert_eq!(runs[0].font.family.as_ref(), theme.font_mono.as_ref());
+        assert_eq!(runs[1].font.family.as_ref(), theme.font_sans.as_ref());
+        assert_eq!(runs[2].font.family.as_ref(), theme.font_mono.as_ref());
+        assert_eq!(runs[1].color, theme.text.opacity(0.85));
     }
 
     #[test]

@@ -1110,22 +1110,18 @@ fn with_chat_pills(mut flat: FlatText, opts: &RenderOptions, theme: &Theme) -> F
     let (text, pills, mut offsets) =
         super::chat_pills::substitute(&flat.text, &flat.chats, &*ui.resolve);
     // Rebuild runs over the substituted text: copied regions keep their
-    // style, pills get the mention-chip run. Pill ranges join `code_ranges`
-    // so the underlay paints the same rounded wash.
+    // style, pills get the UI-font label between their reserved mono slots.
+    // Pill washes are painted separately (rounded [`chat_pills::PILL_RADIUS`]
+    // on `theme.ink`), so they stay out of `code_ranges`.
     let mut runs = Vec::with_capacity(flat.runs.len() + pills.len());
-    let mut code_ranges = Vec::with_capacity(flat.code_ranges.len() + pills.len());
+    let mut code_ranges = Vec::with_capacity(flat.code_ranges.len());
     let mut at = 0;
-    for (pill, (original, shown)) in pills.iter().zip(offsets.omissions.iter()) {
+    for (pill, (original, _)) in pills.iter().zip(offsets.omissions.iter()) {
         runs.extend(super::link_presentation::slice_runs(
             &flat.runs,
             at..original.start,
         ));
-        runs.push(super::chat_pills::pill_run(
-            shown.len(),
-            pill.chat.known,
-            theme,
-        ));
-        code_ranges.push(shown.clone());
+        runs.extend(super::chat_pills::pill_runs(pill, theme));
         at = original.end;
     }
     runs.extend(super::link_presentation::slice_runs(
@@ -1265,7 +1261,9 @@ pub(super) fn flat_text_presented_element(
         .as_ref()
         .map(|original| original.offsets.clone());
     let wash = inline_code_wash(theme);
+    let pill_wash = theme.ink(0.06);
     let sel_wash = selection_wash(theme);
+    let pill_ranges: Vec<Range<usize>> = flat.pills.iter().map(|pill| pill.range.clone()).collect();
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
@@ -1275,6 +1273,18 @@ pub(super) fn flat_text_presented_element(
                         rect,
                         px(INLINE_CODE_RADIUS),
                         wash,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                }
+            }
+            for range in &pill_ranges {
+                for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
+                    window.paint_quad(quad(
+                        rect,
+                        px(super::chat_pills::PILL_RADIUS),
+                        pill_wash,
                         px(0.0),
                         gpui::transparent_black(),
                         BorderStyle::default(),
@@ -1375,8 +1385,7 @@ pub(super) fn flat_text_presented_element(
         .into_any_element()
     };
     // Pill hitboxes + icon/status overlays ride the same geometry. Unknown
-    // chats still paint the muted wash (in `code_ranges`) — they just never
-    // mount a hitbox.
+    // chats still paint the muted wash — they just never mount a hitbox.
     let Some(chats) = opts.chats.as_ref().filter(|_| !flat.pills.is_empty()) else {
         return child;
     };

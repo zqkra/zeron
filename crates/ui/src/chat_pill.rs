@@ -89,6 +89,56 @@ impl ChatRef {
     }
 }
 
+/// The harness names a chat's title may repeat in parentheses. A pill shows
+/// the harness mark right beside the title, so a trailing "(Devin)" beside
+/// the Devin mark is noise; the comparison is case-insensitive because the
+/// title is free text. Claude Code is also authored as "Claude".
+fn harness_title_names(harness: HarnessId) -> &'static [&'static str] {
+    use HarnessId::*;
+    match harness {
+        ClaudeCode => &["Claude Code", "Claude"],
+        Codex => &["Codex"],
+        Cursor => &["Cursor"],
+        Devin => &["Devin"],
+        Grok => &["Grok"],
+        Hermes => &["Hermes"],
+        Pi => &["Pi"],
+        Opencode => &["OpenCode"],
+        Antigravity => &["Antigravity"],
+        Mock => &["Mock"],
+    }
+}
+
+/// The harness name a tooltip or menu shows the user.
+pub(crate) fn harness_display_name(harness: HarnessId) -> &'static str {
+    harness_title_names(harness)[0]
+}
+
+/// The title a pill draws. A trailing parenthesised harness name that names
+/// the chat's own harness is dropped — the mark already says which harness
+/// the chat runs — but a title that would be nothing else is kept whole.
+/// Tooltips keep the stored title untouched.
+pub(crate) fn display_title(title: &str, harness: Option<HarnessId>) -> &str {
+    let Some(harness) = harness else {
+        return title;
+    };
+    let Some(inside) = title.trim_end().strip_suffix(')') else {
+        return title;
+    };
+    let Some(open) = inside.rfind('(') else {
+        return title;
+    };
+    let name = inside[open + 1..].trim();
+    if !harness_title_names(harness)
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+    {
+        return title;
+    }
+    let stripped = title[..open].trim_end();
+    if stripped.is_empty() { title } else { stripped }
+}
+
 /// An untitled chat reads like the sidebar's rows ("New session"); the
 /// message preview stands in when a title hasn't been generated yet.
 fn chat_title(chat: &zeron_proto::Chat) -> SharedString {
@@ -222,6 +272,63 @@ mod tests {
         assert!(ChatRef::resolve_target(&state, "3f6b2a18").is_none());
         assert!(ChatRef::resolve_target(&state, "nope").is_none());
         assert!(ChatRef::resolve_target(&state, "  ").is_none());
+    }
+
+    #[test]
+    fn display_title_strips_only_the_chats_own_trailing_harness() {
+        let devin = Some(HarnessId::Devin);
+        assert_eq!(
+            display_title("Editor P2 rutas de sfx y fx (Devin)", devin),
+            "Editor P2 rutas de sfx y fx"
+        );
+        assert_eq!(
+            display_title("Audit the sync layer (Codex)", Some(HarnessId::Codex)),
+            "Audit the sync layer"
+        );
+        // Case-insensitive, and Claude Code also authors as "Claude".
+        assert_eq!(
+            display_title("Fix the queue (codex)", Some(HarnessId::Codex)),
+            "Fix the queue"
+        );
+        assert_eq!(
+            display_title("Refactor the parser (claude)", Some(HarnessId::ClaudeCode)),
+            "Refactor the parser"
+        );
+        assert_eq!(
+            display_title(
+                "Refactor the parser (Claude Code)",
+                Some(HarnessId::ClaudeCode)
+            ),
+            "Refactor the parser"
+        );
+    }
+
+    #[test]
+    fn display_title_keeps_other_harnesses_and_empty_results() {
+        // A different harness is a real disambiguator: keep it.
+        assert_eq!(
+            display_title("Audit the sync layer (Codex)", Some(HarnessId::Devin)),
+            "Audit the sync layer (Codex)"
+        );
+        assert_eq!(
+            display_title("Audit the sync layer", Some(HarnessId::Codex)),
+            "Audit the sync layer"
+        );
+        // Parentheses that are not the harness, unknown chats, and titles
+        // that are only the harness name all survive intact.
+        assert_eq!(
+            display_title("Retry backoff (draft)", Some(HarnessId::Codex)),
+            "Retry backoff (draft)"
+        );
+        assert_eq!(
+            display_title("Audit the sync layer (Codex)", None),
+            "Audit the sync layer (Codex)"
+        );
+        assert_eq!(display_title("(Devin)", Some(HarnessId::Devin)), "(Devin)");
+        assert_eq!(
+            display_title(" (Devin)", Some(HarnessId::Devin)),
+            " (Devin)"
+        );
     }
 
     #[test]
