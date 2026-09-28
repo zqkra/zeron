@@ -4344,26 +4344,34 @@ mod tests {
             "own checkout, agent children, parent, then this device's projects"
         );
 
-        // An absolute path outside every known root never resolves.
+        // An absolute path outside every known root is still a file: it
+        // resolves as an outside link owned by the linking chat.
         let root_refs: Vec<&str> = roots.iter().map(|root| root.root.as_str()).collect();
-        assert_eq!(
+        assert!(matches!(
             crate::workspace_links::first_root_owning("/elsewhere/x.md", root_refs.clone()),
-            None
-        );
+            Some(crate::workspace_links::FileLinkResolution::Outside(link))
+                if link.path == "/elsewhere/x.md" && link.outside
+        ));
         // A path under an agent child's worktree resolves to that root.
         assert_eq!(
-            crate::workspace_links::first_root_owning(
+            match crate::workspace_links::first_root_owning(
                 "/worktrees/grand/src/lib.rs",
-                root_refs.clone()
-            )
-            .map(|(ix, link)| (roots[ix].chat.clone(), link.path)),
+                root_refs.clone(),
+            ) {
+                Some(crate::workspace_links::FileLinkResolution::Owned { root, link }) =>
+                    Some((roots[root].chat.clone(), link.path)),
+                _ => None,
+            },
             Some((Some("grand".into()), "src/lib.rs".into()))
         );
         // A project root resolves too — with no owning chat, its links open
         // in the linking chat's file context.
         assert_eq!(
-            crate::workspace_links::first_root_owning("/projects/zeron/doc.md", root_refs)
-                .map(|(ix, link)| (roots[ix].chat.clone(), link.path)),
+            match crate::workspace_links::first_root_owning("/projects/zeron/doc.md", root_refs) {
+                Some(crate::workspace_links::FileLinkResolution::Owned { root, link }) =>
+                    Some((roots[root].chat.clone(), link.path)),
+                _ => None,
+            },
             Some((None, "doc.md".into()))
         );
     }

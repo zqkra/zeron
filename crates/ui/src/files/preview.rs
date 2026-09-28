@@ -2779,7 +2779,9 @@ impl FilesSurface {
             .min_h_0()
             .flex()
             .flex_col()
-            .when(outside, |element| element.child(outside_read_only_row(theme)))
+            .when(outside, |element| {
+                element.child(outside_read_only_row(theme))
+            })
             .when(truncated, |element| {
                 element.child(
                     div()
@@ -3324,9 +3326,7 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
         Some(WorkspaceReadOnlyReason::MixedLineEndings) => {
             "Files with mixed line endings are read-only."
         }
-        Some(WorkspaceReadOnlyReason::OutsideWorkspace) => {
-            "Read-only: outside this chat's folder."
-        }
+        Some(WorkspaceReadOnlyReason::OutsideWorkspace) => "Read-only: outside this chat's folder.",
         Some(WorkspaceReadOnlyReason::NotRegularFile) | None => "This file cannot be previewed.",
     }
     .into()

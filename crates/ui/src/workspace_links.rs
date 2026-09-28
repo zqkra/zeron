@@ -6,10 +6,14 @@ use std::path::{Component, Path, PathBuf};
 const FILE_MENTION_SCHEME: &str = "zeron-file:";
 
 /// Where a classified file link sits relative to a surface's ordered roots.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FileLinkResolution {
     /// `roots[index]` owns the target: the link opens in that root's file
     /// context and `link.path` stays workspace-relative.
-    Owned { root: usize, link: WorkspaceFileLink },
+    Owned {
+        root: usize,
+        link: WorkspaceFileLink,
+    },
     /// An absolute path no known root owns: the linking chat reads it as a
     /// host file and the file surface keeps it read-only.
     Outside(WorkspaceFileLink),
@@ -28,27 +32,22 @@ pub(crate) fn first_root_owning<'a>(
 ) -> Option<FileLinkResolution> {
     let classified = classify_file_link(target)?;
     match classified.kind {
-        ClassifiedKind::Relative => roots.into_iter().next().map(|_| {
-            FileLinkResolution::Owned {
-                root: 0,
-                link: classified.link,
-            }
+        ClassifiedKind::Relative => roots.into_iter().next().map(|_| FileLinkResolution::Owned {
+            root: 0,
+            link: classified.link,
         }),
         // Mentions resolve inside a root or not at all, exactly like before.
-        ClassifiedKind::Mention => roots
-            .into_iter()
-            .enumerate()
-            .find_map(|(ix, root)| {
-                resolve_decoded_path(&classified.link.path, root).map(|path| {
-                    FileLinkResolution::Owned {
-                        root: ix,
-                        link: WorkspaceFileLink {
-                            path,
-                            ..classified.link.clone()
-                        },
-                    }
-                })
-            }),
+        ClassifiedKind::Mention => roots.into_iter().enumerate().find_map(|(ix, root)| {
+            resolve_decoded_path(&classified.link.path, root).map(|path| {
+                FileLinkResolution::Owned {
+                    root: ix,
+                    link: WorkspaceFileLink {
+                        path,
+                        ..classified.link.clone()
+                    },
+                }
+            })
+        }),
         ClassifiedKind::Absolute => {
             for (ix, root) in roots.into_iter().enumerate() {
                 if let Some(path) = resolve_decoded_path(&classified.link.path, root) {
@@ -150,17 +149,18 @@ pub(crate) fn resolve_workspace_file_link(
                 ..classified.link
             })
         }
-        ClassifiedKind::Absolute => Some(match resolve_decoded_path(&classified.link.path, workspace_root)
-        {
-            Some(path) => WorkspaceFileLink {
-                path,
-                ..classified.link
+        ClassifiedKind::Absolute => Some(
+            match resolve_decoded_path(&classified.link.path, workspace_root) {
+                Some(path) => WorkspaceFileLink {
+                    path,
+                    ..classified.link
+                },
+                None => WorkspaceFileLink {
+                    outside: true,
+                    ..classified.link
+                },
             },
-            None => WorkspaceFileLink {
-                outside: true,
-                ..classified.link
-            },
-        }),
+        ),
     }
 }
 
@@ -391,7 +391,10 @@ fn parse_line_column(value: &str) -> Option<(u32, Option<u32>)> {
         None => (value, None),
     };
     let line = line.parse::<u32>().ok()?;
-    let column = column.map(|column| column.parse::<u32>().ok()).transpose()?;
+    let column = match column {
+        Some(column) => Some(column.parse::<u32>().ok()?),
+        None => None,
+    };
     Some((line, column))
 }
 
@@ -444,15 +447,17 @@ fn file_name(path: &str) -> &str {
 /// `scheme:` at the start of a relative path means it is a URL, not a file.
 fn has_url_scheme(path: &str) -> bool {
     let mut chars = path.chars();
-    if !chars.next().is_some_and(|first| first.is_ascii_alphabetic()) {
+    if !chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+    {
         return false;
     }
     for character in chars {
         match character {
             ':' => return true,
             character
-                if character.is_ascii_alphanumeric()
-                    || matches!(character, '+' | '-' | '.') => {}
+                if character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.') => {}
             _ => return false,
         }
     }
@@ -607,10 +612,7 @@ mod tests {
                 "/work/comet/2026-09-26/Some%20Folder/it's%20here.txt",
                 "2026-09-26/Some Folder/it's here.txt",
             ),
-            (
-                "file:///work/comet/a%20b.md",
-                "a b.md",
-            ),
+            ("file:///work/comet/a%20b.md", "a b.md"),
             ("%2Ehidden%2Ffile.rs", ".hidden/file.rs"),
         ] {
             assert_eq!(
@@ -641,8 +643,8 @@ mod tests {
             Some(link("a%zz.md", None, None))
         );
         assert_eq!(
-            resolve_workspace_file_link("a%2", root),
-            Some(link("a%2", None, None))
+            resolve_workspace_file_link("a%2.md", root),
+            Some(link("a%2.md", None, None))
         );
         // A decode that would produce unsafe content never resolves.
         assert!(resolve_workspace_file_link("%2E%2E/secret.md", root).is_none());
@@ -780,13 +782,18 @@ mod tests {
             "src/../../secret.rs",
             "src/./lib.rs",
             "src//lib.rs",
-            "/work/comet-other/src/lib.rs",
         ] {
             assert!(
                 resolve_workspace_file_link(target, root).is_none(),
                 "{target}"
             );
         }
+        // A sibling directory sharing the root's prefix is outside it, so it
+        // resolves as a host file rather than into the workspace.
+        assert_eq!(
+            resolve_workspace_file_link("/work/comet-other/src/lib.rs", root),
+            Some(outside_link("/work/comet-other/src/lib.rs"))
+        );
         // Leading-dot relative names are files; mid-path dots do not count.
         assert_eq!(
             resolve_workspace_file_link(".env", root),

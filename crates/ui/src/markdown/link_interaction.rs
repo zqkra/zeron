@@ -702,6 +702,7 @@ mod rendered_tests {
         width: f32,
         activated: Rc<RefCell<Vec<LinkActivation>>>,
         file_roots: Option<Rc<Vec<crate::workspace_links::FileLinkRoot>>>,
+        source_local: bool,
     }
     impl Render for Fixture {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -709,7 +710,7 @@ mod rendered_tests {
             let activated = self.activated.clone();
             opts.link = Some(LinkUi {
                 source_session: Some("session".into()),
-                source_local: false,
+                source_local: self.source_local,
                 file_roots: self.file_roots.clone(),
                 handler: Rc::new(move |a, _, _| {
                     activated.borrow_mut().push(a.clone());
@@ -743,6 +744,7 @@ mod rendered_tests {
                         markdown: "[Docs](https://example.com/docs)".into(),
                         width: 320.,
                         activated: Rc::default(),
+                        source_local: false,
                         file_roots: None,
                     })
                 })
@@ -800,6 +802,7 @@ mod rendered_tests {
                         markdown: "[Docs](https://example.com/docs)".into(),
                         width: 320.,
                         activated: Rc::default(),
+                        source_local: false,
                         file_roots: None,
                     });
                     cx.new(|_| OutsideClickFixture {
@@ -908,6 +911,7 @@ mod rendered_tests {
                                     markdown: "[Docs](https://example.com/docs)".into(),
                                     width: 320.,
                                     activated: activated.clone(),
+                                    source_local: false,
                                     file_roots: None,
                                 })
                             })
@@ -1018,6 +1022,7 @@ mod rendered_tests {
                     cx.new(|_| Fixture {
                         activated,
                         width: 320.,
+                        source_local: false,
                         file_roots: None,
                         markdown:
                             "[first](https://example.com/one) and [second](https://example.org/two)"
@@ -1098,6 +1103,7 @@ mod rendered_tests {
                         activated: Rc::default(),
                         width: 180.,
                         markdown,
+                        source_local: false,
                         file_roots: None,
                     })
                 })
@@ -1207,6 +1213,7 @@ mod rendered_tests {
             markdown: "see [lib](src/lib.rs) here".into(),
             width: 320.,
             activated: activated.clone(),
+            source_local: false,
             file_roots: Some(roots),
         });
         let position = cx.update(|_, _| {
@@ -1270,6 +1277,64 @@ mod rendered_tests {
         assert_eq!(last.target.original, "src/lib.rs");
     }
 
+    /// An absolute destination no root owns is still a file: its menu keeps
+    /// "Open in Zeron" and, when the linking chat is on this device, the
+    /// system-level rows that act on the absolute path.
+    #[gpui::test]
+    fn outside_file_link_menu_keeps_open_in_zeron_and_local_rows(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let roots = Rc::new(vec![crate::workspace_links::FileLinkRoot {
+            chat: Some("chat".into()),
+            root: "/repo".into(),
+            local: true,
+        }]);
+        let activated: Rc<RefCell<Vec<LinkActivation>>> = Rc::default();
+        let (_view, cx) = cx.add_window_view(|_, _| Fixture {
+            markdown: "see [report](/elsewhere/team/INFORME.md) here".into(),
+            width: 320.,
+            activated: activated.clone(),
+            source_local: true,
+            file_roots: Some(roots),
+        });
+        let position = cx.update(|_, _| {
+            let (_, layout, _) = super::super::render::selection_test_snapshot("link-fixture:0");
+            layout.position_for_index(4).unwrap() + gpui::point(px(2.), px(8.))
+        });
+        cx.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::default());
+        for selector in [
+            "link-menu-open-zeron",
+            "link-menu-open-default",
+            "link-menu-show-in-folder",
+            "link-menu-copy-path",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} should be mounted for an outside link on this device"
+            );
+        }
+        for selector in [
+            "link-menu-open-external",
+            "link-menu-copy-address",
+            "link-menu-default-destination",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} is a web-link row"
+            );
+        }
+        let row = cx.debug_bounds("link-menu-open-zeron").unwrap().center();
+        cx.simulate_click(row, gpui::Modifiers::default());
+        let activated = activated.borrow();
+        let last = activated.last().expect("open in zeron activates the link");
+        assert_eq!(last.action, LinkAction::Internal);
+        assert_eq!(last.target.original, "/elsewhere/team/INFORME.md");
+    }
+
     /// A root on another device resolves the link (the file opens through
     /// that chat's context) but cannot offer local system actions; a web
     /// link shows only the web rows.
@@ -1296,6 +1361,7 @@ mod rendered_tests {
                 markdown: markdown.into(),
                 width: 320.,
                 activated: Rc::default(),
+                source_local: false,
                 file_roots: roots.clone(),
             });
             let position = cx.update(|_, _| {

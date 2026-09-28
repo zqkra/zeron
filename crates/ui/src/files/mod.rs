@@ -773,7 +773,11 @@ impl FilesSurface {
                 .chats
                 .iter()
                 .any(|chat| chat.id == self.chat_id && chat.space_id.is_none());
-        if !projectless_explorer {
+        // An editor opened by absolute path beyond the workspace has nothing
+        // the workspace watcher can report; outside files never register one.
+        let outside_editor = self.presentation.is_editor()
+            && self.editor_path.as_deref().is_some_and(path_is_outside);
+        if !projectless_explorer && !outside_editor {
             self.ensure_watch(cx);
         }
         if self.presentation.is_editor()

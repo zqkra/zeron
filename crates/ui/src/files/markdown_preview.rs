@@ -53,14 +53,13 @@ fn strip_outside_links(block: &mut Block) {
             {
                 run.style.link = None;
             }
-            if let Some(image) = &mut run.style.image {
-                if image
+            if let Some(image) = &mut run.style.image
+                && image
                     .link
                     .as_deref()
                     .is_some_and(|target| !web_target(target))
-                {
-                    image.link = None;
-                }
+            {
+                image.link = None;
             }
         }
     }
@@ -69,8 +68,8 @@ fn strip_outside_links(block: &mut Block) {
         Block::BlockQuote { children } => children.iter_mut().for_each(strip_outside_links),
         Block::List { items, .. } => items.iter_mut().flatten().for_each(strip_outside_links),
         Block::Table { header, rows, .. } => {
-            header.iter_mut().for_each(strip_runs);
-            rows.iter_mut().flatten().for_each(strip_runs);
+            header.iter_mut().for_each(|runs| strip_runs(runs));
+            rows.iter_mut().flatten().for_each(|runs| strip_runs(runs));
         }
         Block::CodeBlock { .. } | Block::Rule => {}
     }
@@ -1482,6 +1481,44 @@ mod tests {
             relative_target("docs/readme.md", "#hello"),
             Some(("docs/readme.md".into(), Some("hello".into())))
         );
+    }
+    #[test]
+    fn outside_documents_drop_local_links_and_keep_web_links() {
+        let mut tree = parser::parse_full(
+            "[local](other.md) [web](https://example.com/) [mail](mailto:reader@example.com) [![pic](shot.png)](gallery.md)",
+        );
+        for top in &mut tree.blocks {
+            strip_outside_links(&mut Arc::make_mut(top).block);
+        }
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("paragraph");
+        };
+        let links: Vec<&str> = runs
+            .iter()
+            // An image run carries its own source in `link`; only real
+            // anchors are inspected here.
+            .filter(|run| run.style.image.is_none())
+            .filter_map(|run| run.style.link.as_deref())
+            .collect();
+        assert_eq!(links, ["https://example.com/", "mailto:reader@example.com"]);
+        let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert!(
+            text.contains("local"),
+            "the label stays as plain text: {text}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|run| run.style.link.as_deref() == Some("other.md")),
+            "a local target must lose its link styling"
+        );
+        for run in runs {
+            let Some(image) = &run.style.image else {
+                continue;
+            };
+            assert_eq!(image.source, "shot.png");
+            assert!(image.link.is_none());
+        }
     }
 }
 

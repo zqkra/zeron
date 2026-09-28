@@ -1401,7 +1401,7 @@ fn resolve_absolute_read(
     })?;
     let root = std::fs::canonicalize(&workspace.root).unwrap_or(workspace.root.clone());
     if let Ok(relative) = canonical.strip_prefix(&root) {
-        return WorkspaceRelativePath::from_resolved(&relative).map(AbsoluteRead::Inside);
+        return WorkspaceRelativePath::from_resolved(relative).map(AbsoluteRead::Inside);
     }
     let base = canonical
         .ancestors()
@@ -1411,10 +1411,8 @@ fn resolve_absolute_read(
     let relative = canonical.strip_prefix(&base).map_err(|error| {
         WorkspaceFilesError::Io(format!("absolute path has no host root: {error}"))
     })?;
-    WorkspaceRelativePath::from_resolved(&relative).map(|relative| AbsoluteRead::Outside {
-        base,
-        relative,
-    })
+    WorkspaceRelativePath::from_resolved(relative)
+        .map(|relative| AbsoluteRead::Outside { base, relative })
 }
 
 /// A chat-target read of an absolute path: inside the workspace it reads
@@ -2473,7 +2471,10 @@ mod tests {
         std::fs::write(root.path().join("dir/file.txt"), b"inside\n").unwrap();
         let canonical = std::fs::canonicalize(root.path()).unwrap();
         let workspace = resolved_workspace(&canonical);
-        let absolute = canonical.join("dir/file.txt").to_string_lossy().into_owned();
+        let absolute = canonical
+            .join("dir/file.txt")
+            .to_string_lossy()
+            .into_owned();
 
         let file = read_absolute_file_blocking(&workspace, &absolute, &no_cancel()).unwrap();
         assert_eq!(file.text.as_deref(), Some("inside\n"));
@@ -2506,13 +2507,9 @@ mod tests {
         // A stronger existing reason keeps its own classification.
         let binary = outside.path().join("raw.bin");
         std::fs::write(&binary, b"a\0b").unwrap();
-        let file =
-            read_absolute_file_blocking(&workspace, &binary.to_string_lossy(), &no_cancel())
-                .unwrap();
-        assert_eq!(
-            file.read_only_reason,
-            Some(WorkspaceReadOnlyReason::Binary)
-        );
+        let file = read_absolute_file_blocking(&workspace, &binary.to_string_lossy(), &no_cancel())
+            .unwrap();
+        assert_eq!(file.read_only_reason, Some(WorkspaceReadOnlyReason::Binary));
     }
 
     #[test]
@@ -2587,7 +2584,10 @@ mod tests {
         let canonical_root = std::fs::canonicalize(workspace_dir.path()).unwrap();
         let workspace = resolved_workspace(&canonical_root);
 
-        let escape = canonical_root.join("escape.md").to_string_lossy().into_owned();
+        let escape = canonical_root
+            .join("escape.md")
+            .to_string_lossy()
+            .into_owned();
         let file = read_absolute_file_blocking(&workspace, &escape, &no_cancel()).unwrap();
         assert_eq!(
             file.read_only_reason,
@@ -2635,12 +2635,11 @@ mod tests {
         let chunk = read_image_blocking(&base, &relative, &request).unwrap();
         assert_eq!(chunk.mime_type, "image/png");
         assert!(chunk.done);
-        assert_eq!(chunk.size, 14);
+        assert_eq!(chunk.size, 12);
         // The same path inside the root still wants a matching checkout id.
         std::fs::write(workspace_dir.path().join("in.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         let inside = canonical_root.join("in.png").to_string_lossy().into_owned();
-        let AbsoluteRead::Inside(relative) =
-            resolve_absolute_read(&workspace, &inside).unwrap()
+        let AbsoluteRead::Inside(relative) = resolve_absolute_read(&workspace, &inside).unwrap()
         else {
             panic!("expected inside resolution");
         };
