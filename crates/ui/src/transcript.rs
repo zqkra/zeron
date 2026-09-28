@@ -9172,9 +9172,8 @@ impl Transcript {
     }
 
     /// An agent message: a child's attributed `zeron chat tell` reads as the
-    /// settle report's row — the mark and live title name the sender and the
-    /// open tile goes to it — so a report is not mistaken for the user
-    /// speaking.
+    /// settle report's row — the badge names the sender and opens it — so a
+    /// report is not mistaken for the user speaking.
     #[allow(clippy::too_many_arguments)] // render seam, not a public API
     fn render_agent_message(
         &mut self,
