@@ -59,10 +59,13 @@ pub enum AccentColor {
     Cyan,
     Blue,
     Pink,
+    /// Neutral: the accent roles share one cool grey, so only the chrome's
+    /// own contrast carries emphasis.
+    Graphite,
 }
 
 impl AccentColor {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Zeron,
         Self::Orange,
         Self::Amber,
@@ -70,6 +73,7 @@ impl AccentColor {
         Self::Cyan,
         Self::Blue,
         Self::Pink,
+        Self::Graphite,
     ];
 
     pub fn label(self) -> &'static str {
@@ -81,6 +85,7 @@ impl AccentColor {
             Self::Cyan => "Cyan",
             Self::Blue => "Blue",
             Self::Pink => "Pink",
+            Self::Graphite => "Graphite",
         }
     }
 
@@ -109,6 +114,12 @@ impl AccentColor {
             (Self::Blue, Appearance::Light) => (oklch(0.47, 0.21, 255.0), oklch(0.47, 0.21, 255.0)),
             (Self::Pink, Appearance::Dark) => (oklch(0.72, 0.18, 350.0), oklch(0.51, 0.20, 350.0)),
             (Self::Pink, Appearance::Light) => (oklch(0.48, 0.20, 350.0), oklch(0.48, 0.20, 350.0)),
+            (Self::Graphite, Appearance::Dark) => {
+                (oklch(0.752, 0.006, 286.0), oklch(0.52, 0.006, 286.0))
+            }
+            (Self::Graphite, Appearance::Light) => {
+                (oklch(0.473, 0.010, 286.0), oklch(0.473, 0.010, 286.0))
+            }
         };
         AccentTokens {
             primary,
@@ -140,6 +151,7 @@ impl From<AccentColor> for AccentPreset {
             AccentColor::Cyan => Self::Cyan,
             AccentColor::Blue => Self::Blue,
             AccentColor::Pink => Self::Pink,
+            AccentColor::Graphite => Self::Graphite,
         }
     }
 }
@@ -154,6 +166,7 @@ impl From<AccentPreset> for AccentColor {
             AccentPreset::Cyan => Self::Cyan,
             AccentPreset::Blue => Self::Blue,
             AccentPreset::Pink => Self::Pink,
+            AccentPreset::Graphite => Self::Graphite,
         }
     }
 }

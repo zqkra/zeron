@@ -283,10 +283,12 @@ pub enum AccentPreset {
     Cyan,
     Blue,
     Pink,
+    /// A neutral accent: every accent role in the same cool grey.
+    Graphite,
 }
 
 impl AccentPreset {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Zeron,
         Self::Orange,
         Self::Amber,
@@ -294,6 +296,7 @@ impl AccentPreset {
         Self::Cyan,
         Self::Blue,
         Self::Pink,
+        Self::Graphite,
     ];
 
     pub fn label(self) -> &'static str {
@@ -305,6 +308,7 @@ impl AccentPreset {
             Self::Cyan => "Cyan",
             Self::Blue => "Blue",
             Self::Pink => "Pink",
+            Self::Graphite => "Graphite",
         }
     }
 
@@ -317,6 +321,7 @@ impl AccentPreset {
             Self::Cyan => ("#22d3ee", "#0e7490"),
             Self::Blue => ("#60a5fa", "#2563eb"),
             Self::Pink => ("#f472b6", "#be185d"),
+            Self::Graphite => ("#aeaeb2", "#5b5b61"),
         };
         if appearance.is_dark() { dark } else { light }
             .parse()
