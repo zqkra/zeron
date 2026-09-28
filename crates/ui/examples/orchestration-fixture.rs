@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
         true,
     )?;
     core.workspace
-        .rename_chat(child_a, "Audit the sync layer")?;
+        .rename_chat(child_a, "Audit the sync layer (Codex)")?;
     core.workspace.create_chat_with_parent(
         child_b,
         None,
@@ -174,7 +174,7 @@ fn main() -> anyhow::Result<()> {
                     ]},
                     {"id":"m1","role":"user","createdAt":1788900004500_i64,"deviceId":device,"parts":[{"id":"t","kind":"text","text":"[Message from Zeron chat Audit the sync layer (@chat:3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b). Reply with `zeron chat tell 3f6b2a18 <message>`.]\n\nRead-only audit is done. The ledger rewrite needs one migration: add a nullable `settled_at` column before the backfill runs.\n\nLock ordering is consistent across every write path I traced."}]},
                     {"id":"a3","role":"assistant","status":"complete","createdAt":1788900005000_i64,"deviceId":device,"parts":[
-                        {"id":"p1","kind":"text","text":"Backoff sketch is done. The sync audit needs a decision before it continues, and the lock sweep crashed — I'll summarize once the audit settles.\n\n@chat:aa10bb22-1111-2222-3333-444455556666"},
+                        {"id":"p1","kind":"text","text":"Backoff sketch is done. The sync audit needs a decision before it continues, and the lock sweep crashed — I'll summarize once the audit settles. Waiting on @chat:3f6b2a18-9c4d-4e5f-8a7b-1c2d3e4f5a6b before summarizing.\n\n@chat:aa10bb22-1111-2222-3333-444455556666"},
                         {"id":"t8","kind":"tool","call":{"kind":"exec","command":"zeron chat tell stale-child-9 \"restart with the fixture lock table\""},"resolved":true,"isError":true,"output":"error: no such chat: stale-child-9"}
                     ]}
                 ]);

@@ -3944,27 +3944,10 @@ impl Transcript {
                     let theme = Theme::of(cx).clone();
                     let chat_id = chat.chat_id.clone();
                     // A paragraph that is only a chat mention reads as an
-                    // activity row's own line: the chat badge is the link and
-                    // the status glyph rides beside it — no card chrome.
-                    let (mark, tint) = chat
-                        .harness
-                        .map(crate::pickers::harness_brand_icon)
-                        .unwrap_or((crate::icons::BOT, None));
-                    let mut badge = entity_badge(
-                        crate::icons::icon(mark)
-                            .size(px(14.0))
-                            .flex_none()
-                            .text_color(tint.unwrap_or(theme.text_muted))
-                            .into_any_element(),
-                        chat.title.clone(),
-                        if chat.known {
-                            theme.text.opacity(0.85)
-                        } else {
-                            theme.text_muted
-                        },
-                        &theme,
-                    )
-                    .id(SharedString::from(format!("sole-chat-{chat_id}")));
+                    // activity row's own line: the chat pill is the link and
+                    // the status glyph rides beside it — no row chrome.
+                    let mut badge = chat_pill_body(chat.harness, &chat.title, chat.known, &theme)
+                        .id(SharedString::from(format!("sole-chat-{chat_id}")));
                     if chat.known {
                         badge = badge
                             .cursor_pointer()
@@ -3978,7 +3961,7 @@ impl Transcript {
                                 }
                             });
                     }
-                    let badge = crate::frost::frosted(5.0, 16.0, badge).into_any_element();
+                    let badge = badge.into_any_element();
                     div()
                         .h(px(TOOL_TREE_ROW_HEIGHT))
                         .w_full()
@@ -8631,9 +8614,9 @@ impl Transcript {
         }
     }
 
-    /// The chat badge every agent row names its child with: the entity chip a
-    /// tool row gives a file path, with the chat's harness mark in the well.
-    /// A known chat's badge IS the link to it.
+    /// The chat pill every agent row names its child with: the harness mark
+    /// and the live title on one small wash. A known chat's pill IS the link
+    /// to it.
     fn chat_badge(
         &self,
         line: &AgentLine,
@@ -8642,25 +8625,7 @@ impl Transcript {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (mark, tint) = line
-            .harness
-            .map(crate::pickers::harness_brand_icon)
-            .unwrap_or((crate::icons::BOT, None));
-        let mut badge = entity_badge(
-            crate::icons::icon(mark)
-                .size(px(14.0))
-                .flex_none()
-                .text_color(tint.unwrap_or(theme.text_muted))
-                .into_any_element(),
-            line.title.clone(),
-            if line.known {
-                theme.text.opacity(0.85)
-            } else {
-                theme.text_muted
-            },
-            theme,
-        )
-        .id(id);
+        let mut badge = chat_pill_body(line.harness, &line.title, line.known, theme).id(id);
         if line.known {
             badge = badge
                 .cursor_pointer()
@@ -8670,7 +8635,7 @@ impl Transcript {
                 badge = badge.on_click(line_click!(on_open, cx, chat_id));
             }
         }
-        crate::frost::frosted(5.0, 16.0, badge).into_any_element()
+        badge.into_any_element()
     }
 
     /// One agent line inside a fold: the ordinary tree-row layout — the agent
@@ -9413,10 +9378,9 @@ impl Transcript {
     }
 }
 
-/// The entity chip tool rows use to name a file or a chat: a 22px pill with
-/// a 20px icon well and a truncating label. One geometry for both, so a chat
-/// reads exactly like a file badge; callers frost the result (with their
-/// id/hover wrappers already applied).
+/// The entity chip tool rows use to name a file: a 22px pill with a 20px
+/// icon well and a truncating label; callers frost the result (with their
+/// id/hover wrappers already applied). Chats use [`chat_pill_body`] instead.
 fn entity_badge(
     icon: AnyElement,
     label: SharedString,
@@ -9449,9 +9413,54 @@ fn entity_badge(
         .child(div().min_w_0().truncate().child(label))
 }
 
-/// The chat badge every agent row names its child with: the entity chip a
-/// tool row gives a file path, with the chat's harness mark in the well. A
-/// known chat's badge IS the link to it.
+/// The one chat pill: the harness mark at full size directly on the wash and
+/// the title in the UI font beside it. A row pill and an inline pill differ
+/// only in how their wash and slots are painted, so both build from this.
+/// Callers add their id, hover and click. Unknown chats read muted without a
+/// mark (the caller still passes the placeholder title).
+fn chat_pill_body(
+    harness: Option<HarnessId>,
+    title: &SharedString,
+    known: bool,
+    theme: &Theme,
+) -> gpui::Div {
+    let (mark, tint) = harness
+        .map(crate::pickers::harness_brand_icon)
+        .unwrap_or((crate::icons::BOT, None));
+    let label = crate::chat_pill::display_title(title, harness);
+    div()
+        .min_w_0()
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .gap(px(4.0))
+        .pl(px(4.0))
+        .pr(px(6.0))
+        .rounded(px(chat_pills::PILL_RADIUS))
+        .bg(theme.ink(0.06))
+        .text_size(px(TOOL_LABEL_SIZE))
+        .text_color(if known {
+            theme.text.opacity(0.85)
+        } else {
+            theme.text_muted
+        })
+        .when(known, |pill| {
+            pill.child(
+                crate::icons::icon(mark)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(tint.unwrap_or(theme.text_muted)),
+            )
+        })
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .child(SharedString::from(label.to_owned())),
+        )
+}
+
 /// The faint model name an agent line trails its title with.
 fn model_trail(model: SharedString, theme: &Theme) -> gpui::Div {
     div()
@@ -9673,36 +9682,37 @@ fn user_bubble_text(
         underline: None,
         strikethrough: None,
     };
-    let chip_run = |len: usize| chat_pills::pill_run(len, true, theme);
+    let chip_run = |len: usize| chat_pills::mention_run(len, theme);
     // File mentions and chat pills never overlap (chat refs were scanned on
     // the projected text); merge the sorted ranges into one segmentation.
-    let mut chips: Vec<(Range<usize>, bool)> = mentions
+    enum BubbleChip<'a> {
+        Mention,
+        Pill(&'a chat_pills::PillSpan),
+    }
+    let mut chips: Vec<(Range<usize>, BubbleChip<'_>)> = mentions
         .iter()
-        .map(|span| (map_displayed(&span.range), true))
+        .map(|span| (map_displayed(&span.range), BubbleChip::Mention))
         .collect();
-    chips.extend(pills.iter().map(|pill| (pill.range.clone(), false)));
+    chips.extend(
+        pills
+            .iter()
+            .map(|pill| (pill.range.clone(), BubbleChip::Pill(pill))),
+    );
     chips.sort_by_key(|(range, _)| range.start);
     chips.dedup_by(|b, a| a.0 == b.0);
     let mut runs = Vec::with_capacity(chips.len() * 2 + 1);
     let mut at = 0;
-    for (range, is_mention) in chips.iter() {
+    for (range, chip) in chips.iter() {
         if range.start < at {
             continue;
         }
         if at < range.start {
             runs.push(body_run(range.start - at));
         }
-        let known = *is_mention
-            || pills
-                .iter()
-                .find(|p| p.range == *range)
-                .map(|p| p.chat.known)
-                .unwrap_or(true);
-        let mut run = chip_run(range.len());
-        if !known {
-            run.color = theme.text_muted;
+        match chip {
+            BubbleChip::Mention => runs.push(chip_run(range.len())),
+            BubbleChip::Pill(pill) => runs.extend(chat_pills::pill_runs(pill, theme)),
         }
-        runs.push(run);
         at = range.end;
     }
     if at < display.len() {
@@ -9743,25 +9753,35 @@ fn user_bubble_text(
     let layout = styled.layout().clone();
     let overlay_layout = layout.clone();
     let wash = theme.code_wash;
+    let pill_wash = theme.ink(0.06);
     let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
     let sel_theme = theme.clone();
-    let wash_ranges: Vec<Range<usize>> = {
-        let mut ranges: Vec<Range<usize>> = mentions
-            .iter()
-            .map(|span| map_displayed(&span.range))
-            .collect();
-        ranges.extend(pills.iter().map(|pill| pill.range.clone()));
-        ranges
-    };
+    let mention_wash: Vec<Range<usize>> = mentions
+        .iter()
+        .map(|span| map_displayed(&span.range))
+        .collect();
+    let pill_wash_ranges: Vec<Range<usize>> = pills.iter().map(|pill| pill.range.clone()).collect();
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, cx| {
-            for range in wash_ranges.iter() {
+            for range in mention_wash.iter() {
                 for rect in render::range_rects(&layout, range, 0.0, 2.0) {
                     window.paint_quad(quad(
                         rect,
                         px(5.0),
                         wash,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                }
+            }
+            for range in pill_wash_ranges.iter() {
+                for rect in render::range_rects(&layout, range, 0.0, 2.0) {
+                    window.paint_quad(quad(
+                        rect,
+                        px(chat_pills::PILL_RADIUS),
+                        pill_wash,
                         px(0.0),
                         gpui::transparent_black(),
                         BorderStyle::default(),
