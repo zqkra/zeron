@@ -17,7 +17,7 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -176,6 +176,14 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Chats whose child-update delivery a manual stop froze: an explicit
+    /// user interrupt records the chat here, and the child notifier withholds
+    /// its pending updates until a user-authored turn starts. Without the
+    /// freeze a stop does not stick — updates held while the turn ran flush
+    /// ~2 s after it ends and wake the chat with a hidden turn. In-memory:
+    /// the freeze lasts exactly as long as this engine process, and a restart
+    /// re-arms pending rows as usual.
+    child_notify_paused: Mutex<HashSet<String>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -214,6 +222,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                child_notify_paused: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -277,6 +286,15 @@ impl SessionsEngine {
         }
     }
 
+    /// Record a user-authored prompt on `chat_id`: the sidebar preview bump,
+    /// plus the end of any manual-stop freeze on its child updates. Every
+    /// non-hidden dispatch and steer funnels through here, so the resume
+    /// cannot drift from the message that caused it.
+    fn note_user_prompt(&self, chat_id: &str, prompt: &str) {
+        self.resume_child_notifications(chat_id);
+        self.inner.note_message(chat_id, prompt);
+    }
+
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         let host = self
             .inner
@@ -315,6 +333,24 @@ impl SessionsEngine {
         lock(&self.inner.statuses)
             .get(chat_id)
             .is_some_and(is_active)
+    }
+
+    /// Freeze child-update delivery for `chat_id` because its user stopped the
+    /// running turn. Ledger rows stay claimed and pending; the notifier
+    /// withholds them until [`Self::resume_child_notifications`].
+    pub(crate) fn pause_child_notifications(&self, chat_id: &str) {
+        lock(&self.inner.child_notify_paused).insert(chat_id.to_string());
+    }
+
+    /// The user wrote again: a manual-stop freeze on this chat's child updates
+    /// is over. Held updates deliver once this turn ends.
+    pub(crate) fn resume_child_notifications(&self, chat_id: &str) {
+        lock(&self.inner.child_notify_paused).remove(chat_id);
+    }
+
+    /// Whether a manual stop currently holds this chat's child updates.
+    pub(crate) fn child_notifications_paused(&self, chat_id: &str) -> bool {
+        lock(&self.inner.child_notify_paused).contains(chat_id)
     }
 
     /// Any run currently working or blocked on input — the auto-updater's
@@ -514,7 +550,7 @@ impl SessionsEngine {
                     // "completed" flash on every remote send (2026-07-31).
                     self.set_status(chat_id, SessionStatus::Working, false);
                     if !hidden {
-                        self.inner.note_message(chat_id, &request.prompt);
+                        self.note_user_prompt(chat_id, &request.prompt);
                     }
                     return Ok(run_id);
                 }
@@ -529,7 +565,7 @@ impl SessionsEngine {
                 };
                 if !reclaimed {
                     if !hidden {
-                        self.inner.note_message(chat_id, &request.prompt);
+                        self.note_user_prompt(chat_id, &request.prompt);
                     }
                     return Ok(run_id);
                 }
@@ -631,7 +667,7 @@ impl SessionsEngine {
         // Hidden agent prompts skip the bump: the sidebar preview must not
         // read "[Zeron system]".
         if !hidden {
-            self.inner.note_message(chat_id, &request.prompt);
+            self.note_user_prompt(chat_id, &request.prompt);
         }
 
         // Name the chat NOW, off the first prompt — not after the first
@@ -782,7 +818,7 @@ impl SessionsEngine {
             }
             self.set_status(chat_id, SessionStatus::Working, false);
             if !hidden {
-                self.inner.note_message(chat_id, prompt);
+                self.note_user_prompt(chat_id, prompt);
             }
             return Ok(SteerOutcome::Accepted);
         }
@@ -800,7 +836,7 @@ impl SessionsEngine {
             return Ok(SteerOutcome::NotSteerable);
         }
         if !hidden {
-            self.inner.note_message(chat_id, prompt);
+            self.note_user_prompt(chat_id, prompt);
         }
         Ok(SteerOutcome::Accepted)
     }

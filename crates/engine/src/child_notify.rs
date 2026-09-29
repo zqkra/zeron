@@ -4,6 +4,12 @@
 //! the parent's doc and delivers one combined agent-only prompt, exactly
 //! once, without ever interrupting the parent's turn.
 //!
+//! Delivery waits for the parent to be between turns, and after a manual stop
+//! it waits for the user: an explicit stop freezes held updates for that
+//! parent until the user's next prompt starts a turn (the freeze lives on
+//! [`SessionsEngine`]), so pressing Stop cannot be undone a debounce later by
+//! the very updates the stop was meant to silence.
+//!
 //! Exactly-once is built in two layers, both keyed on the stable turn key
 //! from [`zeron_proto::orchestration::child_update`]:
 //!
@@ -219,6 +225,9 @@ enum Defer {
     InFlight,
     /// Parent chat row missing or hosted elsewhere; wake when it changes.
     ParentRow,
+    /// A manual stop froze delivery; wake when the parent's session row
+    /// changes — the user's next turn start and end are what thaw it.
+    Paused,
 }
 
 /// Per-wake fingerprints and parked work. Everything here is O(known rows)
@@ -356,13 +365,14 @@ fn detect(
         }
     }
 
-    // Parents parked on a live turn wake when its session row changed — or
-    // vanished entirely (a removed row means the turn is over either way).
+    // Parents parked on a live turn — or on a manual-stop pause — wake when
+    // the parent's session row changed, or vanished entirely (a removed row
+    // means the turn is over either way).
     let inflight_wake: Vec<String> = state
         .deferred
         .iter()
         .filter(|(parent, why)| {
-            matches!(why, Defer::InFlight)
+            matches!(why, Defer::InFlight | Defer::Paused)
                 && (changed_sessions.contains(parent.as_str())
                     || !sessions.iter().any(|s| s.chat_id == **parent))
         })
@@ -472,6 +482,15 @@ async fn flush_due(
                 tracing::warn!(chat = %parent_id, error = %err, "child-notification drop failed");
                 state.due.insert(parent_id, Instant::now() + RETRY_CAP);
             }
+            continue;
+        }
+        // A user stop froze automatic delivery: the pending rows stay claimed
+        // and the chat stays idle until a user-authored turn starts. The
+        // session watch re-arms us as that turn starts and ends; the belt
+        // re-check is only a safety net.
+        if sessions.child_notifications_paused(&parent_id) {
+            state.deferred.insert(parent_id.clone(), Defer::Paused);
+            state.due.insert(parent_id, Instant::now() + BUSY_RECHECK);
             continue;
         }
         // AwaitingInput is still a turn — the parent is owed its answer, not

@@ -373,6 +373,141 @@ async fn busy_parent_holds_the_notification_until_turn_end() {
 }
 
 #[tokio::test]
+async fn manual_stop_freezes_child_updates_until_the_user_writes() {
+    let bed = bed();
+    top_chat(&bed.core, "parent");
+    agent_chat(&bed.core, "child", "parent", true);
+    // The parent runs a held turn; the child settles while it is busy, so the
+    // update is claimed but can only flush after the turn ends.
+    bed.core
+        .sessions
+        .dispatch(
+            "parent",
+            HarnessId::Mock,
+            request("__HOLD__ parent"),
+            Some("u-p".into()),
+        )
+        .await
+        .unwrap();
+    wait_for("parent turn in flight", || {
+        bed.core.sessions.turn_in_flight("parent")
+    })
+    .await;
+    bed.core
+        .sessions
+        .dispatch(
+            "child",
+            HarnessId::Mock,
+            request("CHILD"),
+            Some("u1".into()),
+        )
+        .await
+        .unwrap();
+    wait_for("durable claim", || {
+        !bed.core
+            .doc_host
+            .docs_store()
+            .pending_child_notifications("parent")
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    // The user stops the parent through the durable command plane, exactly
+    // like the Stop button, `zeron chat interrupt` and the MCP tool do.
+    let client = zeron_rpc::memory_client(bed.core.rpc_service());
+    client
+        .call(
+            methods::QUEUE_COMMAND,
+            serde_json::json!({"chatId": "parent", "command": {"kind": "interrupt"}}),
+        )
+        .await
+        .unwrap();
+    wait_for("parent stopped", || {
+        !bed.core.sessions.turn_in_flight("parent")
+    })
+    .await;
+    // Well past the 2 s debounce the held update must neither deliver nor wake
+    // the parent with a new turn, and the row must still be recoverable.
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    assert!(system_prompts(&bed.requests).is_empty());
+    assert!(child_update_cards(&bed.core, "parent").is_empty());
+    let rows = bed
+        .core
+        .doc_host
+        .docs_store()
+        .child_notifications_for("child")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, "pending");
+
+    // The user writes again: that turn runs and delivery resumes when it ends.
+    bed.core
+        .sessions
+        .dispatch(
+            "parent",
+            HarnessId::Mock,
+            request("user follow-up"),
+            Some("u-2".into()),
+        )
+        .await
+        .unwrap();
+    wait_for("held update delivered", || {
+        !system_prompts(&bed.requests).is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(system_prompts(&bed.requests).len(), 1);
+    assert_eq!(child_update_cards(&bed.core, "parent").len(), 1);
+    assert_eq!(
+        bed.core
+            .doc_host
+            .docs_store()
+            .child_notifications_for("child")
+            .unwrap()[0]
+            .state,
+        "delivered"
+    );
+    bed.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_childs_own_interruption_does_not_freeze_the_parent() {
+    let bed = bed();
+    top_chat(&bed.core, "parent");
+    agent_chat(&bed.core, "child", "parent", true);
+    bed.core
+        .sessions
+        .dispatch(
+            "child",
+            HarnessId::Mock,
+            request("__HOLD__ work"),
+            Some("u1".into()),
+        )
+        .await
+        .unwrap();
+    wait_for("child working", || {
+        bed.core
+            .sessions
+            .session_status("child")
+            .is_some_and(|s| s.status == SessionStatus::Working)
+    })
+    .await;
+    // The engine stops the CHILD (teardown, removal, restart); the parent was
+    // not manually stopped, so it is still owed the interrupted notice.
+    bed.core.sessions.interrupt("child").await.unwrap();
+    wait_for("interrupted notice delivered", || {
+        !system_prompts(&bed.requests).is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let prompts = system_prompts(&bed.requests);
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("@chat:child was interrupted."));
+    assert_eq!(child_update_cards(&bed.core, "parent").len(), 1);
+    bed.core.shutdown().await;
+}
+
+#[tokio::test]
 async fn two_children_coalesce_into_one_prompt_and_two_cards() {
     let bed = bed();
     top_chat(&bed.core, "parent");
